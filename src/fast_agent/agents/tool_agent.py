@@ -1,11 +1,15 @@
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Sequence
 
 from mcp.server.fastmcp.tools.base import Tool as FastMCPTool
 from mcp.types import CallToolResult, ListToolsResult, Tool
 
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.llm_agent import LlmAgent
-from fast_agent.constants import FAST_AGENT_ERROR_CHANNEL, HUMAN_INPUT_TOOL_NAME
+from fast_agent.constants import (
+    DEFAULT_MAX_ITERATIONS,
+    FAST_AGENT_ERROR_CHANNEL,
+    HUMAN_INPUT_TOOL_NAME,
+)
 from fast_agent.context import Context
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.mcp.helpers.content_helpers import text_content
@@ -14,13 +18,6 @@ from fast_agent.types import PromptMessageExtended, RequestParams
 from fast_agent.types.llm_stop_reason import LlmStopReason
 
 logger = get_logger(__name__)
-
-DEFAULT_MAX_TOOL_CALLS = 20
-
-
-# should we have MAX_TOOL_CALLS instead to constrain by number of tools rather than turns...?
-DEFAULT_MAX_ITERATIONS = 20
-"""Maximum number of User/Assistant turns to take"""
 
 
 class ToolAgent(LlmAgent):
@@ -35,14 +32,13 @@ class ToolAgent(LlmAgent):
     def __init__(
         self,
         config: AgentConfig,
-        tools: list[FastMCPTool | Callable] = [],
+        tools: Sequence[FastMCPTool | Callable] = [],
         context: Context | None = None,
     ) -> None:
         super().__init__(config=config, context=context)
 
         self._execution_tools: dict[str, FastMCPTool] = {}
         self._tool_schemas: list[Tool] = []
-        self._tool_loop_error: str | None = None
 
         # Build a working list of tools and auto-inject human-input tool if missing
         working_tools: list[FastMCPTool | Callable] = list(tools) if tools else []
@@ -59,6 +55,7 @@ class ToolAgent(LlmAgent):
                     logger.warning(f"Failed to initialize human-input tool: {e}")
 
         for tool in working_tools:
+            (tool)
             if isinstance(tool, FastMCPTool):
                 fast_tool = tool
             elif callable(tool):
@@ -91,6 +88,7 @@ class ToolAgent(LlmAgent):
             tools = (await self.list_tools()).tools
 
         iterations = 0
+        max_iterations = request_params.max_iterations if request_params else DEFAULT_MAX_ITERATIONS
 
         while True:
             result = await super().generate_impl(
@@ -98,24 +96,29 @@ class ToolAgent(LlmAgent):
             )
 
             if LlmStopReason.TOOL_USE == result.stop_reason:
-                self._tool_loop_error = None
+                tool_message = await self.run_tools(result)
+                error_channel_messages = (tool_message.channels or {}).get(FAST_AGENT_ERROR_CHANNEL)
+                if error_channel_messages:
+                    tool_result_contents = [
+                        content
+                        for tool_result in (tool_message.tool_results or {}).values()
+                        for content in tool_result.content
+                    ]
+                    if tool_result_contents:
+                        if result.content is None:
+                            result.content = []
+                        result.content.extend(tool_result_contents)
+                    result.stop_reason = LlmStopReason.ERROR
+                    break
                 if self.config.use_history:
-                    tool_message = await self.run_tools(result)
-                    if self._tool_loop_error:
-                        result.stop_reason = LlmStopReason.ERROR
-                        break
                     messages = [tool_message]
                 else:
-                    tool_message = await self.run_tools(result)
-                    if self._tool_loop_error:
-                        result.stop_reason = LlmStopReason.ERROR
-                        break
                     messages.extend([result, tool_message])
             else:
                 break
 
             iterations += 1
-            if iterations > DEFAULT_MAX_ITERATIONS:
+            if iterations > max_iterations:
                 logger.warning("Max iterations reached, stopping tool loop")
                 break
         return result
@@ -133,17 +136,18 @@ class ToolAgent(LlmAgent):
             return PromptMessageExtended(role="user", tool_results={})
 
         tool_results: dict[str, CallToolResult] = {}
-        self._tool_loop_error = None
+        tool_loop_error: str | None = None
         # TODO -- use gather() for parallel results, update display
-        available_tools = [t.name for t in (await self.list_tools()).tools]
+        tool_schemas = (await self.list_tools()).tools
+        available_tools = [t.name for t in tool_schemas]
         for correlation_id, tool_request in request.tool_calls.items():
             tool_name = tool_request.params.name
             tool_args = tool_request.params.arguments or {}
 
-            if tool_name not in self._execution_tools:
+            if tool_name not in available_tools and tool_name not in self._execution_tools:
                 error_message = f"Tool '{tool_name}' is not available"
                 logger.error(error_message)
-                self._mark_tool_loop_error(
+                tool_loop_error = self._mark_tool_loop_error(
                     correlation_id=correlation_id,
                     error_message=error_message,
                     tool_results=tool_results,
@@ -170,9 +174,9 @@ class ToolAgent(LlmAgent):
             # Delegate to call_tool for execution (overridable by subclasses)
             result = await self.call_tool(tool_name, tool_args)
             tool_results[correlation_id] = result
-            self.display.show_tool_result(name=self.name, result=result)
+            self.display.show_tool_result(name=self.name, result=result, tool_name=tool_name)
 
-        return self._finalize_tool_results(tool_results)
+        return self._finalize_tool_results(tool_results, tool_loop_error=tool_loop_error)
 
     def _mark_tool_loop_error(
         self,
@@ -180,24 +184,34 @@ class ToolAgent(LlmAgent):
         correlation_id: str,
         error_message: str,
         tool_results: dict[str, CallToolResult],
-    ) -> None:
+    ) -> str:
         error_result = CallToolResult(
             content=[text_content(error_message)],
             isError=True,
         )
         tool_results[correlation_id] = error_result
         self.display.show_tool_result(name=self.name, result=error_result)
-        self._tool_loop_error = error_message
+        return error_message
 
     def _finalize_tool_results(
-        self, tool_results: dict[str, CallToolResult]
+        self,
+        tool_results: dict[str, CallToolResult],
+        *,
+        tool_loop_error: str | None = None,
     ) -> PromptMessageExtended:
         channels = None
-        if self._tool_loop_error:
+        content = []
+        if tool_loop_error:
+            content.append(text_content(tool_loop_error))
             channels = {
-                FAST_AGENT_ERROR_CHANNEL: [text_content(self._tool_loop_error)],
+                FAST_AGENT_ERROR_CHANNEL: [text_content(tool_loop_error)],
             }
-        return PromptMessageExtended(role="user", tool_results=tool_results, channels=channels)
+        return PromptMessageExtended(
+            role="user",
+            content=content,
+            tool_results=tool_results,
+            channels=channels,
+        )
 
     async def list_tools(self) -> ListToolsResult:
         """Return available tools for this agent. Overridable by subclasses."""

@@ -8,26 +8,17 @@ This class extends LlmDecorator with LLM-specific interaction behaviors includin
 - Chat display integration
 """
 
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
-try:
-    from a2a.types import AgentCapabilities  # type: ignore
-except Exception:  # pragma: no cover - optional dependency fallback
-    from dataclasses import dataclass
-
-    @dataclass
-    class AgentCapabilities:  # minimal fallback
-        streaming: bool = False
-        push_notifications: bool = False
-        state_transition_history: bool = False
-
-
+from a2a.types import AgentCapabilities
 from mcp import Tool
 from rich.text import Text
 
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.llm_decorator import LlmDecorator, ModelT
+from fast_agent.constants import FAST_AGENT_ERROR_CHANNEL
 from fast_agent.context import Context
+from fast_agent.mcp.helpers.content_helpers import get_text
 from fast_agent.types import PromptMessageExtended, RequestParams
 from fast_agent.types.llm_stop_reason import LlmStopReason
 from fast_agent.ui.console_display import ConsoleDisplay
@@ -56,7 +47,16 @@ class LlmAgent(LlmDecorator):
         super().__init__(config=config, context=context)
 
         # Initialize display component
-        self.display = ConsoleDisplay(config=self._context.config if self._context else None)
+        self._display = ConsoleDisplay(config=self._context.config if self._context else None)
+
+    @property
+    def display(self) -> ConsoleDisplay:
+        """UI display helper for presenting messages and tool activity."""
+        return self._display
+
+    @display.setter
+    def display(self, value: ConsoleDisplay) -> None:
+        self._display = value
 
     async def show_assistant_message(
         self,
@@ -123,6 +123,31 @@ class LlmAgent(LlmDecorator):
                         Text("The assistant requested tool calls", style="dim green italic")
                     )
 
+            case LlmStopReason.ERROR:
+                # Check if there's detailed error information in the error channel
+                if message.channels and FAST_AGENT_ERROR_CHANNEL in message.channels:
+                    error_blocks = message.channels[FAST_AGENT_ERROR_CHANNEL]
+                    if error_blocks:
+                        # Extract text from the error block using the helper function
+                        error_text = get_text(error_blocks[0])
+                        if error_text:
+                            additional_segments.append(
+                                Text(f"\n\nError details: {error_text}", style="dim red italic")
+                            )
+                        else:
+                            # Fallback if we couldn't extract text
+                            additional_segments.append(
+                                Text(
+                                    f"\n\nError details: {str(error_blocks[0])}",
+                                    style="dim red italic",
+                                )
+                            )
+                else:
+                    # Fallback if no detailed error is available
+                    additional_segments.append(
+                        Text("\n\nAn error occurred during generation.", style="dim red italic")
+                    )
+
             case _:
                 if message.stop_reason:
                     additional_segments.append(
@@ -146,7 +171,7 @@ class LlmAgent(LlmDecorator):
                 combined += segment
             additional_message_text = combined
 
-        message_text = message.last_text() or ""
+        message_text = message
 
         # Use provided name/model or fall back to defaults
         display_name = name if name is not None else self.name
@@ -182,6 +207,13 @@ class LlmAgent(LlmDecorator):
         chat_turn = self._llm.chat_turn()
         self.display.show_user_message(message.last_text() or "", model, chat_turn, name=self.name)
 
+    def _should_stream(self) -> bool:
+        """Determine whether streaming display should be used."""
+        if getattr(self, "display", None):
+            enabled, _ = self.display.resolve_streaming_preferences()
+            return enabled
+        return True
+
     async def generate_impl(
         self,
         messages: List[PromptMessageExtended],
@@ -195,13 +227,53 @@ class LlmAgent(LlmDecorator):
         if "user" == messages[-1].role:
             self.show_user_message(message=messages[-1])
 
-        # TODO -- we should merge the request parameters here with the LLM defaults?
         # TODO - manage error catch, recovery, pause
-        result, summary = await self._generate_with_summary(messages, request_params, tools)
+        summary_text: Text | None = None
 
-        summary_text = Text(f"\n\n{summary.message}", style="dim red italic") if summary else None
+        if self._should_stream():
+            display_name = self.name
+            display_model = self.llm.model_name if self._llm else None
 
-        await self.show_assistant_message(result, additional_message=summary_text)
+            remove_listener: Callable[[], None] | None = None
+            remove_tool_listener: Callable[[], None] | None = None
+
+            with self.display.streaming_assistant_message(
+                name=display_name,
+                model=display_model,
+            ) as stream_handle:
+                try:
+                    remove_listener = self.llm.add_stream_listener(stream_handle.update)
+                    remove_tool_listener = self.llm.add_tool_stream_listener(
+                        stream_handle.handle_tool_event
+                    )
+                except Exception:
+                    remove_listener = None
+                    remove_tool_listener = None
+
+                try:
+                    result, summary = await self._generate_with_summary(
+                        messages, request_params, tools
+                    )
+                finally:
+                    if remove_listener:
+                        remove_listener()
+                    if remove_tool_listener:
+                        remove_tool_listener()
+
+                if summary:
+                    summary_text = Text(f"\n\n{summary.message}", style="dim red italic")
+
+                stream_handle.finalize(result)
+
+            await self.show_assistant_message(result, additional_message=summary_text)
+        else:
+            result, summary = await self._generate_with_summary(messages, request_params, tools)
+
+            summary_text = (
+                Text(f"\n\n{summary.message}", style="dim red italic") if summary else None
+            )
+            await self.show_assistant_message(result, additional_message=summary_text)
+
         return result
 
     async def structured_impl(
@@ -219,33 +291,3 @@ class LlmAgent(LlmDecorator):
         summary_text = Text(f"\n\n{summary.message}", style="dim red italic") if summary else None
         await self.show_assistant_message(message=message, additional_message=summary_text)
         return result, message
-
-    # async def show_prompt_loaded(
-    #     self,
-    #     prompt_name: str,
-    #     description: Optional[str] = None,
-    #     message_count: int = 0,
-    #     arguments: Optional[dict[str, str]] = None,
-    # ) -> None:
-    #     """
-    #     Display information about a loaded prompt template.
-
-    #     Args:
-    #         prompt_name: The name of the prompt
-    #         description: Optional description of the prompt
-    #         message_count: Number of messages in the prompt
-    #         arguments: Optional dictionary of arguments passed to the prompt
-    #     """
-    #     # Get aggregator from attached LLM if available
-    #     aggregator = None
-    #     if self._llm and hasattr(self._llm, "aggregator"):
-    #         aggregator = self._llm.aggregator
-
-    #     await self.display.show_prompt_loaded(
-    #         prompt_name=prompt_name,
-    #         description=description,
-    #         message_count=message_count,
-    #         agent_name=self.name,
-    #         aggregator=aggregator,
-    #         arguments=arguments,
-    #     )

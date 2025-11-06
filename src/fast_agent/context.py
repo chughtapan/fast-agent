@@ -1,10 +1,10 @@
-"""
-A central context object to store global state that is shared across the application.
-"""
+from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 from opentelemetry import trace
@@ -26,14 +26,21 @@ from fast_agent.core.logging.events import EventFilter, StreamingExclusionFilter
 from fast_agent.core.logging.logger import LoggingConfig, get_logger
 from fast_agent.core.logging.transport import create_transport
 from fast_agent.mcp_server_registry import ServerRegistry
+from fast_agent.skills import SkillRegistry
 
 if TYPE_CHECKING:
     from fast_agent.core.executor.workflow_signal import SignalWaitCallback
+    from fast_agent.mcp.mcp_connection_manager import MCPConnectionManager
 else:
     # Runtime placeholders for the types
     SignalWaitCallback = Any
+    MCPConnectionManager = Any
 
 logger = get_logger(__name__)
+
+"""
+A central context object to store global state that is shared across the application.
+"""
 
 
 class Context(BaseModel):
@@ -50,8 +57,10 @@ class Context(BaseModel):
     # Registries
     server_registry: Optional[ServerRegistry] = None
     task_registry: Optional[ActivityRegistry] = None
+    skill_registry: Optional[SkillRegistry] = None
 
     tracer: trace.Tracer | None = None
+    _connection_manager: "MCPConnectionManager | None" = None
 
     model_config = ConfigDict(
         extra="allow",
@@ -130,16 +139,40 @@ async def configure_logger(config: "Settings") -> None:
     """
     Configure logging and tracing based on the application config.
     """
+    settings = config.logger
+
+    # Configure the standard Python logger used by LoggingListener so it respects settings.
+    python_logger = logging.getLogger("fast_agent")
+    python_logger.handlers.clear()
+    python_logger.setLevel(settings.level.upper())
+    python_logger.propagate = False
+
+    transport = None
+    if settings.type == "console":
+        # Console mode: use the Python logger to emit to stdout and skip additional transport output
+        handler = logging.StreamHandler()
+        handler.setLevel(settings.level.upper())
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        python_logger.addHandler(handler)
+    else:
+        # For all other modes, rely on transports (file/http/none) and keep the Python logger quiet
+        python_logger.addHandler(logging.NullHandler())
+
     # Use StreamingExclusionFilter to prevent streaming events from flooding logs
-    event_filter: EventFilter = StreamingExclusionFilter(min_level=config.logger.level)
-    logger.info(f"Configuring logger with level: {config.logger.level}")
-    transport = create_transport(settings=config.logger, event_filter=event_filter)
+    event_filter: EventFilter = StreamingExclusionFilter(min_level=settings.level)
+    logger.info(f"Configuring logger with level: {settings.level}")
+    if settings.type == "console":
+        from fast_agent.core.logging.transport import NoOpTransport
+
+        transport = NoOpTransport(event_filter=event_filter)
+    else:
+        transport = create_transport(settings=settings, event_filter=event_filter)
     await LoggingConfig.configure(
         event_filter=event_filter,
         transport=transport,
-        batch_size=config.logger.batch_size,
-        flush_interval=config.logger.flush_interval,
-        progress_display=config.logger.progress_display,
+        batch_size=settings.batch_size,
+        flush_interval=settings.flush_interval,
+        progress_display=settings.progress_display,
     )
 
 
@@ -172,6 +205,15 @@ async def initialize_context(
     context = Context()
     context.config = config
     context.server_registry = ServerRegistry(config=config)
+
+    skills_settings = getattr(config, "skills", None)
+    override_directory = None
+    if skills_settings and getattr(skills_settings, "directory", None):
+        override_directory = Path(skills_settings.directory).expanduser()
+    context.skill_registry = SkillRegistry(
+        base_dir=Path.cwd(),
+        override_directory=override_directory,
+    )
 
     # Configure logging and telemetry
     await configure_otel(config)

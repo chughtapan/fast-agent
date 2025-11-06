@@ -111,6 +111,11 @@ class LlmDecorator(AgentProtocol):
         self._initialized = False
 
     @property
+    def context(self) -> Context | None:
+        """Optional execution context supplied at construction time."""
+        return self._context
+
+    @property
     def initialized(self) -> bool:
         """Check if the agent is initialized."""
         return self._initialized
@@ -243,9 +248,12 @@ class LlmDecorator(AgentProtocol):
         """
         # Normalize all input types to a list of PromptMessageExtended
         multipart_messages = normalize_to_extended_list(messages)
+        final_request_params = (
+            self.llm.get_request_params(request_params) if self._llm else request_params
+        )
 
         with self._tracer.start_as_current_span(f"Agent: '{self._name}' generate"):
-            return await self.generate_impl(multipart_messages, request_params, tools)
+            return await self.generate_impl(multipart_messages, final_request_params, tools)
 
     async def generate_impl(
         self,
@@ -314,6 +322,13 @@ class LlmDecorator(AgentProtocol):
         # Otherwise treat the string as plain content (ignore arguments here)
         return await self.send(prompt)
 
+    def clear(self, *, clear_prompts: bool = False) -> None:
+        """Reset conversation state while optionally retaining applied prompt templates."""
+
+        if not self._llm:
+            return
+        self._llm.clear(clear_prompts=clear_prompts)
+
     async def structured(
         self,
         messages: Union[
@@ -345,9 +360,12 @@ class LlmDecorator(AgentProtocol):
         """
         # Normalize all input types to a list of PromptMessageExtended
         multipart_messages = normalize_to_extended_list(messages)
+        final_request_params = (
+            self.llm.get_request_params(request_params) if self._llm else request_params
+        )
 
         with self._tracer.start_as_current_span(f"Agent: '{self._name}' structured"):
-            return await self.structured_impl(multipart_messages, model, request_params)
+            return await self.structured_impl(multipart_messages, model, final_request_params)
 
     async def structured_impl(
         self,
@@ -699,6 +717,12 @@ class LlmDecorator(AgentProtocol):
         if self._llm:
             return self._llm.message_history
         return []
+
+    def pop_last_message(self) -> PromptMessageExtended | None:
+        """Remove and return the most recent message from the conversation history."""
+        if self._llm:
+            return self._llm.pop_last_message()
+        return None
 
     @property
     def usage_accumulator(self) -> UsageAccumulator | None:

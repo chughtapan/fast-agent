@@ -4,9 +4,11 @@ Type definitions for agents and agent configurations.
 
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
-from typing import Dict, List, Optional
+from pathlib import Path
 
 from mcp.client.session import ElicitationFnT
+
+from fast_agent.skills import SkillManifest, SkillRegistry
 
 # Forward imports to avoid circular dependencies
 from fast_agent.types import RequestParams
@@ -32,10 +34,12 @@ class AgentConfig:
 
     name: str
     instruction: str = "You are a helpful agent."
-    servers: List[str] = field(default_factory=list)
-    tools: Optional[Dict[str, List[str]]] = None
-    resources: Optional[Dict[str, List[str]]] = None
-    prompts: Optional[Dict[str, List[str]]] = None
+    servers: list[str] = field(default_factory=list)
+    tools: dict[str, list[str]] = field(default_factory=dict)  # filters for tools
+    resources: dict[str, list[str]] = field(default_factory=dict)  # filters for resources
+    prompts: dict[str, list[str]] = field(default_factory=dict)  # filters for prompts
+    skills: SkillManifest | SkillRegistry | Path | str | None = None
+    skill_manifests: list[SkillManifest] = field(default_factory=list, repr=False)
     model: str | None = None
     use_history: bool = True
     default_request_params: RequestParams | None = None

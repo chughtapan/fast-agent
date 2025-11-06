@@ -17,14 +17,12 @@ from anyio import Event, Lock, create_task_group
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from httpx import HTTPStatusError
 from mcp import ClientSession
-from mcp.client.sse import sse_client
 from mcp.client.stdio import (
     StdioServerParameters,
     get_default_environment,
-    stdio_client,
 )
-from mcp.client.streamable_http import GetSessionIdCallback, streamablehttp_client
-from mcp.types import JSONRPCMessage, ServerCapabilities
+from mcp.client.streamable_http import GetSessionIdCallback
+from mcp.types import Implementation, JSONRPCMessage, ServerCapabilities
 
 from fast_agent.config import MCPServerSettings
 from fast_agent.context_dependent import ContextDependent
@@ -34,8 +32,14 @@ from fast_agent.event_progress import ProgressAction
 from fast_agent.mcp.logger_textio import get_stderr_handler
 from fast_agent.mcp.mcp_agent_client_session import MCPAgentClientSession
 from fast_agent.mcp.oauth_client import build_oauth_provider
+from fast_agent.mcp.sse_tracking import tracking_sse_client
+from fast_agent.mcp.stdio_tracking_simple import tracking_stdio_client
+from fast_agent.mcp.streamable_http_tracking import tracking_streamablehttp_client
+from fast_agent.mcp.transport_tracking import TransportChannelMetrics
 
 if TYPE_CHECKING:
+    from mcp.client.auth import OAuthClientProvider
+
     from fast_agent.context import Context
     from fast_agent.mcp_server_registry import ServerRegistry
 
@@ -61,6 +65,38 @@ class StreamingContextAdapter:
 def _add_none_to_context(context_manager):
     """Helper to add a None value to context managers that return 2 values instead of 3"""
     return StreamingContextAdapter(context_manager)
+
+
+def _prepare_headers_and_auth(
+    server_config: MCPServerSettings,
+) -> tuple[dict[str, str], Optional["OAuthClientProvider"], set[str]]:
+    """
+    Prepare request headers and determine if OAuth authentication should be used.
+
+    Returns a copy of the headers, an OAuth auth provider when applicable, and the set
+    of user-supplied authorization header keys.
+    """
+    headers: dict[str, str] = dict(server_config.headers or {})
+    auth_header_keys = {"authorization", "x-hf-authorization"}
+    user_provided_auth_keys = {key for key in headers if key.lower() in auth_header_keys}
+
+    # OAuth is only relevant for SSE/HTTP transports and should be skipped when the
+    # user has already supplied explicit Authorization headers.
+    if server_config.transport not in ("sse", "http") or user_provided_auth_keys:
+        return headers, None, user_provided_auth_keys
+
+    oauth_auth = build_oauth_provider(server_config)
+    if oauth_auth is not None:
+        # Scrub Authorization headers so OAuth-managed credentials are the only ones sent.
+        for header_name in (
+            "Authorization",
+            "authorization",
+            "X-HF-Authorization",
+            "x-hf-authorization",
+        ):
+            headers.pop(header_name, None)
+
+    return headers, oauth_auth, user_provided_auth_keys
 
 
 class ServerConnection:
@@ -107,6 +143,16 @@ class ServerConnection:
 
         # Server instructions from initialization
         self.server_instructions: str | None = None
+        self.server_capabilities: ServerCapabilities | None = None
+        self.server_implementation: Implementation | None = None
+        self.client_capabilities: dict | None = None
+        self.server_instructions_available: bool = False
+        self.server_instructions_enabled: bool = (
+            server_config.include_instructions if server_config else True
+        )
+        self.session_id: str | None = None
+        self._get_session_id_cb: GetSessionIdCallback | None = None
+        self.transport_metrics: TransportChannelMetrics | None = None
 
     def is_healthy(self) -> bool:
         """Check if the server connection is healthy and ready to use."""
@@ -138,15 +184,32 @@ class ServerConnection:
         result = await self.session.initialize()
 
         self.server_capabilities = result.capabilities
+        # InitializeResult exposes server info via `serverInfo`; keep fallback for older fields
+        implementation = getattr(result, "serverInfo", None)
+        if implementation is None:
+            implementation = getattr(result, "implementation", None)
+        self.server_implementation = implementation
+
+        raw_instructions = getattr(result, "instructions", None)
+        self.server_instructions_available = bool(raw_instructions)
 
         # Store instructions if provided by the server and enabled in config
         if self.server_config.include_instructions:
-            self.server_instructions = getattr(result, 'instructions', None)
+            self.server_instructions = raw_instructions
             if self.server_instructions:
-                logger.debug(f"{self.server_name}: Received server instructions", data={"instructions": self.server_instructions})
+                logger.debug(
+                    f"{self.server_name}: Received server instructions",
+                    data={"instructions": self.server_instructions},
+                )
         else:
             self.server_instructions = None
-            logger.debug(f"{self.server_name}: Server instructions disabled by configuration")
+            if self.server_instructions_available:
+                logger.debug(
+                    f"{self.server_name}: Server instructions disabled by configuration",
+                    data={"instructions": raw_instructions},
+                )
+            else:
+                logger.debug(f"{self.server_name}: No server instructions provided")
 
         # If there's an init hook, run it
 
@@ -175,10 +238,15 @@ class ServerConnection:
         )
 
         session = self._client_session_factory(
-            read_stream, send_stream, read_timeout, server_config=self.server_config
+            read_stream,
+            send_stream,
+            read_timeout,
+            server_config=self.server_config,
+            transport_metrics=self.transport_metrics,
         )
 
         self.session = session
+        self.client_capabilities = getattr(session, "client_capabilities", None)
 
         return session
 
@@ -192,11 +260,30 @@ async def _server_lifecycle_task(server_conn: ServerConnection) -> None:
     try:
         transport_context = server_conn._transport_context_factory()
 
-        async with transport_context as (read_stream, write_stream, _):
+        async with transport_context as (read_stream, write_stream, get_session_id_cb):
+            server_conn._get_session_id_cb = get_session_id_cb
+
+            if get_session_id_cb is not None:
+                try:
+                    server_conn.session_id = get_session_id_cb()
+                except Exception:
+                    logger.debug(f"{server_name}: Unable to retrieve session id from transport")
+            elif server_conn.server_config.transport == "stdio":
+                server_conn.session_id = "local"
+
             server_conn.create_session(read_stream, write_stream)
 
             async with server_conn.session:
                 await server_conn.initialize_session()
+
+                if get_session_id_cb is not None:
+                    try:
+                        server_conn.session_id = get_session_id_cb() or server_conn.session_id
+                    except Exception:
+                        logger.debug(f"{server_name}: Unable to refresh session id after init")
+                elif server_conn.server_config.transport == "stdio":
+                    server_conn.session_id = "local"
+
                 await server_conn.wait_for_shutdown_request()
 
     except HTTPStatusError as http_exc:
@@ -353,6 +440,28 @@ class MCPConnectionManager(ContextDependent):
 
         logger.debug(f"{server_name}: Found server configuration=", data=config.model_dump())
 
+        timeline_steps = 20
+        timeline_seconds = 30
+        try:
+            ctx = self.context
+        except RuntimeError:
+            ctx = None
+
+        config_obj = getattr(ctx, "config", None)
+        timeline_config = getattr(config_obj, "mcp_timeline", None)
+        if timeline_config:
+            timeline_steps = getattr(timeline_config, "steps", timeline_steps)
+            timeline_seconds = getattr(timeline_config, "step_seconds", timeline_seconds)
+
+        transport_metrics = (
+            TransportChannelMetrics(
+                bucket_seconds=timeline_seconds,
+                bucket_count=timeline_steps,
+            )
+            if config.transport in ("http", "sse", "stdio")
+            else None
+        )
+
         def transport_context_factory():
             if config.transport == "stdio":
                 if not config.command:
@@ -369,7 +478,13 @@ class MCPConnectionManager(ContextDependent):
                 error_handler = get_stderr_handler(server_name)
                 # Explicitly ensure we're using our custom logger for stderr
                 logger.debug(f"{server_name}: Creating stdio client with custom error handler")
-                return _add_none_to_context(stdio_client(server_params, errlog=error_handler))
+
+                channel_hook = transport_metrics.record_event if transport_metrics else None
+                return _add_none_to_context(
+                    tracking_stdio_client(
+                        server_params, channel_hook=channel_hook, errlog=error_handler
+                    )
+                )
             elif config.transport == "sse":
                 if not config.url:
                     raise ValueError(
@@ -377,31 +492,62 @@ class MCPConnectionManager(ContextDependent):
                     )
                 # Suppress MCP library error spam
                 self._suppress_mcp_sse_errors()
-                oauth_auth = build_oauth_provider(config)
-                # If using OAuth, strip any pre-existing Authorization headers to avoid conflicts
-                headers = dict(config.headers or {})
-                if oauth_auth is not None:
-                    headers.pop("Authorization", None)
-                    headers.pop("X-HF-Authorization", None)
-                return _add_none_to_context(
-                    sse_client(
-                        config.url,
-                        headers,
-                        sse_read_timeout=config.read_transport_sse_timeout_seconds,
-                        auth=oauth_auth,
+                headers, oauth_auth, user_auth_keys = _prepare_headers_and_auth(config)
+                if user_auth_keys:
+                    logger.debug(
+                        f"{server_name}: Using user-specified auth header(s); skipping OAuth provider.",
+                        user_auth_headers=sorted(user_auth_keys),
                     )
+                channel_hook = None
+                if transport_metrics is not None:
+
+                    def channel_hook(event):
+                        try:
+                            transport_metrics.record_event(event)
+                        except Exception:  # pragma: no cover - defensive guard
+                            logger.debug(
+                                "%s: transport metrics hook failed",
+                                server_name,
+                                exc_info=True,
+                            )
+
+                return tracking_sse_client(
+                    config.url,
+                    headers,
+                    sse_read_timeout=config.read_transport_sse_timeout_seconds,
+                    auth=oauth_auth,
+                    channel_hook=channel_hook,
                 )
             elif config.transport == "http":
                 if not config.url:
                     raise ValueError(
                         f"Server '{server_name}' uses http transport but no url is specified"
                     )
-                oauth_auth = build_oauth_provider(config)
-                headers = dict(config.headers or {})
-                if oauth_auth is not None:
-                    headers.pop("Authorization", None)
-                    headers.pop("X-HF-Authorization", None)
-                return streamablehttp_client(config.url, headers, auth=oauth_auth)
+                headers, oauth_auth, user_auth_keys = _prepare_headers_and_auth(config)
+                if user_auth_keys:
+                    logger.debug(
+                        f"{server_name}: Using user-specified auth header(s); skipping OAuth provider.",
+                        user_auth_headers=sorted(user_auth_keys),
+                    )
+                channel_hook = None
+                if transport_metrics is not None:
+
+                    def channel_hook(event):
+                        try:
+                            transport_metrics.record_event(event)
+                        except Exception:  # pragma: no cover - defensive guard
+                            logger.debug(
+                                "%s: transport metrics hook failed",
+                                server_name,
+                                exc_info=True,
+                            )
+
+                return tracking_streamablehttp_client(
+                    config.url,
+                    headers,
+                    auth=oauth_auth,
+                    channel_hook=channel_hook,
+                )
             else:
                 raise ValueError(f"Unsupported transport: {config.transport}")
 
@@ -411,6 +557,9 @@ class MCPConnectionManager(ContextDependent):
             transport_context_factory=transport_context_factory,
             client_session_factory=client_session_factory,
         )
+
+        if transport_metrics is not None:
+            server_conn.transport_metrics = transport_metrics
 
         async with self._lock:
             # Check if already running

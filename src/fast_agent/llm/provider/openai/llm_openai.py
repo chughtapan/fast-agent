@@ -7,7 +7,7 @@ from mcp.types import (
     ContentBlock,
     TextContent,
 )
-from openai import APIError, AsyncOpenAI, AuthenticationError
+from openai import APIError, AsyncOpenAI, AuthenticationError, DefaultAioHttpClient
 from openai.lib.streaming.chat import ChatCompletionStreamState
 
 # from openai.types.beta.chat import
@@ -95,15 +95,115 @@ class OpenAILLM(FastAgentLLM[ChatCompletionMessageParam, ChatCompletionMessage])
         return self.context.config.openai.base_url if self.context.config.openai else None
 
     def _openai_client(self) -> AsyncOpenAI:
-        try:
-            return AsyncOpenAI(api_key=self._api_key(), base_url=self._base_url())
+        """
+        Create an OpenAI client instance.
+        Subclasses can override this to provide different client types (e.g., AzureOpenAI).
 
+        Note: The returned client should be used within an async context manager
+        to ensure proper cleanup of aiohttp sessions.
+        """
+        try:
+            return AsyncOpenAI(
+                api_key=self._api_key(),
+                base_url=self._base_url(),
+                http_client=DefaultAioHttpClient(),
+            )
         except AuthenticationError as e:
             raise ProviderKeyError(
                 "Invalid OpenAI API key",
                 "The configured OpenAI API key was rejected.\n"
                 "Please check that your API key is valid and not expired.",
             ) from e
+
+    def _streams_tool_arguments(self) -> bool:
+        """
+        Determine whether the current provider streams tool call arguments incrementally.
+
+        Official OpenAI and Azure OpenAI endpoints stream arguments. Most third-party
+        OpenAI-compatible gateways (e.g. OpenRouter, Moonshot) deliver the full arguments
+        once, so we should treat them as non-streaming to restore the legacy \"Calling Tool\"
+        display experience.
+        """
+        if self.provider == Provider.AZURE:
+            return True
+
+        if self.provider == Provider.OPENAI:
+            base_url = self._base_url()
+            if not base_url:
+                return True
+            lowered = base_url.lower()
+            return "api.openai" in lowered or "openai.azure" in lowered or "azure.com" in lowered
+
+        return False
+
+    def _emit_tool_notification_fallback(
+        self,
+        tool_calls: Any,
+        notified_indices: set[int],
+        *,
+        streams_arguments: bool,
+        model: str,
+    ) -> None:
+        """Emit start/stop notifications when streaming metadata was missing."""
+        if not tool_calls:
+            return
+
+        for index, tool_call in enumerate(tool_calls):
+            if index in notified_indices:
+                continue
+
+            tool_name = None
+            tool_use_id = None
+
+            try:
+                tool_use_id = getattr(tool_call, "id", None)
+                function = getattr(tool_call, "function", None)
+                if function:
+                    tool_name = getattr(function, "name", None)
+            except Exception:
+                tool_use_id = None
+                tool_name = None
+
+            if not tool_name:
+                tool_name = "tool"
+            if not tool_use_id:
+                tool_use_id = f"tool-{index}"
+
+            payload = {
+                "tool_name": tool_name,
+                "tool_use_id": tool_use_id,
+                "index": index,
+                "streams_arguments": streams_arguments,
+            }
+
+            self._notify_tool_stream_listeners("start", payload)
+            self.logger.info(
+                "Model emitted fallback tool notification",
+                data={
+                    "progress_action": ProgressAction.CALLING_TOOL,
+                    "agent_name": self.name,
+                    "model": model,
+                    "tool_name": tool_name,
+                    "tool_use_id": tool_use_id,
+                    "tool_event": "start",
+                    "streams_arguments": streams_arguments,
+                    "fallback": True,
+                },
+            )
+            self._notify_tool_stream_listeners("stop", payload)
+            self.logger.info(
+                "Model emitted fallback tool notification",
+                data={
+                    "progress_action": ProgressAction.CALLING_TOOL,
+                    "agent_name": self.name,
+                    "model": model,
+                    "tool_name": tool_name,
+                    "tool_use_id": tool_use_id,
+                    "tool_event": "stop",
+                    "streams_arguments": streams_arguments,
+                    "fallback": True,
+                },
+            )
 
     async def _process_stream(self, stream, model: str):
         """Process the streaming response and display real-time token usage."""
@@ -113,22 +213,145 @@ class OpenAILLM(FastAgentLLM[ChatCompletionMessageParam, ChatCompletionMessage])
         # For non-OpenAI providers (like Ollama), ChatCompletionStreamState might not work correctly
         # Fall back to manual accumulation if needed
         # TODO -- consider this and whether to subclass instead
-        if self.provider in [Provider.GENERIC, Provider.OPENROUTER, Provider.GOOGLE_OAI]:
+        if self.provider in [
+            Provider.GENERIC,
+            Provider.OPENROUTER,
+            Provider.GOOGLE_OAI,
+        ]:
             return await self._process_stream_manual(stream, model)
 
         # Use ChatCompletionStreamState helper for accumulation (OpenAI only)
         state = ChatCompletionStreamState()
 
+        # Track tool call state for stream events
+        tool_call_started: dict[int, dict[str, Any]] = {}
+        streams_arguments = self._streams_tool_arguments()
+        notified_tool_indices: set[int] = set()
+
         # Process the stream chunks
         async for chunk in stream:
             # Handle chunk accumulation
             state.handle_chunk(chunk)
+            # Process streaming events for tool calls
+            if chunk.choices:
+                choice = chunk.choices[0]
+                delta = choice.delta
 
-            # Count tokens in real-time from content deltas
-            if chunk.choices and chunk.choices[0].delta.content:
-                content = chunk.choices[0].delta.content
-                # Use base class method for token estimation and progress emission
-                estimated_tokens = self._update_streaming_progress(content, model, estimated_tokens)
+                # Handle tool call streaming
+                if delta.tool_calls:
+                    for tool_call in delta.tool_calls:
+                        index = tool_call.index
+
+                        # Fire "start" event on first chunk for this tool call
+                        if index is None:
+                            continue
+
+                        existing_info = tool_call_started.get(index)
+                        tool_use_id = tool_call.id or (
+                            existing_info.get("tool_use_id") if existing_info else None
+                        )
+                        function_name = (
+                            tool_call.function.name
+                            if tool_call.function and tool_call.function.name
+                            else (existing_info.get("tool_name") if existing_info else None)
+                        )
+
+                        if existing_info is None and tool_use_id and function_name:
+                            tool_call_started[index] = {
+                                "tool_name": function_name,
+                                "tool_use_id": tool_use_id,
+                                "streams_arguments": streams_arguments,
+                            }
+                            self._notify_tool_stream_listeners(
+                                "start",
+                                {
+                                    "tool_name": function_name,
+                                    "tool_use_id": tool_use_id,
+                                    "index": index,
+                                    "streams_arguments": streams_arguments,
+                                },
+                            )
+                            self.logger.info(
+                                "Model started streaming tool call",
+                                data={
+                                    "progress_action": ProgressAction.CALLING_TOOL,
+                                    "agent_name": self.name,
+                                    "model": model,
+                                    "tool_name": function_name,
+                                    "tool_use_id": tool_use_id,
+                                    "tool_event": "start",
+                                    "streams_arguments": streams_arguments,
+                                },
+                            )
+                            notified_tool_indices.add(index)
+                        elif existing_info:
+                            if tool_use_id:
+                                existing_info["tool_use_id"] = tool_use_id
+                            if function_name:
+                                existing_info["tool_name"] = function_name
+
+                        # Fire "delta" event for argument chunks
+                        if tool_call.function and tool_call.function.arguments:
+                            info = tool_call_started.setdefault(
+                                index,
+                                {
+                                    "tool_name": function_name,
+                                    "tool_use_id": tool_use_id,
+                                    "streams_arguments": streams_arguments,
+                                },
+                            )
+                            self._notify_tool_stream_listeners(
+                                "delta",
+                                {
+                                    "tool_name": info.get("tool_name"),
+                                    "tool_use_id": info.get("tool_use_id"),
+                                    "index": index,
+                                    "chunk": tool_call.function.arguments,
+                                    "streams_arguments": info.get("streams_arguments", False),
+                                },
+                            )
+
+                # Handle text content streaming
+                if delta.content:
+                    content = delta.content
+                    # Use base class method for token estimation and progress emission
+                    estimated_tokens = self._update_streaming_progress(
+                        content, model, estimated_tokens
+                    )
+                    self._notify_tool_stream_listeners(
+                        "text",
+                        {
+                            "chunk": content,
+                            "streams_arguments": streams_arguments,
+                        },
+                    )
+
+                # Fire "stop" event when tool calls complete
+                if choice.finish_reason == "tool_calls":
+                    for index, info in list(tool_call_started.items()):
+                        self._notify_tool_stream_listeners(
+                            "stop",
+                            {
+                                "tool_name": info.get("tool_name"),
+                                "tool_use_id": info.get("tool_use_id"),
+                                "index": index,
+                                "streams_arguments": info.get("streams_arguments", False),
+                            },
+                        )
+                        self.logger.info(
+                            "Model finished streaming tool call",
+                            data={
+                                "progress_action": ProgressAction.CALLING_TOOL,
+                                "agent_name": self.name,
+                                "model": model,
+                                "tool_name": info.get("tool_name"),
+                                "tool_use_id": info.get("tool_use_id"),
+                                "tool_event": "stop",
+                                "streams_arguments": info.get("streams_arguments", False),
+                            },
+                        )
+                        notified_tool_indices.add(index)
+                    tool_call_started.clear()
 
         # Check if we hit the length limit to avoid LengthFinishReasonError
         current_snapshot = state.current_completion_snapshot
@@ -157,12 +380,24 @@ class OpenAILLM(FastAgentLLM[ChatCompletionMessageParam, ChatCompletionMessage])
                 f"Streaming complete - Model: {model}, Input tokens: {final_completion.usage.prompt_tokens}, Output tokens: {final_completion.usage.completion_tokens}"
             )
 
+        final_message = None
+        if hasattr(final_completion, "choices") and final_completion.choices:
+            final_message = getattr(final_completion.choices[0], "message", None)
+        tool_calls = getattr(final_message, "tool_calls", None) if final_message else None
+        self._emit_tool_notification_fallback(
+            tool_calls,
+            notified_tool_indices,
+            streams_arguments=streams_arguments,
+            model=model,
+        )
+
         return final_completion
 
     # TODO - as per other comment this needs to go in another class. There are a number of "special" cases dealt with
     # here to deal with OpenRouter idiosyncrasies between e.g. Anthropic and Gemini models.
     async def _process_stream_manual(self, stream, model: str):
         """Manual stream processing for providers like Ollama that may not work with ChatCompletionStreamState."""
+
         from openai.types.chat import ChatCompletionMessageToolCall
 
         # Track estimated output tokens by counting text chunks
@@ -176,14 +411,132 @@ class OpenAILLM(FastAgentLLM[ChatCompletionMessageParam, ChatCompletionMessage])
         finish_reason = None
         usage_data = None
 
+        # Track tool call state for stream events
+        tool_call_started: dict[int, dict[str, Any]] = {}
+        streams_arguments = self._streams_tool_arguments()
+        notified_tool_indices: set[int] = set()
+
         # Process the stream chunks manually
         async for chunk in stream:
-            # Count tokens in real-time from content deltas
-            if chunk.choices and chunk.choices[0].delta.content:
-                content = chunk.choices[0].delta.content
-                accumulated_content += content
-                # Use base class method for token estimation and progress emission
-                estimated_tokens = self._update_streaming_progress(content, model, estimated_tokens)
+            # Process streaming events for tool calls
+            if chunk.choices:
+                choice = chunk.choices[0]
+                delta = choice.delta
+
+                # Handle tool call streaming
+                if delta.tool_calls:
+                    for tool_call in delta.tool_calls:
+                        if tool_call.index is not None:
+                            index = tool_call.index
+
+                            existing_info = tool_call_started.get(index)
+                            tool_use_id = tool_call.id or (
+                                existing_info.get("tool_use_id") if existing_info else None
+                            )
+                            function_name = (
+                                tool_call.function.name
+                                if tool_call.function and tool_call.function.name
+                                else (existing_info.get("tool_name") if existing_info else None)
+                            )
+
+                            # Fire "start" event on first chunk for this tool call
+                            if index not in tool_call_started and tool_use_id and function_name:
+                                tool_call_started[index] = {
+                                    "tool_name": function_name,
+                                    "tool_use_id": tool_use_id,
+                                    "streams_arguments": streams_arguments,
+                                }
+                                self._notify_tool_stream_listeners(
+                                    "start",
+                                    {
+                                        "tool_name": function_name,
+                                        "tool_use_id": tool_use_id,
+                                        "index": index,
+                                        "streams_arguments": streams_arguments,
+                                    },
+                                )
+                                self.logger.info(
+                                    "Model started streaming tool call",
+                                    data={
+                                        "progress_action": ProgressAction.CALLING_TOOL,
+                                        "agent_name": self.name,
+                                        "model": model,
+                                        "tool_name": function_name,
+                                        "tool_use_id": tool_use_id,
+                                        "tool_event": "start",
+                                        "streams_arguments": streams_arguments,
+                                    },
+                                )
+                                notified_tool_indices.add(index)
+                            elif existing_info:
+                                if tool_use_id:
+                                    existing_info["tool_use_id"] = tool_use_id
+                                if function_name:
+                                    existing_info["tool_name"] = function_name
+
+                            # Fire "delta" event for argument chunks
+                            if tool_call.function and tool_call.function.arguments:
+                                info = tool_call_started.setdefault(
+                                    index,
+                                    {
+                                        "tool_name": function_name,
+                                        "tool_use_id": tool_use_id,
+                                        "streams_arguments": streams_arguments,
+                                    },
+                                )
+                                self._notify_tool_stream_listeners(
+                                    "delta",
+                                    {
+                                        "tool_name": info.get("tool_name"),
+                                        "tool_use_id": info.get("tool_use_id"),
+                                        "index": index,
+                                        "chunk": tool_call.function.arguments,
+                                        "streams_arguments": info.get("streams_arguments", False),
+                                    },
+                                )
+
+                # Handle text content streaming
+                if delta.content:
+                    content = delta.content
+                    accumulated_content += content
+                    # Use base class method for token estimation and progress emission
+                    estimated_tokens = self._update_streaming_progress(
+                        content, model, estimated_tokens
+                    )
+                    self._notify_tool_stream_listeners(
+                        "text",
+                        {
+                            "chunk": content,
+                            "streams_arguments": streams_arguments,
+                        },
+                    )
+
+                # Fire "stop" event when tool calls complete
+                if choice.finish_reason == "tool_calls":
+                    for index, info in list(tool_call_started.items()):
+                        self._notify_tool_stream_listeners(
+                            "stop",
+                            {
+                                "tool_name": info.get("tool_name"),
+                                "tool_use_id": info.get("tool_use_id"),
+                                "index": index,
+                                "streams_arguments": info.get("streams_arguments", False),
+                            },
+                        )
+                        self.logger.info(
+                            "Model finished streaming tool call",
+                            data={
+                                "progress_action": ProgressAction.CALLING_TOOL,
+                                "agent_name": self.name,
+                                "model": model,
+                                "tool_name": info.get("tool_name"),
+                                "tool_use_id": info.get("tool_use_id"),
+                                "tool_event": "stop",
+                                "streams_arguments": info.get("streams_arguments", False),
+                            },
+                        )
+                        notified_tool_indices.add(index)
+                    tool_call_started.clear()
 
             # Extract other fields from the chunk
             if chunk.choices:
@@ -284,6 +637,15 @@ class OpenAILLM(FastAgentLLM[ChatCompletionMessageParam, ChatCompletionMessage])
                 f"Streaming complete - Model: {model}, Input tokens: {getattr(usage_data, 'prompt_tokens', 0)}, Output tokens: {actual_tokens}"
             )
 
+        final_message = final_completion.choices[0].message if final_completion.choices else None
+        tool_calls = getattr(final_message, "tool_calls", None) if final_message else None
+        self._emit_tool_notification_fallback(
+            tool_calls,
+            notified_tool_indices,
+            streams_arguments=streams_arguments,
+            model=model,
+        )
+
         return final_completion
 
     async def _openai_completion(
@@ -343,13 +705,14 @@ class OpenAILLM(FastAgentLLM[ChatCompletionMessageParam, ChatCompletionMessage])
         self._log_chat_progress(self.chat_turn(), model=self.default_request_params.model)
         model_name = self.default_request_params.model or DEFAULT_OPENAI_MODEL
 
-        # Use basic streaming API
-        stream = await self._openai_client().chat.completions.create(**arguments)
-        # Process the stream
+        # Use basic streaming API with context manager to properly close aiohttp session
         try:
-            response = await self._process_stream(stream, model_name)
+            async with self._openai_client() as client:
+                stream = await client.chat.completions.create(**arguments)
+                # Process the stream
+                response = await self._process_stream(stream, model_name)
         except APIError as error:
-            self.logger.error("Streaming APIError during OpenAI completion", exc_info=error)
+            self.logger.error("APIError during OpenAI completion", exc_info=error)
             return self._stream_failure_response(error, model_name)
         # Track usage if response is valid and has usage data
         if (

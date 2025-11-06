@@ -48,12 +48,14 @@ def get_test_models():
     else:
         return [
             "gpt-4.1-mini",
+            #            "sonnet",
             "haiku",
             "kimi",
             "o4-mini.low",
             "gpt-5-mini.low",
             "gemini25",
             "gpt-oss",
+            #            "responses.gpt-5-mini",
             #     "generic.qwen3:8b",
         ]
 
@@ -91,7 +93,25 @@ _tool = Tool(
     inputSchema=_input_schema,
 )
 
+_const_input_schema = {
+    "type": "object",
+    "properties": {
+        "mode": {
+            "type": "string",
+            "const": "auto-cancel",
+            "description": "The mode must always be the literal 'auto-cancel'.",
+        }
+    },
+    "required": ["mode"],
+}
+_const_tool = Tool(
+    name="const_mode",
+    description="Demonstrates a tool schema that includes a const constraint.",
+    inputSchema=_const_input_schema,
+)
 
+
+@pytest.mark.e2e
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", TEST_MODELS)
 async def test_basic_generation(llm_agent_setup, model_name):
@@ -102,6 +122,7 @@ async def test_basic_generation(llm_agent_setup, model_name):
     assert result.last_text() is not None
 
 
+@pytest.mark.e2e
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", TEST_MODELS)
 async def test_max_tokens_limit(llm_agent_setup, model_name):
@@ -113,6 +134,7 @@ async def test_max_tokens_limit(llm_agent_setup, model_name):
     assert result.stop_reason is LlmStopReason.MAX_TOKENS
 
 
+@pytest.mark.e2e
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", TEST_MODELS)
 async def test_stop_sequence(llm_agent_setup, model_name):
@@ -129,6 +151,7 @@ async def test_stop_sequence(llm_agent_setup, model_name):
         assert result.stop_reason is LlmStopReason.END_TURN
 
 
+@pytest.mark.e2e
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", TEST_MODELS)
 async def test_structured_output(llm_agent_setup, model_name):
@@ -150,6 +173,7 @@ async def test_structured_output(llm_agent_setup, model_name):
     assert result.last_text() is not None
 
 
+@pytest.mark.e2e
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", TEST_MODELS)
 async def test_tool_use_stop(llm_agent_setup, model_name):
@@ -164,6 +188,7 @@ async def test_tool_use_stop(llm_agent_setup, model_name):
     assert "weather" == tool_call.params.name
 
 
+@pytest.mark.e2e
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", TEST_MODELS)
 async def test_tool_user_continuation(llm_agent_setup, model_name):
@@ -187,6 +212,27 @@ async def test_tool_user_continuation(llm_agent_setup, model_name):
     assert "sunny" in result.last_text().lower()
 
 
+@pytest.mark.e2e
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", TEST_MODELS)
+async def test_tool_const_schema(llm_agent_setup, model_name):
+    """Ensure providers accept tool schemas that include const constraints."""
+    agent = llm_agent_setup
+    result = await agent.generate(
+        "call the const_mode tool so I can confirm the mode you must use.",
+        tools=[_const_tool],
+        request_params=RequestParams(maxTokens=400),
+    )
+
+    assert result.stop_reason is LlmStopReason.TOOL_USE
+    assert result.tool_calls
+    assert 1 == len(result.tool_calls)
+    tool_id = next(iter(result.tool_calls.keys()))
+    tool_call: CallToolRequest = result.tool_calls[tool_id]
+    assert "const_mode" == tool_call.params.name
+
+
+@pytest.mark.e2e
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", TEST_MODELS)
 async def test_tool_calling_agent(llm_agent_setup, model_name):
@@ -210,6 +256,7 @@ async def test_tool_calling_agent(llm_agent_setup, model_name):
     assert "sunny" in result.last_text().lower()
 
 
+@pytest.mark.e2e
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", TEST_MODELS)
 async def test_vision_model_reads_name(llm_agent_setup, model_name):
@@ -239,6 +286,7 @@ async def test_vision_model_reads_name(llm_agent_setup, model_name):
     )
 
 
+@pytest.mark.e2e
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", TEST_MODELS)
 async def test_pdf_prompt_summarizes_name(llm_agent_setup, model_name):
@@ -263,6 +311,7 @@ async def test_pdf_prompt_summarizes_name(llm_agent_setup, model_name):
     assert ("fast-agent" in text) or ("llmindset" in text)
 
 
+@pytest.mark.e2e
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", TEST_MODELS)
 async def test_mcp_tool_result_image_reads_name(llm_agent_setup, model_name):
@@ -317,6 +366,7 @@ async def test_mcp_tool_result_image_reads_name(llm_agent_setup, model_name):
     assert "evalstate" in (result.all_text() or "").lower()
 
 
+@pytest.mark.e2e
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", TEST_MODELS)
 async def test_mcp_tool_result_pdf_summarizes_name(llm_agent_setup, model_name):

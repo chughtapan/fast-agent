@@ -64,13 +64,21 @@ def convert_log_event(event: Event) -> "ProgressEvent | None":
         chat_turn = event_data.get("chat_turn")
         if chat_turn is not None:
             details = f"{model} turn {chat_turn}"
+
+        tool_name = event_data.get("tool_name")
+        tool_event = event_data.get("tool_event")
+        if tool_name:
+            tool_suffix = tool_name
+            if tool_event:
+                tool_suffix = f"{tool_suffix} ({tool_event})"
+            details = f"{details} • {tool_suffix}".strip()
     else:
         if not target:
             target = event_data.get("target", "unknown")
 
     # Extract streaming token count for STREAMING actions
     streaming_tokens = None
-    if progress_action == ProgressAction.STREAMING:
+    if progress_action == ProgressAction.STREAMING or progress_action == ProgressAction.THINKING:
         streaming_tokens = event_data.get("details", "")
 
     # Extract progress data for TOOL_PROGRESS actions

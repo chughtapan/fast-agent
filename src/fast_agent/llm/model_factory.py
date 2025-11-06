@@ -84,10 +84,15 @@ class ModelFactory:
         "claude-opus-4-20250514": Provider.ANTHROPIC,
         "claude-sonnet-4-20250514": Provider.ANTHROPIC,
         "claude-sonnet-4-0": Provider.ANTHROPIC,
+        "claude-sonnet-4-5-20250929": Provider.ANTHROPIC,
+        "claude-sonnet-4-5": Provider.ANTHROPIC,
+        "claude-haiku-4-5": Provider.ANTHROPIC,
         "deepseek-chat": Provider.DEEPSEEK,
         "gemini-2.0-flash": Provider.GOOGLE,
         "gemini-2.5-flash-preview-05-20": Provider.GOOGLE,
+        "gemini-2.5-flash-preview-09-2025": Provider.GOOGLE,
         "gemini-2.5-pro-preview-05-06": Provider.GOOGLE,
+        "gemini-2.5-pro": Provider.GOOGLE,
         "grok-4": Provider.XAI,
         "grok-4-0709": Provider.XAI,
         "grok-3": Provider.XAI,
@@ -101,22 +106,24 @@ class ModelFactory:
     }
 
     MODEL_ALIASES = {
-        "sonnet": "claude-sonnet-4-0",
+        "sonnet": "claude-sonnet-4-5",
         "sonnet4": "claude-sonnet-4-0",
+        "sonnet45": "claude-sonnet-4-5",
         "sonnet35": "claude-3-5-sonnet-latest",
         "sonnet37": "claude-3-7-sonnet-latest",
         "claude": "claude-sonnet-4-0",
-        "haiku": "claude-3-5-haiku-latest",
+        "haiku": "claude-haiku-4-5",
         "haiku3": "claude-3-haiku-20240307",
         "haiku35": "claude-3-5-haiku-latest",
+        "hauku45": "claude-haiku-4-5",
         "opus": "claude-opus-4-1",
         "opus4": "claude-opus-4-1",
         "opus3": "claude-3-opus-latest",
         "deepseekv3": "deepseek-chat",
         "deepseek": "deepseek-chat",
         "gemini2": "gemini-2.0-flash",
-        "gemini25": "gemini-2.5-flash-preview-05-20",
-        "gemini25pro": "gemini-2.5-pro-preview-05-06",
+        "gemini25": "gemini-2.5-flash-preview-09-2025",
+        "gemini25pro": "gemini-2.5-pro",
         "kimi": "groq.moonshotai/kimi-k2-instruct-0905",
         "gpt-oss": "groq.openai/gpt-oss-120b",
         "gpt-oss-20b": "groq.openai/gpt-oss-20b",
@@ -314,6 +321,11 @@ class ModelFactory:
                 from fast_agent.llm.provider.openai.llm_groq import GroqLLM
 
                 return GroqLLM
+            if provider == Provider.RESPONSES:
+                from fast_agent.llm.provider.openai.responses import ResponsesLLM
+
+                return ResponsesLLM
+
         except Exception as e:
             raise ModelConfigError(
                 f"Provider '{provider.value}' is unavailable or missing dependencies: {e}"

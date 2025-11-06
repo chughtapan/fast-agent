@@ -4,9 +4,10 @@ These decorators provide type-safe function signatures and IDE support
 for creating agents in the DirectFastAgent framework.
 """
 
-from functools import wraps
+from collections.abc import Coroutine
 from pathlib import Path
 from typing import (
+    Any,
     Awaitable,
     Callable,
     Dict,
@@ -16,7 +17,6 @@ from typing import (
     ParamSpec,
     Protocol,
     TypeVar,
-    cast,
 )
 
 from mcp.client.session import ElicitationFnT
@@ -27,14 +27,12 @@ from fast_agent.agents.workflow.iterative_planner import ITERATIVE_PLAN_SYSTEM_P
 from fast_agent.agents.workflow.router_agent import (
     ROUTING_SYSTEM_INSTRUCTION,
 )
+from fast_agent.skills import SkillManifest, SkillRegistry
 from fast_agent.types import RequestParams
 
 # Type variables for the decorated function
 P = ParamSpec("P")  # Parameters
 R = TypeVar("R", covariant=True)  # Return type
-
-# Type for agent functions - can be either async or sync
-AgentCallable = Callable[P, Awaitable[R]]
 
 
 # Protocol for decorated agent functions
@@ -185,8 +183,11 @@ def _decorator_impl(
     tools: Optional[Dict[str, List[str]]] = None,
     resources: Optional[Dict[str, List[str]]] = None,
     prompts: Optional[Dict[str, List[str]]] = None,
+    skills: SkillManifest | SkillRegistry | Path | str | List[
+        SkillManifest | SkillRegistry | Path | str | None
+    ] | None = None,
     **extra_kwargs,
-) -> Callable[[AgentCallable[P, R]], AgentCallable[P, R]]:
+) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """
     Core implementation for agent decorators with common behavior and type safety.
 
@@ -203,12 +204,7 @@ def _decorator_impl(
         **extra_kwargs: Additional agent/workflow-specific parameters
     """
 
-    def decorator(func: AgentCallable[P, R]) -> AgentCallable[P, R]:
-        @wraps(func)
-        def wrapper(*args: P.args, **kwargs: P.kwargs) -> Awaitable[R]:
-            # Call the original function
-            return func(*args, **kwargs)
-
+    def decorator(func: Callable[P, Coroutine[Any, Any, R]]) -> Callable[P, Coroutine[Any, Any, R]]:
         # Create agent configuration
         config = AgentConfig(
             name=name,
@@ -217,6 +213,7 @@ def _decorator_impl(
             tools=tools,
             resources=resources,
             prompts=prompts,
+            skills=skills,
             model=model,
             use_history=use_history,
             human_input=human_input,
@@ -229,7 +226,7 @@ def _decorator_impl(
         if request_params:
             config.default_request_params = request_params
 
-        # Store metadata on the wrapper function
+        # Store metadata in the registry
         agent_data = {
             "config": config,
             "type": agent_type.value,
@@ -243,13 +240,13 @@ def _decorator_impl(
         # Store the configuration in the FastAgent instance
         self.agents[name] = agent_data
 
-        # Store type information for IDE support
-        setattr(wrapper, "_agent_type", agent_type)
-        setattr(wrapper, "_agent_config", config)
+        # Store type information on the function for IDE support
+        setattr(func, "_agent_type", agent_type)
+        setattr(func, "_agent_config", config)
         for key, value in extra_kwargs.items():
-            setattr(wrapper, f"_{key}", value)
+            setattr(func, f"_{key}", value)
 
-        return cast("AgentCallable[P, R]", wrapper)
+        return func
 
     return decorator
 
@@ -264,6 +261,7 @@ def agent(
     tools: Optional[Dict[str, List[str]]] = None,
     resources: Optional[Dict[str, List[str]]] = None,
     prompts: Optional[Dict[str, List[str]]] = None,
+    skills: SkillManifest | SkillRegistry | Path | str | None = None,
     model: Optional[str] = None,
     use_history: bool = True,
     request_params: RequestParams | None = None,
@@ -271,7 +269,7 @@ def agent(
     default: bool = False,
     elicitation_handler: Optional[ElicitationFnT] = None,
     api_key: str | None = None,
-) -> Callable[[AgentCallable[P, R]], AgentCallable[P, R]]:
+) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """
     Decorator to create and register a standard agent with type-safe signature.
 
@@ -314,6 +312,7 @@ def agent(
         tools=tools,
         resources=resources,
         prompts=prompts,
+        skills=skills,
         api_key=api_key,
     )
 
@@ -329,6 +328,7 @@ def custom(
     tools: Optional[Dict[str, List[str]]] = None,
     resources: Optional[Dict[str, List[str]]] = None,
     prompts: Optional[Dict[str, List[str]]] = None,
+    skills: SkillManifest | SkillRegistry | Path | str | None = None,
     model: Optional[str] = None,
     use_history: bool = True,
     request_params: RequestParams | None = None,
@@ -336,7 +336,7 @@ def custom(
     default: bool = False,
     elicitation_handler: Optional[ElicitationFnT] = None,
     api_key: str | None = None,
-) -> Callable[[AgentCallable[P, R]], AgentCallable[P, R]]:
+) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """
     Decorator to create and register a standard agent with type-safe signature.
 
@@ -376,6 +376,7 @@ def custom(
         tools=tools,
         resources=resources,
         prompts=prompts,
+        skills=skills,
     )
 
 
@@ -400,7 +401,7 @@ def orchestrator(
     plan_iterations: int = 5,
     default: bool = False,
     api_key: str | None = None,
-) -> Callable[[AgentCallable[P, R]], AgentCallable[P, R]]:
+) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """
     Decorator to create and register an orchestrator agent with type-safe signature.
 
@@ -452,7 +453,7 @@ def iterative_planner(
     plan_iterations: int = -1,
     default: bool = False,
     api_key: str | None = None,
-) -> Callable[[AgentCallable[P, R]], AgentCallable[P, R]]:
+) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """
     Decorator to create and register an orchestrator agent with type-safe signature.
 
@@ -510,7 +511,7 @@ def router(
         ElicitationFnT
     ] = None,  ## exclude from docs, decide whether allowable
     api_key: str | None = None,
-) -> Callable[[AgentCallable[P, R]], AgentCallable[P, R]]:
+) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """
     Decorator to create and register a router agent with type-safe signature.
 
@@ -558,7 +559,7 @@ def chain(
     instruction: Optional[str | Path | AnyUrl] = None,
     cumulative: bool = False,
     default: bool = False,
-) -> Callable[[AgentCallable[P, R]], AgentCallable[P, R]]:
+) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """
     Decorator to create and register a chain agent with type-safe signature.
 
@@ -604,7 +605,7 @@ def parallel(
     instruction: Optional[str | Path | AnyUrl] = None,
     include_request: bool = True,
     default: bool = False,
-) -> Callable[[AgentCallable[P, R]], AgentCallable[P, R]]:
+) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """
     Decorator to create and register a parallel agent with type-safe signature.
 
@@ -648,7 +649,7 @@ def evaluator_optimizer(
     min_rating: str = "GOOD",
     max_refinements: int = 3,
     default: bool = False,
-) -> Callable[[AgentCallable[P, R]], AgentCallable[P, R]]:
+) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """
     Decorator to create and register an evaluator-optimizer agent with type-safe signature.
 

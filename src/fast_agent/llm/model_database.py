@@ -87,7 +87,7 @@ class ModelDatabase:
     )
 
     GEMINI_PRO = ModelParameters(
-        context_window=2097152, max_output_tokens=8192, tokenizes=GOOGLE_MULTIMODAL
+        context_window=1_048_576, max_output_tokens=65_536, tokenizes=GOOGLE_MULTIMODAL
     )
 
     QWEN_STANDARD = ModelParameters(
@@ -130,11 +130,9 @@ class ModelDatabase:
         context_window=400000, max_output_tokens=128000, tokenizes=OPENAI_MULTIMODAL
     )
 
-    # TODO update to 32000
     ANTHROPIC_OPUS_4_VERSIONED = ModelParameters(
         context_window=200000, max_output_tokens=32000, tokenizes=ANTHROPIC_MULTIMODAL
     )
-    # TODO update to 64000
     ANTHROPIC_SONNET_4_VERSIONED = ModelParameters(
         context_window=200000, max_output_tokens=64000, tokenizes=ANTHROPIC_MULTIMODAL
     )
@@ -232,9 +230,13 @@ class ModelDatabase:
         "claude-3-7-sonnet-latest": ANTHROPIC_37_SERIES,
         "claude-sonnet-4-0": ANTHROPIC_SONNET_4_VERSIONED,
         "claude-sonnet-4-20250514": ANTHROPIC_SONNET_4_VERSIONED,
+        "claude-sonnet-4-5": ANTHROPIC_SONNET_4_VERSIONED,
+        "claude-sonnet-4-5-20250929": ANTHROPIC_SONNET_4_VERSIONED,
         "claude-opus-4-0": ANTHROPIC_OPUS_4_VERSIONED,
         "claude-opus-4-1": ANTHROPIC_OPUS_4_VERSIONED,
         "claude-opus-4-20250514": ANTHROPIC_OPUS_4_VERSIONED,
+        "claude-haiku-4-5-20251001": ANTHROPIC_SONNET_4_VERSIONED,
+        "claude-haiku-4-5": ANTHROPIC_SONNET_4_VERSIONED,
         # DeepSeek Models
         "deepseek-chat": DEEPSEEK_CHAT_STANDARD,
         # Google Gemini Models (vanilla aliases and versioned)
@@ -243,6 +245,9 @@ class ModelDatabase:
         "gemini-2.5-pro-preview": GEMINI_2_5_PRO,
         "gemini-2.5-flash-preview-05-20": GEMINI_FLASH,
         "gemini-2.5-pro-preview-05-06": GEMINI_PRO,
+        "gemini-2.5-pro": GEMINI_PRO,
+        "gemini-2.5-flash-preview-09-2025": GEMINI_FLASH,
+        "gemini-2.5-flash": GEMINI_FLASH,
         # xAI Grok Models
         "grok-4-fast-reasoning": GROK_4_VLM,
         "grok-4-fast-non-reasoning": GROK_4_VLM,

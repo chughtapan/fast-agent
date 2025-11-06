@@ -11,7 +11,9 @@ from abc import ABC
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
+    Iterable,
     List,
     Mapping,
     Optional,
@@ -41,16 +43,21 @@ from fast_agent.constants import HUMAN_INPUT_TOOL_NAME
 from fast_agent.core.exceptions import PromptExitError
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.interfaces import FastAgentLLMProtocol
-from fast_agent.mcp.mcp_aggregator import MCPAggregator
+from fast_agent.mcp.common import get_resource_name, get_server_name, is_namespaced_name
+from fast_agent.mcp.mcp_aggregator import MCPAggregator, NamespacedTool, ServerStatus
+from fast_agent.skills.registry import format_skills_for_prompt
 from fast_agent.tools.elicitation import (
     get_elicitation_tool,
     run_elicitation_form,
     set_elicitation_input_callback,
 )
+from fast_agent.tools.shell_runtime import ShellRuntime
 from fast_agent.types import PromptMessageExtended, RequestParams
+from fast_agent.ui import console
 
 # Define a TypeVar for models
 ModelT = TypeVar("ModelT", bound=BaseModel)
+ItemT = TypeVar("ItemT")
 
 LLM = TypeVar("LLM", bound=FastAgentLLMProtocol)
 
@@ -59,6 +66,7 @@ if TYPE_CHECKING:
 
     from fast_agent.context import Context
     from fast_agent.llm.usage_tracking import UsageAccumulator
+    from fast_agent.skills import SkillManifest
 
 
 class McpAgent(ABC, ToolAgent):
@@ -73,7 +81,6 @@ class McpAgent(ABC, ToolAgent):
         self,
         config: AgentConfig,
         connection_persistence: bool = True,
-        # legacy human_input_callback removed
         context: "Context | None" = None,
         **kwargs,
     ) -> None:
@@ -96,6 +103,69 @@ class McpAgent(ABC, ToolAgent):
         self.instruction = self.config.instruction
         self.executor = context.executor if context else None
         self.logger = get_logger(f"{__name__}.{self._name}")
+        manifests: List[SkillManifest] = list(getattr(self.config, "skill_manifests", []) or [])
+        if not manifests and context and getattr(context, "skill_registry", None):
+            try:
+                manifests = list(context.skill_registry.load_manifests())  # type: ignore[assignment]
+            except Exception:
+                manifests = []
+
+        self._skill_manifests = list(manifests)
+        self._skill_map: Dict[str, SkillManifest] = {
+            manifest.name: manifest for manifest in manifests
+        }
+        self._agent_skills_warning_shown = False
+        shell_flag_requested = bool(context and getattr(context, "shell_runtime", False))
+        skills_configured = bool(self._skill_manifests)
+        self._shell_runtime_activation_reason: str | None = None
+
+        if shell_flag_requested and skills_configured:
+            self._shell_runtime_activation_reason = (
+                "via --shell flag and agent skills configuration"
+            )
+        elif shell_flag_requested:
+            self._shell_runtime_activation_reason = "via --shell flag"
+        elif skills_configured:
+            self._shell_runtime_activation_reason = "because agent skills are configured"
+
+        # Get timeout configuration from context
+        timeout_seconds = 90  # default
+        warning_interval_seconds = 30  # default
+        if context and context.config:
+            shell_config = getattr(context.config, "shell_execution", None)
+            if shell_config:
+                timeout_seconds = getattr(shell_config, "timeout_seconds", 90)
+                warning_interval_seconds = getattr(shell_config, "warning_interval_seconds", 30)
+
+        # Derive skills directory from this agent's manifests (respects per-agent config)
+        skills_directory = None
+        if self._skill_manifests:
+            # Get the skills directory from the first manifest's path
+            # Path structure: .fast-agent/skills/skill-name/SKILL.md
+            # So we need parent.parent of the manifest path
+            first_manifest = self._skill_manifests[0]
+            if first_manifest.path:
+                skills_directory = first_manifest.path.parent.parent
+
+        self._shell_runtime = ShellRuntime(
+            self._shell_runtime_activation_reason,
+            self.logger,
+            timeout_seconds=timeout_seconds,
+            warning_interval_seconds=warning_interval_seconds,
+            skills_directory=skills_directory,
+        )
+        self._shell_runtime_enabled = self._shell_runtime.enabled
+        self._shell_access_modes: tuple[str, ...] = ()
+        if self._shell_runtime_enabled:
+            modes: list[str] = ["[red]direct[/red]"]
+            if skills_configured:
+                modes.append("skills")
+            if shell_flag_requested:
+                modes.append("switch")
+            self._shell_access_modes = tuple(modes)
+        self._bash_tool = self._shell_runtime.tool
+        if self._shell_runtime_enabled:
+            self._shell_runtime.announce()
 
         # Store the default request params from config
         self._default_request_params = self.config.default_request_params
@@ -163,6 +233,17 @@ class McpAgent(ABC, ToolAgent):
         """
         await self._aggregator.close()
 
+    async def get_server_status(self) -> Dict[str, ServerStatus]:
+        """Expose server status details for UI and diagnostics consumers."""
+        if not self._aggregator:
+            return {}
+        return await self._aggregator.collect_server_status()
+
+    @property
+    def aggregator(self) -> MCPAggregator:
+        """Expose the MCP aggregator for UI integrations."""
+        return self._aggregator
+
     @property
     def initialized(self) -> bool:
         """Check if both the agent and aggregator are initialized."""
@@ -195,6 +276,24 @@ class McpAgent(ABC, ToolAgent):
             self.instruction = self.instruction.replace(
                 "{{serverInstructions}}", server_instructions
             )
+
+        skills_placeholder_present = "{{agentSkills}}" in self.instruction
+
+        if skills_placeholder_present:
+            agent_skills = format_skills_for_prompt(self._skill_manifests)
+            self.instruction = self.instruction.replace("{{agentSkills}}", agent_skills)
+            self._agent_skills_warning_shown = True
+        elif self._skill_manifests and not self._agent_skills_warning_shown:
+            warning_message = (
+                "Agent skills are configured but the system prompt does not include {{agentSkills}}. "
+                "Skill descriptions will not be added to the system prompt."
+            )
+            self.logger.warning(warning_message)
+            try:
+                console.console.print(f"[yellow]{warning_message}[/yellow]")
+            except Exception:  # pragma: no cover - console fallback
+                pass
+            self._agent_skills_warning_shown = True
 
         # Update default request params to match
         if self._default_request_params:
@@ -249,87 +348,107 @@ class McpAgent(ABC, ToolAgent):
     ) -> str:
         return await self.send(message)
 
-    # async def send(
-    #     self,
-    #     message: Union[
-    #         str,
-    #         PromptMessage,
-    #         PromptMessageExtended,
-    #         Sequence[Union[str, PromptMessage, PromptMessageExtended]],
-    #     ],
-    #     request_params: RequestParams | None = None,
-    # ) -> str:
-    #     """
-    #     Send a message to the agent and get a response.
-
-    #     Args:
-    #         message: Message content in various formats:
-    #             - String: Converted to a user PromptMessageExtended
-    #             - PromptMessage: Converted to PromptMessageExtended
-    #             - PromptMessageExtended: Used directly
-    #             - request_params: Optional request parameters
-
-    #     Returns:
-    #         The agent's response as a string
-    #     """
-    #     response = await self.generate(message, request_params)
-    #     return response.last_text() or ""
-
-    def _matches_pattern(self, name: str, pattern: str, server_name: str) -> bool:
+    def _matches_pattern(self, name: str, pattern: str) -> bool:
         """
         Check if a name matches a pattern for a specific server.
 
         Args:
             name: The name to match (could be tool name, resource URI, or prompt name)
             pattern: The pattern to match against (e.g., "add", "math*", "resource://math/*")
-            server_name: The server name (used for tool name prefixing)
 
         Returns:
             True if the name matches the pattern
         """
-        # For tools, build the full pattern with server prefix: server_name-pattern
-        if name.startswith(f"{server_name}-"):
-            full_pattern = f"{server_name}-{pattern}"
-            return fnmatch.fnmatch(name, full_pattern)
 
         # For resources and prompts, match directly against the pattern
         return fnmatch.fnmatch(name, pattern)
 
-    async def list_tools(self) -> ListToolsResult:
+    def _filter_namespaced_tools(self, tools: Sequence[Tool] | None) -> list[Tool]:
         """
-        List all tools available to this agent, filtered by configuration.
+        Apply configuration-based filtering to a collection of tools.
+        """
+        if not tools:
+            return []
+
+        return [
+            tool
+            for tool in tools
+            if is_namespaced_name(tool.name) and self._tool_matches_filter(tool.name)
+        ]
+
+    def _filter_server_collections(
+        self,
+        items_by_server: Mapping[str, Sequence[ItemT]],
+        filters: Mapping[str, Sequence[str]] | None,
+        value_getter: Callable[[ItemT], str],
+    ) -> dict[str, list[ItemT]]:
+        """
+        Apply server-specific filters to a mapping of collections.
+        """
+        if not items_by_server:
+            return {}
+
+        if not filters:
+            return {server: list(items) for server, items in items_by_server.items()}
+
+        filtered: dict[str, list[ItemT]] = {}
+        for server, items in items_by_server.items():
+            patterns = filters.get(server)
+            if patterns is None:
+                filtered[server] = list(items)
+                continue
+
+            matches = [
+                item
+                for item in items
+                if any(self._matches_pattern(value_getter(item), pattern) for pattern in patterns)
+            ]
+            if matches:
+                filtered[server] = matches
+
+        return filtered
+
+    def _filter_server_tools(self, tools: list[Tool] | None, namespace: str) -> list[Tool]:
+        """
+        Filter items for a Server (not namespaced)
+        """
+        if not tools:
+            return []
+
+        filters = self.config.tools
+        if not filters:
+            return list(tools)
+
+        if namespace not in filters:
+            return list(tools)
+
+        filtered = self._filter_server_collections({namespace: tools}, filters, lambda tool: tool.name)
+        return filtered.get(namespace, [])
+
+    async def _get_filtered_mcp_tools(self) -> list[Tool]:
+        """
+        Get the list of tools available to this agent, applying configured filters.
 
         Returns:
-            ListToolsResult with available tools
+            List of Tool objects
         """
-        # Get all tools from the aggregator
-        result = await self._aggregator.list_tools()
+        aggregator_result = await self._aggregator.list_tools()
+        return self._filter_namespaced_tools(aggregator_result.tools)
 
-        # Apply filtering if tools are specified in config
-        if self.config.tools is not None:
-            filtered_tools = []
-            for tool in result.tools:
-                # Extract server name from tool name, handling server names with hyphens
-                server_name = None
-                for configured_server in self.config.tools.keys():
-                    if tool.name.startswith(f"{configured_server}-"):
-                        server_name = configured_server
-                        break
+    def _tool_matches_filter(self, packed_name: str) -> bool:
+        """
+        Check if a tool name matches the agent's tool configuration.
 
-                # Check if this server has tool filters
-                if server_name and server_name in self.config.tools:
-                    # Check if tool matches any pattern for this server
-                    for pattern in self.config.tools[server_name]:
-                        if self._matches_pattern(tool.name, pattern, server_name):
-                            filtered_tools.append(tool)
-                            break
-            result.tools = filtered_tools
-
-        # Append human input tool if enabled and available
-        if self.config.human_input and getattr(self, "_human_input_tool", None):
-            result.tools.append(self._human_input_tool)
-
-        return result
+        Args:
+            tool_name: The name of the tool to check (namespaced)
+        """
+        server_name = get_server_name(packed_name)
+        config_tools = self.config.tools or {}
+        if server_name not in config_tools:
+            return True
+        resource_name = get_resource_name(packed_name)
+        patterns = config_tools.get(server_name, [])
+        return any(self._matches_pattern(resource_name, pattern) for pattern in patterns)
 
     async def call_tool(self, name: str, arguments: Dict[str, Any] | None = None) -> CallToolResult:
         """
@@ -342,9 +461,15 @@ class McpAgent(ABC, ToolAgent):
         Returns:
             Result of the tool call
         """
+        if self._shell_runtime.tool and name == self._shell_runtime.tool.name:
+            return await self._shell_runtime.execute(arguments)
+
         if name == HUMAN_INPUT_TOOL_NAME:
             # Call the elicitation-backed human input tool
             return await self._call_human_input_tool(arguments)
+
+        if name in self._execution_tools:
+            return await super().call_tool(name, arguments)
         else:
             return await self._aggregator.call_tool(name, arguments)
 
@@ -597,68 +722,116 @@ class McpAgent(ABC, ToolAgent):
             return PromptMessageExtended(role="user", tool_results={})
 
         tool_results: dict[str, CallToolResult] = {}
-        self._tool_loop_error = None
+        tool_loop_error: str | None = None
 
-        # Cache available tool names (original, not namespaced) for display
-        available_tools = [
-            namespaced_tool.tool.name
-            for namespaced_tool in self._aggregator._namespaced_tool_map.values()
-        ]
+        # Cache available tool names exactly as advertised to the LLM for display/highlighting
+        try:
+            listed_tools = await self.list_tools()
+        except Exception as exc:  # pragma: no cover - defensive guard, should not happen
+            self.logger.warning(f"Failed to list tools before execution: {exc}")
+            listed_tools = ListToolsResult(tools=[])
+
+        available_tools: list[str] = []
+        seen_tool_names: set[str] = set()
+        for tool_schema in listed_tools.tools:
+            if tool_schema.name in seen_tool_names:
+                continue
+            available_tools.append(tool_schema.name)
+            seen_tool_names.add(tool_schema.name)
+
+        # Cache namespaced tools for routing/metadata
+        namespaced_tools = self._aggregator._namespaced_tool_map
 
         # Process each tool call using our aggregator
         for correlation_id, tool_request in request.tool_calls.items():
             tool_name = tool_request.params.name
             tool_args = tool_request.params.arguments or {}
 
-            # Get the original tool name for display (not namespaced)
-            namespaced_tool = self._aggregator._namespaced_tool_map.get(tool_name)
-            display_tool_name = namespaced_tool.tool.name if namespaced_tool else tool_name
-
-            tool_available = False
-            if tool_name == HUMAN_INPUT_TOOL_NAME:
-                tool_available = True
-            elif namespaced_tool:
-                tool_available = True
-            else:
-                tool_available = any(
-                    candidate.tool.name == tool_name
-                    for candidate in self._aggregator._namespaced_tool_map.values()
+            # Determine which tool we are calling (namespaced MCP, local, etc.)
+            namespaced_tool = namespaced_tools.get(tool_name)
+            local_tool = self._execution_tools.get(tool_name)
+            candidate_namespaced_tool = None
+            if namespaced_tool is None and local_tool is None:
+                candidate_namespaced_tool = next(
+                    (
+                        candidate
+                        for candidate in namespaced_tools.values()
+                        if candidate.tool.name == tool_name
+                    ),
+                    None,
                 )
+
+            # Select display/highlight names
+            display_tool_name = (
+                (namespaced_tool or candidate_namespaced_tool).namespaced_tool_name
+                if (namespaced_tool or candidate_namespaced_tool) is not None
+                else tool_name
+            )
+
+            tool_available = (
+                tool_name == HUMAN_INPUT_TOOL_NAME
+                or (self._shell_runtime.tool and tool_name == self._shell_runtime.tool.name)
+                or namespaced_tool is not None
+                or local_tool is not None
+                or candidate_namespaced_tool is not None
+            )
 
             if not tool_available:
                 error_message = f"Tool '{display_tool_name}' is not available"
                 self.logger.error(error_message)
-                self._mark_tool_loop_error(
+                tool_loop_error = self._mark_tool_loop_error(
                     correlation_id=correlation_id,
                     error_message=error_message,
                     tool_results=tool_results,
                 )
                 break
 
-            # Find the index of the current tool in available_tools for highlighting
-            highlight_index = None
-            try:
-                highlight_index = available_tools.index(display_tool_name)
-            except ValueError:
-                # Tool not found in list, no highlighting
-                pass
+            metadata: dict[str, Any] | None = None
+            if (
+                self._shell_runtime_enabled
+                and self._shell_runtime.tool
+                and tool_name == self._shell_runtime.tool.name
+            ):
+                metadata = self._shell_runtime.metadata(tool_args.get("command"))
+
+            display_tool_name, bottom_items, highlight_index = self._prepare_tool_display(
+                tool_name=tool_name,
+                namespaced_tool=namespaced_tool,
+                candidate_namespaced_tool=candidate_namespaced_tool,
+                local_tool=local_tool,
+                fallback_order=self._unique_preserving_order(available_tools),
+            )
 
             self.display.show_tool_call(
                 name=self._name,
                 tool_args=tool_args,
-                bottom_items=available_tools,
+                bottom_items=bottom_items,
                 tool_name=display_tool_name,
                 highlight_index=highlight_index,
                 max_item_length=12,
+                metadata=metadata,
             )
 
             try:
-                # Use our aggregator to call the MCP tool
+                # Use the appropriate handler for this tool
                 result = await self.call_tool(tool_name, tool_args)
                 tool_results[correlation_id] = result
 
                 # Show tool result (like ToolAgent does)
-                self.display.show_tool_result(name=self._name, result=result)
+                skybridge_config = None
+                skybridge_tool = namespaced_tool or candidate_namespaced_tool
+                if skybridge_tool:
+                    skybridge_config = await self._aggregator.get_skybridge_config(
+                        skybridge_tool.server_name
+                    )
+
+                if not getattr(result, "_suppress_display", False):
+                    self.display.show_tool_result(
+                        name=self._name,
+                        result=result,
+                        tool_name=display_tool_name,
+                        skybridge_config=skybridge_config,
+                    )
 
                 self.logger.debug(f"MCP tool {display_tool_name} executed successfully")
             except Exception as e:
@@ -669,10 +842,77 @@ class McpAgent(ABC, ToolAgent):
                 )
                 tool_results[correlation_id] = error_result
 
-                # Show error result too
+                # Show error result too (no need for skybridge config on errors)
                 self.display.show_tool_result(name=self._name, result=error_result)
 
-        return self._finalize_tool_results(tool_results)
+        return self._finalize_tool_results(tool_results, tool_loop_error=tool_loop_error)
+
+    def _prepare_tool_display(
+        self,
+        *,
+        tool_name: str,
+        namespaced_tool: "NamespacedTool | None",
+        candidate_namespaced_tool: "NamespacedTool | None",
+        local_tool: Any | None,
+        fallback_order: list[str],
+    ) -> tuple[str, list[str] | None, int | None]:
+        """
+        Determine how we present tool metadata for the console display.
+
+        Returns a tuple of (display_tool_name, bottom_items, highlight_index).
+        """
+        active_namespaced = namespaced_tool or candidate_namespaced_tool
+        display_tool_name = (
+            active_namespaced.namespaced_tool_name if active_namespaced is not None else tool_name
+        )
+
+        bottom_items: list[str] | None = None
+        highlight_target: str | None = None
+
+        if active_namespaced is not None:
+            server_tools = self._aggregator._server_to_tool_map.get(
+                active_namespaced.server_name, []
+            )
+            if server_tools:
+                bottom_items = self._unique_preserving_order(
+                    tool_entry.tool.name for tool_entry in server_tools
+                )
+            highlight_target = active_namespaced.tool.name
+        elif local_tool is not None:
+            bottom_items = self._unique_preserving_order(self._execution_tools.keys())
+            highlight_target = tool_name
+        elif tool_name == HUMAN_INPUT_TOOL_NAME:
+            bottom_items = [HUMAN_INPUT_TOOL_NAME]
+            highlight_target = HUMAN_INPUT_TOOL_NAME
+
+        highlight_index: int | None = None
+        if bottom_items and highlight_target:
+            try:
+                highlight_index = bottom_items.index(highlight_target)
+            except ValueError:
+                highlight_index = None
+
+        if bottom_items is None and fallback_order:
+            bottom_items = fallback_order
+            fallback_target = display_tool_name if display_tool_name in bottom_items else tool_name
+            try:
+                highlight_index = bottom_items.index(fallback_target)
+            except ValueError:
+                highlight_index = None
+
+        return display_tool_name, bottom_items, highlight_index
+
+    @staticmethod
+    def _unique_preserving_order(items: Iterable[str]) -> list[str]:
+        """Return a list of unique items while preserving original order."""
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in items:
+            if item in seen:
+                continue
+            seen.add(item)
+            result.append(item)
+        return result
 
     async def apply_prompt_template(self, prompt_result: GetPromptResult, prompt_name: str) -> str:
         """
@@ -689,37 +929,6 @@ class McpAgent(ABC, ToolAgent):
         assert self._llm
         with self._tracer.start_as_current_span(f"Agent: '{self._name}' apply_prompt_template"):
             return await self._llm.apply_prompt_template(prompt_result, prompt_name)
-
-    # async def structured(
-    #     self,
-    #     messages: Union[
-    #         str,
-    #         PromptMessage,
-    #         PromptMessageExtended,
-    #         Sequence[Union[str, PromptMessage, PromptMessageExtended]],
-    #     ],
-    #     model: Type[ModelT],
-    #     request_params: RequestParams | None = None,
-    # ) -> Tuple[ModelT | None, PromptMessageExtended]:
-    #     """
-    #     Apply the prompt and return the result as a Pydantic model.
-    #     Normalizes input messages and delegates to the attached LLM.
-
-    #     Args:
-    #         messages: Message(s) in various formats:
-    #             - String: Converted to a user PromptMessageExtended
-    #             - PromptMessage: Converted to PromptMessageExtended
-    #             - PromptMessageExtended: Used directly
-    #             - List of any combination of the above
-    #         model: The Pydantic model class to parse the result into
-    #         request_params: Optional parameters to configure the LLM request
-
-    #     Returns:
-    #         An instance of the specified model, or None if coercion fails
-    #     """
-
-    #     with self._tracer.start_as_current_span(f"Agent: '{self._name}' structured"):
-    #         return await super().structured(messages, model, request_params)
 
     async def apply_prompt_messages(
         self, prompts: List[PromptMessageExtended], request_params: RequestParams | None = None
@@ -754,24 +963,11 @@ class McpAgent(ABC, ToolAgent):
         target = namespace if namespace is not None else server_name
         result = await self._aggregator.list_prompts(target)
 
-        # Apply filtering if prompts are specified in config
-        if self.config.prompts is not None:
-            filtered_result = {}
-            for server, prompts in result.items():
-                # Check if this server has prompt filters
-                if server in self.config.prompts:
-                    filtered_prompts = []
-                    for prompt in prompts:
-                        # Check if prompt matches any pattern for this server
-                        for pattern in self.config.prompts[server]:
-                            if self._matches_pattern(prompt.name, pattern, server):
-                                filtered_prompts.append(prompt)
-                                break
-                    if filtered_prompts:
-                        filtered_result[server] = filtered_prompts
-            result = filtered_result
-
-        return result
+        return self._filter_server_collections(
+            result,
+            self.config.prompts,
+            lambda prompt: prompt.name,
+        )
 
     async def list_resources(
         self, namespace: str | None = None, server_name: str | None = None
@@ -789,28 +985,13 @@ class McpAgent(ABC, ToolAgent):
         target = namespace if namespace is not None else server_name
         result = await self._aggregator.list_resources(target)
 
-        # Apply filtering if resources are specified in config
-        if self.config.resources is not None:
-            filtered_result = {}
-            for server, resources in result.items():
-                # Check if this server has resource filters
-                if server in self.config.resources:
-                    filtered_resources = []
-                    for resource in resources:
-                        # Check if resource matches any pattern for this server
-                        for pattern in self.config.resources[server]:
-                            if self._matches_pattern(resource, pattern, server):
-                                filtered_resources.append(resource)
-                                break
-                    if filtered_resources:
-                        filtered_result[server] = filtered_resources
-            result = filtered_result
+        return self._filter_server_collections(
+            result,
+            self.config.resources,
+            lambda resource: resource,
+        )
 
-        return result
-
-    async def list_mcp_tools(
-        self, namespace: str | None = None, server_name: str | None = None
-    ) -> Mapping[str, List[Tool]]:
+    async def list_mcp_tools(self, namespace: str | None = None) -> Mapping[str, List[Tool]]:
         """
         List all tools available to this agent, grouped by server and filtered by configuration.
 
@@ -821,37 +1002,47 @@ class McpAgent(ABC, ToolAgent):
             Dictionary mapping server names to lists of Tool objects (with original names, not namespaced)
         """
         # Get all tools from the aggregator
-        target = namespace if namespace is not None else server_name
-        result = await self._aggregator.list_mcp_tools(target)
+        result = await self._aggregator.list_mcp_tools(namespace)
+        filtered_result: dict[str, list[Tool]] = {}
 
-        # Apply filtering if tools are specified in config
-        if self.config.tools is not None:
-            filtered_result = {}
-            for server, tools in result.items():
-                # Check if this server has tool filters
-                if server in self.config.tools:
-                    filtered_tools = []
-                    for tool in tools:
-                        # Check if tool matches any pattern for this server
-                        for pattern in self.config.tools[server]:
-                            if self._matches_pattern(tool.name, pattern, server):
-                                filtered_tools.append(tool)
-                                break
-                    if filtered_tools:
-                        filtered_result[server] = filtered_tools
-            result = filtered_result
+        for server, server_tools in result.items():
+            filtered_result[server] = self._filter_server_tools(server_tools, server)
 
         # Add elicitation-backed human input tool to a special server if enabled and available
-        if self.config.human_input and getattr(self, "_human_input_tool", None):
+        if self.config.human_input and self._human_input_tool:
             special_server_name = "__human_input__"
+            filtered_result.setdefault(special_server_name, []).append(self._human_input_tool)
 
-            # If the special server doesn't exist in result, create it
-            if special_server_name not in result:
-                result[special_server_name] = []
+        return filtered_result
 
-            result[special_server_name].append(self._human_input_tool)
+    async def list_tools(self) -> ListToolsResult:
+        """
+        List all tools available to this agent, filtered by configuration.
 
-        return result
+        Returns:
+            ListToolsResult with available tools
+        """
+        # Start with filtered aggregator tools and merge in subclass/local tools
+        merged_tools: list[Tool] = await self._get_filtered_mcp_tools()
+        existing_names = {tool.name for tool in merged_tools}
+
+        local_tools = (await super().list_tools()).tools
+        for tool in local_tools:
+            if tool.name not in existing_names:
+                merged_tools.append(tool)
+                existing_names.add(tool.name)
+
+        if self._bash_tool and self._bash_tool.name not in existing_names:
+            merged_tools.append(self._bash_tool)
+            existing_names.add(self._bash_tool.name)
+
+        if self.config.human_input:
+            human_tool = getattr(self, "_human_input_tool", None)
+            if human_tool and human_tool.name not in existing_names:
+                merged_tools.append(human_tool)
+                existing_names.add(human_tool.name)
+
+        return ListToolsResult(tools=merged_tools)
 
     @property
     def agent_type(self) -> AgentType:
@@ -902,11 +1093,17 @@ class McpAgent(ABC, ToolAgent):
         # Get the list of MCP servers (if not provided)
         if bottom_items is None:
             if self._aggregator and self._aggregator.server_names:
-                server_names = self._aggregator.server_names
+                server_names = list(self._aggregator.server_names)
             else:
                 server_names = []
         else:
-            server_names = bottom_items
+            server_names = list(bottom_items)
+
+        server_names = self._unique_preserving_order(server_names)
+
+        shell_label = self._shell_server_label()
+        if shell_label:
+            server_names = [shell_label, *(name for name in server_names if name != shell_label)]
 
         # Extract servers from tool calls in the message for highlighting
         if highlight_items is None:
@@ -939,12 +1136,22 @@ class McpAgent(ABC, ToolAgent):
         Returns:
             List of server names that were called
         """
-        servers = []
+        servers: list[str] = []
 
         # Check if message has tool calls
         if message.tool_calls:
             for tool_request in message.tool_calls.values():
                 tool_name = tool_request.params.name
+
+                if (
+                    self._shell_runtime_enabled
+                    and self._shell_runtime.tool
+                    and tool_name == self._shell_runtime.tool.name
+                ):
+                    shell_label = self._shell_server_label()
+                    if shell_label and shell_label not in servers:
+                        servers.append(shell_label)
+                    continue
 
                 # Use aggregator's mapping to find the server for this tool
                 if tool_name in self._aggregator._namespaced_tool_map:
@@ -954,6 +1161,15 @@ class McpAgent(ABC, ToolAgent):
 
         return servers
 
+    def _shell_server_label(self) -> str | None:
+        """Return the display label for the local shell runtime."""
+        if not self._shell_runtime_enabled or not self._shell_runtime.tool:
+            return None
+
+        runtime_info = self._shell_runtime.runtime_info()
+        runtime_name = runtime_info.get("name")
+        return runtime_name or "shell"
+
     async def _parse_resource_name(self, name: str, resource_type: str) -> tuple[str, str]:
         """Delegate resource name parsing to the aggregator."""
         return await self._aggregator._parse_resource_name(name, resource_type)
@@ -962,6 +1178,18 @@ class McpAgent(ABC, ToolAgent):
         """
         Convert a Tool to an AgentSkill.
         """
+
+        if tool.name in self._skill_map:
+            manifest = self._skill_map[tool.name]
+            return AgentSkill(
+                id=f"skill:{manifest.name}",
+                name=manifest.name,
+                description=manifest.description or "",
+                tags=["skill"],
+                examples=None,
+                input_modes=None,
+                output_modes=None,
+            )
 
         _, tool_without_namespace = await self._parse_resource_name(tool.name, "tool")
         return AgentSkill(

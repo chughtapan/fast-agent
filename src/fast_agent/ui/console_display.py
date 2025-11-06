@@ -1,12 +1,17 @@
-from enum import Enum
+from contextlib import contextmanager
 from json import JSONDecodeError
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterator, List, Mapping, Optional, Union
 
 from mcp.types import CallToolResult
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
 
+from fast_agent.config import Settings
+from fast_agent.constants import REASONING
+from fast_agent.core.logging.logger import get_logger
 from fast_agent.ui import console
+from fast_agent.ui.markdown_helpers import prepare_markdown_content
 from fast_agent.ui.mcp_ui_utils import UILink
 from fast_agent.ui.mermaid_utils import (
     MermaidDiagram,
@@ -14,117 +19,25 @@ from fast_agent.ui.mermaid_utils import (
     detect_diagram_type,
     extract_mermaid_diagrams,
 )
+from fast_agent.ui.message_primitives import MESSAGE_CONFIGS, MessageType
+from fast_agent.ui.streaming import (
+    NullStreamingHandle as _NullStreamingHandle,
+)
+from fast_agent.ui.streaming import (
+    StreamingHandle,
+)
+from fast_agent.ui.streaming import (
+    StreamingMessageHandle as _StreamingMessageHandle,
+)
+from fast_agent.ui.tool_display import ToolDisplay
 
 if TYPE_CHECKING:
     from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
+    from fast_agent.mcp.skybridge import SkybridgeServerConfig
+
+logger = get_logger(__name__)
 
 CODE_STYLE = "native"
-
-
-class MessageType(Enum):
-    """Types of messages that can be displayed."""
-
-    USER = "user"
-    ASSISTANT = "assistant"
-    SYSTEM = "system"
-    TOOL_CALL = "tool_call"
-    TOOL_RESULT = "tool_result"
-
-
-# Configuration for each message type
-MESSAGE_CONFIGS = {
-    MessageType.USER: {
-        "block_color": "blue",
-        "arrow": "▶",
-        "arrow_style": "dim blue",
-        "highlight_color": "blue",
-    },
-    MessageType.ASSISTANT: {
-        "block_color": "green",
-        "arrow": "◀",
-        "arrow_style": "dim green",
-        "highlight_color": "bright_green",
-    },
-    MessageType.SYSTEM: {
-        "block_color": "yellow",
-        "arrow": "●",
-        "arrow_style": "dim yellow",
-        "highlight_color": "bright_yellow",
-    },
-    MessageType.TOOL_CALL: {
-        "block_color": "magenta",
-        "arrow": "◀",
-        "arrow_style": "dim magenta",
-        "highlight_color": "magenta",
-    },
-    MessageType.TOOL_RESULT: {
-        "block_color": "magenta",  # Can be overridden to red if error
-        "arrow": "▶",
-        "arrow_style": "dim magenta",
-        "highlight_color": "magenta",
-    },
-}
-
-HTML_ESCAPE_CHARS = {
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;",
-}
-
-
-def _prepare_markdown_content(content: str, escape_xml: bool = True) -> str:
-    """Prepare content for markdown rendering by escaping HTML/XML tags
-    while preserving code blocks and inline code.
-
-    This ensures XML/HTML tags are displayed as visible text rather than
-    being interpreted as markup by the markdown renderer.
-
-    Note: This method does not handle overlapping code blocks (e.g., if inline
-    code appears within a fenced code block range). In practice, this is not
-    an issue since markdown syntax doesn't support such overlapping.
-    """
-    if not escape_xml or not isinstance(content, str):
-        return content
-
-    protected_ranges = []
-    import re
-
-    # Protect fenced code blocks (don't escape anything inside these)
-    code_block_pattern = r"```[\s\S]*?```"
-    for match in re.finditer(code_block_pattern, content):
-        protected_ranges.append((match.start(), match.end()))
-
-    # Protect inline code (don't escape anything inside these)
-    inline_code_pattern = r"(?<!`)`(?!``)[^`\n]+`(?!`)"
-    for match in re.finditer(inline_code_pattern, content):
-        protected_ranges.append((match.start(), match.end()))
-
-    protected_ranges.sort(key=lambda x: x[0])
-
-    # Build the escaped content
-    result = []
-    last_end = 0
-
-    for start, end in protected_ranges:
-        # Escape everything outside protected ranges
-        unprotected_text = content[last_end:start]
-        for char, replacement in HTML_ESCAPE_CHARS.items():
-            unprotected_text = unprotected_text.replace(char, replacement)
-        result.append(unprotected_text)
-
-        # Keep protected ranges (code blocks) as-is
-        result.append(content[start:end])
-        last_end = end
-
-    # Escape any remaining content after the last protected range
-    remainder_text = content[last_end:]
-    for char, replacement in HTML_ESCAPE_CHARS.items():
-        remainder_text = remainder_text.replace(char, replacement)
-    result.append(remainder_text)
-
-    return "".join(result)
 
 
 class ConsoleDisplay:
@@ -133,7 +46,9 @@ class ConsoleDisplay:
     This centralizes the UI display logic used by LLM implementations.
     """
 
-    def __init__(self, config=None) -> None:
+    CODE_STYLE = CODE_STYLE
+
+    def __init__(self, config: Settings | None = None) -> None:
         """
         Initialize the console display handler.
 
@@ -143,6 +58,53 @@ class ConsoleDisplay:
         self.config = config
         self._markup = config.logger.enable_markup if config else True
         self._escape_xml = True
+        self._tool_display = ToolDisplay(self)
+
+    @property
+    def code_style(self) -> str:
+        return CODE_STYLE
+
+    def resolve_streaming_preferences(self) -> tuple[bool, str]:
+        """Return whether streaming is enabled plus the active mode."""
+        if not self.config:
+            return True, "markdown"
+
+        logger_settings = getattr(self.config, "logger", None)
+        if not logger_settings:
+            return True, "markdown"
+
+        streaming_mode = getattr(logger_settings, "streaming", "markdown")
+        if streaming_mode not in {"markdown", "plain", "none"}:
+            streaming_mode = "markdown"
+
+        # Legacy compatibility: allow streaming_plain_text override
+        if streaming_mode == "markdown" and getattr(logger_settings, "streaming_plain_text", False):
+            streaming_mode = "plain"
+
+        show_chat = bool(getattr(logger_settings, "show_chat", True))
+        streaming_display = bool(getattr(logger_settings, "streaming_display", True))
+
+        enabled = show_chat and streaming_display and streaming_mode != "none"
+        return enabled, streaming_mode
+
+    @staticmethod
+    def _format_elapsed(elapsed: float) -> str:
+        """Format elapsed seconds for display."""
+        if elapsed < 0:
+            elapsed = 0.0
+        if elapsed < 0.001:
+            return "<1ms"
+        if elapsed < 1:
+            return f"{elapsed * 1000:.0f}ms"
+        if elapsed < 10:
+            return f"{elapsed:.2f}s"
+        if elapsed < 60:
+            return f"{elapsed:.1f}s"
+        minutes, seconds = divmod(elapsed, 60)
+        if minutes < 60:
+            return f"{int(minutes)}m {seconds:02.0f}s"
+        hours, minutes = divmod(int(minutes), 60)
+        return f"{hours}h {minutes:02d}m"
 
     def display_message(
         self,
@@ -156,6 +118,7 @@ class ConsoleDisplay:
         is_error: bool = False,
         truncate_content: bool = True,
         additional_message: Text | None = None,
+        pre_content: Text | None = None,
     ) -> None:
         """
         Unified method to display formatted messages to the console.
@@ -170,6 +133,8 @@ class ConsoleDisplay:
             max_item_length: Optional max length for bottom metadata items (with ellipsis)
             is_error: For tool results, whether this is an error (uses red color)
             truncate_content: Whether to truncate long content
+            additional_message: Optional Rich Text appended after the main content
+            pre_content: Optional Rich Text shown before the main content
         """
         # Get configuration for this message type
         config = MESSAGE_CONFIGS[message_type]
@@ -191,6 +156,8 @@ class ConsoleDisplay:
         self._create_combined_separator_status(left, right_info)
 
         # Display the content
+        if pre_content and pre_content.plain:
+            console.console.print(pre_content, markup=self._markup)
         self._display_content(
             content, truncate_content, is_error, message_type, check_markdown_markers=False
         )
@@ -198,44 +165,12 @@ class ConsoleDisplay:
             console.console.print(additional_message, markup=self._markup)
 
         # Handle bottom separator with optional metadata
-        console.console.print()
-
-        if bottom_metadata:
-            # Apply shortening if requested
-            display_items = bottom_metadata
-            if max_item_length:
-                display_items = self._shorten_items(bottom_metadata, max_item_length)
-
-            # Format the metadata with highlighting, clipped to available width
-            # Compute available width for the metadata segment (excluding the fixed prefix/suffix)
-            total_width = console.console.size.width
-            prefix = Text("─| ")
-            prefix.stylize("dim")
-            suffix = Text(" |")
-            suffix.stylize("dim")
-            available = max(0, total_width - prefix.cell_len - suffix.cell_len)
-
-            metadata_text = self._format_bottom_metadata(
-                display_items,
-                highlight_index,
-                config["highlight_color"],
-                max_width=available,
-            )
-
-            # Create the separator line with metadata
-            line = Text()
-            line.append_text(prefix)
-            line.append_text(metadata_text)
-            line.append_text(suffix)
-            remaining = total_width - line.cell_len
-            if remaining > 0:
-                line.append("─" * remaining, style="dim")
-            console.console.print(line, markup=self._markup)
-        else:
-            # No metadata - continuous bar
-            console.console.print("─" * console.console.size.width, style="dim")
-
-        console.console.print()
+        self._render_bottom_metadata(
+            message_type=message_type,
+            bottom_metadata=bottom_metadata,
+            highlight_index=highlight_index,
+            max_item_length=max_item_length,
+        )
 
     def _display_content(
         self,
@@ -258,7 +193,6 @@ class ConsoleDisplay:
         import json
         import re
 
-        from rich.markdown import Markdown
         from rich.pretty import Pretty
         from rich.syntax import Syntax
 
@@ -304,7 +238,7 @@ class ConsoleDisplay:
                     # Check for markdown markers before deciding to use markdown rendering
                     if any(marker in content for marker in ["##", "**", "*", "`", "---", "###"]):
                         # Has markdown markers - render as markdown with escaping
-                        prepared_content = _prepare_markdown_content(content, self._escape_xml)
+                        prepared_content = prepare_markdown_content(content, self._escape_xml)
                         md = Markdown(prepared_content, code_theme=CODE_STYLE)
                         console.console.print(md, markup=self._markup)
                     else:
@@ -324,7 +258,7 @@ class ConsoleDisplay:
                     # Check if it looks like markdown
                     if any(marker in content for marker in ["##", "**", "*", "`", "---", "###"]):
                         # Escape HTML/XML tags while preserving code blocks
-                        prepared_content = _prepare_markdown_content(content, self._escape_xml)
+                        prepared_content = prepare_markdown_content(content, self._escape_xml)
                         md = Markdown(prepared_content, code_theme=CODE_STYLE)
                         # Markdown handles its own styling, don't apply style
                         console.console.print(md, markup=self._markup)
@@ -352,10 +286,6 @@ class ConsoleDisplay:
                 # We need to handle the main content (which may have markdown)
                 # and any styled segments that were appended
 
-                # For now, we'll render the entire content with markdown support
-                # This means extracting each span and handling it appropriately
-                from rich.markdown import Markdown
-
                 # If the Text object has multiple spans with different styles,
                 # we need to be careful about how we render them
                 if len(content._spans) > 1:
@@ -372,9 +302,7 @@ class ConsoleDisplay:
                         marker in markdown_part for marker in ["##", "**", "*", "`", "---", "###"]
                     ):
                         # Render markdown part
-                        prepared_content = _prepare_markdown_content(
-                            markdown_part, self._escape_xml
-                        )
+                        prepared_content = prepare_markdown_content(markdown_part, self._escape_xml)
                         md = Markdown(prepared_content, code_theme=CODE_STYLE)
                         console.console.print(md, markup=self._markup)
 
@@ -392,7 +320,7 @@ class ConsoleDisplay:
                         console.console.print(content, markup=self._markup)
                 else:
                     # Simple case: entire text should be rendered as markdown
-                    prepared_content = _prepare_markdown_content(plain_text, self._escape_xml)
+                    prepared_content = prepare_markdown_content(plain_text, self._escape_xml)
                     md = Markdown(prepared_content, code_theme=CODE_STYLE)
                     console.console.print(md, markup=self._markup)
             else:
@@ -458,6 +386,58 @@ class ConsoleDisplay:
         """
         return [item[: max_length - 1] + "…" if len(item) > max_length else item for item in items]
 
+    def _render_bottom_metadata(
+        self,
+        *,
+        message_type: MessageType,
+        bottom_metadata: List[str] | None,
+        highlight_index: int | None,
+        max_item_length: int | None,
+    ) -> None:
+        """
+        Render the bottom separator line with optional metadata.
+
+        Args:
+            message_type: The type of message being displayed
+            bottom_metadata: Optional list of items to show in the separator
+            highlight_index: Optional index of the item to highlight
+            max_item_length: Optional maximum length for individual items
+        """
+        console.console.print()
+
+        if bottom_metadata:
+            display_items = bottom_metadata
+            if max_item_length:
+                display_items = self._shorten_items(bottom_metadata, max_item_length)
+
+            total_width = console.console.size.width
+            prefix = Text("─| ")
+            prefix.stylize("dim")
+            suffix = Text(" |")
+            suffix.stylize("dim")
+            available = max(0, total_width - prefix.cell_len - suffix.cell_len)
+
+            highlight_color = MESSAGE_CONFIGS[message_type]["highlight_color"]
+            metadata_text = self._format_bottom_metadata(
+                display_items,
+                highlight_index,
+                highlight_color,
+                max_width=available,
+            )
+
+            line = Text()
+            line.append_text(prefix)
+            line.append_text(metadata_text)
+            line.append_text(suffix)
+            remaining = total_width - line.cell_len
+            if remaining > 0:
+                line.append("─" * remaining, style="dim")
+            console.console.print(line, markup=self._markup)
+        else:
+            console.console.print("─" * console.console.size.width, style="dim")
+
+        console.console.print()
+
     def _format_bottom_metadata(
         self,
         items: List[str],
@@ -513,122 +493,42 @@ class ConsoleDisplay:
 
         return formatted
 
-    def show_tool_result(self, result: CallToolResult, name: str | None = None) -> None:
-        """Display a tool result in the new visual style."""
-        if not self.config or not self.config.logger.show_tools:
-            return
-
-        # Import content helpers
-        from fast_agent.mcp.helpers.content_helpers import get_text, is_text_content
-
-        # Analyze content to determine display format and status
-        content = result.content
-        if result.isError:
-            status = "ERROR"
-        else:
-            # Check if it's a list with content blocks
-            if len(content) == 0:
-                status = "No Content"
-            elif len(content) == 1 and is_text_content(content[0]):
-                text_content = get_text(content[0])
-                char_count = len(text_content) if text_content else 0
-                status = f"Text Only {char_count} chars"
-            else:
-                text_count = sum(1 for item in content if is_text_content(item))
-                if text_count == len(content):
-                    status = f"{len(content)} Text Blocks" if len(content) > 1 else "1 Text Block"
-                else:
-                    status = (
-                        f"{len(content)} Content Blocks" if len(content) > 1 else "1 Content Block"
-                    )
-
-        # Build right info
-        right_info = f"[dim]tool result - {status}[/dim]"
-
-        # Display using unified method
-        self.display_message(
-            content=content,
-            message_type=MessageType.TOOL_RESULT,
+    def show_tool_result(
+        self,
+        result: CallToolResult,
+        name: str | None = None,
+        tool_name: str | None = None,
+        skybridge_config: "SkybridgeServerConfig | None" = None,
+    ) -> None:
+        self._tool_display.show_tool_result(
+            result,
             name=name,
-            right_info=right_info,
-            is_error=result.isError,
-            truncate_content=True,
+            tool_name=tool_name,
+            skybridge_config=skybridge_config,
         )
 
     def show_tool_call(
         self,
         tool_name: str,
-        tool_args: Dict[str, Any] | None,
-        bottom_items: List[str] | None = None,
+        tool_args: dict[str, Any] | None,
+        bottom_items: list[str] | None = None,
         highlight_index: int | None = None,
         max_item_length: int | None = None,
         name: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Display a tool call in the new visual style.
-
-        Args:
-            tool_name: Name of the tool being called
-            tool_args: Arguments being passed to the tool
-            bottom_items: Optional list of items for bottom separator (e.g., available tools)
-            highlight_index: Index of item to highlight in the bottom separator (0-based), or None
-            max_item_length: Optional max length for bottom items (with ellipsis)
-            name: Optional agent name
-        """
-        if not self.config or not self.config.logger.show_tools:
-            return
-
-        # Build right info
-        right_info = f"[dim]tool request - {tool_name}[/dim]"
-
-        # Display using unified method
-        self.display_message(
-            content=tool_args,
-            message_type=MessageType.TOOL_CALL,
-            name=name,
-            right_info=right_info,
-            bottom_metadata=bottom_items,
+        self._tool_display.show_tool_call(
+            tool_name,
+            tool_args,
+            bottom_items=bottom_items,
             highlight_index=highlight_index,
             max_item_length=max_item_length,
-            truncate_content=True,
+            name=name,
+            metadata=metadata,
         )
 
     async def show_tool_update(self, updated_server: str, agent_name: str | None = None) -> None:
-        """Show a tool update for a server in the new visual style.
-
-        Args:
-            updated_server: Name of the server being updated
-            agent_name: Optional agent name to display
-        """
-        if not self.config or not self.config.logger.show_tools:
-            return
-
-        # Combined separator and status line
-        if agent_name:
-            left = (
-                f"[magenta]▎[/magenta][dim magenta]▶[/dim magenta] [magenta]{agent_name}[/magenta]"
-            )
-        else:
-            left = "[magenta]▎[/magenta][dim magenta]▶[/dim magenta]"
-
-        right = f"[dim]{updated_server}[/dim]"
-        self._create_combined_separator_status(left, right)
-
-        # Display update message
-        message = f"Updating tools for server {updated_server}"
-        console.console.print(message, style="dim", markup=self._markup)
-
-        # Bottom separator
-        console.console.print()
-        console.console.print("─" * console.console.size.width, style="dim")
-        console.console.print()
-
-        # Force prompt_toolkit redraw if active
-        try:
-            from prompt_toolkit.application.current import get_app
-
-            get_app().invalidate()  # Forces prompt_toolkit to redraw
-        except:  # noqa: E722
-            pass  # No active prompt_toolkit session
+        await self._tool_display.show_tool_update(updated_server, agent_name=agent_name)
 
     def _create_combined_separator_status(self, left_content: str, right_info: str = "") -> None:
         """
@@ -670,6 +570,43 @@ class ConsoleDisplay:
         console.console.print(combined, markup=self._markup)
         console.console.print()
 
+    @staticmethod
+    def summarize_skybridge_configs(
+        configs: Mapping[str, "SkybridgeServerConfig"] | None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        return ToolDisplay.summarize_skybridge_configs(configs)
+
+    def show_skybridge_summary(
+        self,
+        agent_name: str,
+        configs: Mapping[str, "SkybridgeServerConfig"] | None,
+    ) -> None:
+        self._tool_display.show_skybridge_summary(agent_name, configs)
+
+    def _extract_reasoning_content(self, message: "PromptMessageExtended") -> Text | None:
+        """Extract reasoning channel content as dim text."""
+        channels = message.channels or {}
+        reasoning_blocks = channels.get(REASONING) or []
+        if not reasoning_blocks:
+            return None
+
+        from fast_agent.mcp.helpers.content_helpers import get_text
+
+        reasoning_segments = []
+        for block in reasoning_blocks:
+            text = get_text(block)
+            if text:
+                reasoning_segments.append(text)
+
+        if not reasoning_segments:
+            return None
+
+        joined = "\n".join(reasoning_segments)
+        if not joined.strip():
+            return None
+
+        return Text(joined, style="dim default")
+
     async def show_assistant_message(
         self,
         message_text: Union[str, Text, "PromptMessageExtended"],
@@ -692,14 +629,17 @@ class ConsoleDisplay:
             model: Optional model name for right info
             additional_message: Optional additional styled message to append
         """
-        if not self.config or not self.config.logger.show_chat:
+        if self.config and not self.config.logger.show_chat:
             return
 
         # Extract text from PromptMessageExtended if needed
         from fast_agent.types import PromptMessageExtended
 
+        pre_content: Text | None = None
+
         if isinstance(message_text, PromptMessageExtended):
             display_text = message_text.last_text() or ""
+            pre_content = self._extract_reasoning_content(message_text)
         else:
             display_text = message_text
 
@@ -717,6 +657,7 @@ class ConsoleDisplay:
             max_item_length=max_item_length,
             truncate_content=False,  # Assistant messages shouldn't be truncated
             additional_message=additional_message,
+            pre_content=pre_content,
         )
 
         # Handle mermaid diagrams separately (after the main message)
@@ -729,6 +670,54 @@ class ConsoleDisplay:
             diagrams = extract_mermaid_diagrams(plain_text)
             if diagrams:
                 self._display_mermaid_diagrams(diagrams)
+
+    @contextmanager
+    def streaming_assistant_message(
+        self,
+        *,
+        bottom_items: List[str] | None = None,
+        highlight_index: int | None = None,
+        max_item_length: int | None = None,
+        name: str | None = None,
+        model: str | None = None,
+    ) -> Iterator[StreamingHandle]:
+        """Create a streaming context for assistant messages."""
+        streaming_enabled, streaming_mode = self.resolve_streaming_preferences()
+
+        if not streaming_enabled:
+            yield _NullStreamingHandle()
+            return
+
+        from fast_agent.ui.progress_display import progress_display
+
+        config = MESSAGE_CONFIGS[MessageType.ASSISTANT]
+        block_color = config["block_color"]
+        arrow = config["arrow"]
+        arrow_style = config["arrow_style"]
+
+        left = f"[{block_color}]▎[/{block_color}][{arrow_style}]{arrow}[/{arrow_style}] "
+        if name:
+            left += f"[{block_color}]{name}[/{block_color}]"
+
+        right_info = f"[dim]{model}[/dim]" if model else ""
+
+        # Determine renderer based on streaming mode
+        use_plain_text = streaming_mode == "plain"
+
+        handle = _StreamingMessageHandle(
+            display=self,
+            bottom_items=bottom_items,
+            highlight_index=highlight_index,
+            max_item_length=max_item_length,
+            use_plain_text=use_plain_text,
+            header_left=left,
+            header_right=right_info,
+            progress_display=progress_display,
+        )
+        try:
+            yield handle
+        finally:
+            handle.close()
 
     def _display_mermaid_diagrams(self, diagrams: List[MermaidDiagram]) -> None:
         """Display mermaid diagram links."""
@@ -760,7 +749,7 @@ class ConsoleDisplay:
 
     async def show_mcp_ui_links(self, links: List[UILink]) -> None:
         """Display MCP-UI links beneath the chat like mermaid links."""
-        if not self.config or not self.config.logger.show_chat:
+        if self.config and not self.config.logger.show_chat:
             return
 
         if not links:
@@ -787,7 +776,7 @@ class ConsoleDisplay:
         name: str | None = None,
     ) -> None:
         """Display a user message in the new visual style."""
-        if not self.config or not self.config.logger.show_chat:
+        if self.config and not self.config.logger.show_chat:
             return
 
         # Build right side with model and turn
@@ -814,7 +803,7 @@ class ConsoleDisplay:
         server_count: int = 0,
     ) -> None:
         """Display the system prompt in a formatted panel."""
-        if not self.config or not self.config.logger.show_chat:
+        if self.config and not self.config.logger.show_chat:
             return
 
         # Build right side info
@@ -855,7 +844,7 @@ class ConsoleDisplay:
             highlight_server: Optional server name to highlight
             arguments: Optional dictionary of arguments passed to the prompt template
         """
-        if not self.config or not self.config.logger.show_tools:
+        if self.config and not self.config.logger.show_tools:
             return
 
         # Build the server list with highlighting

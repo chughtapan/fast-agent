@@ -9,7 +9,8 @@ import shlex
 import subprocess
 import tempfile
 from importlib.metadata import version
-from typing import TYPE_CHECKING, List, Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion, WordCompleter
@@ -23,7 +24,9 @@ from rich import print as rich_print
 from fast_agent.agents.agent_types import AgentType
 from fast_agent.constants import FAST_AGENT_ERROR_CHANNEL, FAST_AGENT_REMOVED_METADATA_CHANNEL
 from fast_agent.core.exceptions import PromptExitError
-from fast_agent.llm.model_info import get_model_info
+from fast_agent.llm.model_info import ModelInfo
+from fast_agent.mcp.types import McpAgentProtocol
+from fast_agent.ui.mcp_display import render_mcp_status
 
 if TYPE_CHECKING:
     from fast_agent.core.agent_app import AgentApp
@@ -74,6 +77,20 @@ help_message_shown = False
 _agent_info_shown = set()
 
 
+async def show_mcp_status(agent_name: str, agent_provider: "AgentApp | None") -> None:
+    if agent_provider is None:
+        rich_print("[red]No agent provider available[/red]")
+        return
+
+    try:
+        agent = agent_provider._agent(agent_name)
+    except Exception as exc:
+        rich_print(f"[red]Unable to load agent '{agent_name}': {exc}[/red]")
+        return
+
+    await render_mcp_status(agent)
+
+
 async def _display_agent_info_helper(agent_name: str, agent_provider: "AgentApp | None") -> None:
     """Helper function to display agent information."""
     # Only show once per agent
@@ -88,10 +105,9 @@ async def _display_agent_info_helper(agent_name: str, agent_provider: "AgentApp 
 
         # Get counts TODO -- add this to the type library or adjust the way aggregator/reporting works
         server_count = 0
-        if hasattr(agent, "_aggregator") and hasattr(agent._aggregator, "server_names"):
-            server_count = (
-                len(agent._aggregator.server_names) if agent._aggregator.server_names else 0
-            )
+        if isinstance(agent, McpAgentProtocol):
+            server_names = agent.aggregator.server_names
+            server_count = len(server_names) if server_names else 0
 
         tools_result = await agent.list_tools()
         tool_count = (
@@ -105,6 +121,14 @@ async def _display_agent_info_helper(agent_name: str, agent_provider: "AgentApp 
 
         prompts_dict = await agent.list_prompts()
         prompt_count = sum(len(prompts) for prompts in prompts_dict.values()) if prompts_dict else 0
+
+        skill_count = 0
+        skill_manifests = getattr(agent, "_skill_manifests", None)
+        if skill_manifests:
+            try:
+                skill_count = len(list(skill_manifests))
+            except TypeError:
+                skill_count = 0
 
         # Handle different agent types
         if agent.agent_type == AgentType.PARALLEL:
@@ -134,37 +158,51 @@ async def _display_agent_info_helper(agent_name: str, agent_provider: "AgentApp 
                     f"[dim]Agent [/dim][blue]{agent_name}[/blue][dim]:[/dim] {child_count:,}[dim] {child_word}[/dim]"
                 )
         else:
-            # For regular agents, only display if they have MCP servers attached
-            if server_count > 0:
-                # Build display parts in order: tools, prompts, resources (omit if count is 0)
-                display_parts = []
+            content_parts = []
 
+            if server_count > 0:
+                sub_parts = []
                 if tool_count > 0:
                     tool_word = "tool" if tool_count == 1 else "tools"
-                    display_parts.append(f"{tool_count:,}[dim] {tool_word}[/dim]")
-
+                    sub_parts.append(f"{tool_count:,}[dim] {tool_word}[/dim]")
                 if prompt_count > 0:
                     prompt_word = "prompt" if prompt_count == 1 else "prompts"
-                    display_parts.append(f"{prompt_count:,}[dim] {prompt_word}[/dim]")
-
+                    sub_parts.append(f"{prompt_count:,}[dim] {prompt_word}[/dim]")
                 if resource_count > 0:
                     resource_word = "resource" if resource_count == 1 else "resources"
-                    display_parts.append(f"{resource_count:,}[dim] {resource_word}[/dim]")
+                    sub_parts.append(f"{resource_count:,}[dim] {resource_word}[/dim]")
 
-                # Always show server count
                 server_word = "Server" if server_count == 1 else "Servers"
                 server_text = f"{server_count:,}[dim] MCP {server_word}[/dim]"
-
-                if display_parts:
-                    content = (
-                        f"{server_text}[dim], [/dim]"
-                        + "[dim], [/dim]".join(display_parts)
-                        + "[dim] available[/dim]"
+                if sub_parts:
+                    server_text = (
+                        f"{server_text}[dim] ([/dim]"
+                        + "[dim], [/dim]".join(sub_parts)
+                        + "[dim])[/dim]"
                     )
-                else:
-                    content = f"{server_text}[dim] available[/dim]"
+                content_parts.append(server_text)
 
+            if skill_count > 0:
+                skill_word = "skill" if skill_count == 1 else "skills"
+                content_parts.append(
+                    f"{skill_count:,}[dim] {skill_word}[/dim][dim] available[/dim]"
+                )
+
+            if content_parts:
+                content = "[dim]. [/dim]".join(content_parts)
                 rich_print(f"[dim]Agent [/dim][blue]{agent_name}[/blue][dim]:[/dim] {content}")
+        #               await _render_mcp_status(agent)
+
+        # Display Skybridge status (if aggregator discovered any)
+        try:
+            aggregator = agent.aggregator if isinstance(agent, McpAgentProtocol) else None
+            display = getattr(agent, "display", None)
+            if aggregator and display and hasattr(display, "show_skybridge_summary"):
+                skybridge_configs = await aggregator.get_skybridge_configs()
+                display.show_skybridge_summary(agent_name, skybridge_configs)
+        except Exception:
+            # Ignore Skybridge rendering issues to avoid interfering with startup
+            pass
 
         # Mark as shown
         _agent_info_shown.add(agent_name)
@@ -322,17 +360,21 @@ class AgentCompleter(Completer):
         self.agents = agents
         # Map commands to their descriptions for better completion hints
         self.commands = {
-            "tools": "List available MCP tools",
+            "mcp": "Show MCP server status",
+            "history": "Show conversation history overview (optionally another agent)",
+            "tools": "List available MCP Tools",
+            "skills": "List available Agent Skills",
             "prompt": "List and choose MCP prompts, or apply specific prompt (/prompt <name>)",
+            "clear": "Clear history",
+            "clear last": "Remove the most recent message from history",
             "agents": "List available agents",
             "system": "Show the current system prompt",
             "usage": "Show current usage statistics",
             "markdown": "Show last assistant message without markdown formatting",
             "save_history": "Save history; .json = MCP JSON, others = Markdown",
             "help": "Show commands and shortcuts",
-            "clear": "Clear the screen",
-            "STOP": "Stop this prompting session and move to next workflow step",
             "EXIT": "Exit fast-agent, terminating any running workflows",
+            "STOP": "Stop this prompting session and move to next workflow step",
             **(commands or {}),  # Allow custom commands to be passed in
         }
         if is_human_input:
@@ -501,7 +543,15 @@ def create_keybindings(
 
     @kb.add("c-l")
     def _(event) -> None:
-        """Ctrl+L: Clear the input buffer."""
+        """Ctrl+L: Clear and redraw the terminal screen."""
+        app_ref = event.app or app
+        if app_ref and getattr(app_ref, "renderer", None):
+            app_ref.renderer.clear()
+            app_ref.invalidate()
+
+    @kb.add("c-u")
+    def _(event) -> None:
+        """Ctrl+U: Clear the input buffer."""
         event.current_buffer.text = ""
 
     @kb.add("c-e")
@@ -622,60 +672,93 @@ async def get_enhanced_input(
         model_display = None
         tdv_segment = None
         turn_count = 0
-        try:
-            if agent_provider:
+        agent = None
+        if agent_provider:
+            try:
                 agent = agent_provider._agent(agent_name)
+            except Exception as exc:
+                print(f"[toolbar debug] unable to resolve agent '{agent_name}': {exc}")
 
-                # Get turn count from message history
-                for message in agent.message_history:
-                    if message.role == "user":
-                        turn_count += 1
+        if agent:
+            for message in agent.message_history:
+                if message.role == "user":
+                    turn_count += 1
 
-                # Get model name from LLM
-                if agent.llm and agent.llm.model_name:
-                    model_name = agent.llm.model_name
-                    # Truncate model name to max 25 characters with ellipsis
-                    max_len = 25
-                    if len(model_name) > max_len:
-                        # Keep total length at max_len including ellipsis
-                        model_display = model_name[: max_len - 1] + "…"
-                    else:
-                        model_display = model_name
+            # Resolve LLM reference safely (avoid assertion when unattached)
+            llm = None
+            try:
+                llm = agent.llm
+            except AssertionError:
+                llm = getattr(agent, "_llm", None)
+            except Exception as exc:
+                print(f"[toolbar debug] agent.llm access failed for '{agent_name}': {exc}")
 
-                # Build TDV capability segment based on model database
-                info = get_model_info(agent)
-                # Default to text-only if info resolution fails for any reason
-                t, d, v = (True, False, False)
-                if info:
-                    t, d, v = info.tdv_flags
+            model_name = None
+            if llm:
+                model_name = getattr(llm, "model_name", None)
+                if not model_name:
+                    model_name = getattr(
+                        getattr(llm, "default_request_params", None), "model", None
+                    )
 
-                # Check for alert flags in user messages
-                alert_flags: set[str] = set()
-                error_seen = False
-                for message in agent.message_history:
-                    if message.channels:
-                        if message.channels.get(FAST_AGENT_ERROR_CHANNEL):
-                            error_seen = True
-                    if message.role == "user" and message.channels:
-                        meta_blocks = message.channels.get(FAST_AGENT_REMOVED_METADATA_CHANNEL, [])
-                        alert_flags.update(_extract_alert_flags_from_meta(meta_blocks))
+            if not model_name:
+                model_name = getattr(agent.config, "model", None)
+            if not model_name and getattr(agent.config, "default_request_params", None):
+                model_name = getattr(agent.config.default_request_params, "model", None)
+            if not model_name:
+                context = getattr(agent, "context", None) or getattr(
+                    agent_provider, "context", None
+                )
+                config_obj = getattr(context, "config", None) if context else None
+                model_name = getattr(config_obj, "default_model", None)
 
-                if error_seen and not alert_flags:
-                    alert_flags.add("T")
+            if model_name:
+                max_len = 25
+                model_display = (
+                    model_name[: max_len - 1] + "…" if len(model_name) > max_len else model_name
+                )
+            else:
+                print(f"[toolbar debug] no model resolved for agent '{agent_name}'")
+                model_display = "unknown"
 
-                def _style_flag(letter: str, supported: bool) -> str:
-                    # Enabled uses the same color as NORMAL mode (ansigreen), disabled is dim
-                    if letter in alert_flags:
-                        return f"<style fg='ansired' bg='ansiblack'>{letter}</style>"
+            # Build TDV capability segment based on model database
+            info = None
+            if llm:
+                info = ModelInfo.from_llm(llm)
+            if not info and model_name:
+                info = ModelInfo.from_name(model_name)
 
-                    enabled_color = "ansigreen"
-                    if supported:
-                        return f"<style fg='{enabled_color}' bg='ansiblack'>{letter}</style>"
-                    return f"<style fg='ansiblack' bg='ansiwhite'>{letter}</style>"
+            # Default to text-only if info resolution fails for any reason
+            t, d, v = (True, False, False)
+            if info:
+                t, d, v = info.tdv_flags
 
-                tdv_segment = f"{_style_flag('T', t)}{_style_flag('D', d)}{_style_flag('V', v)}"
-        except Exception:
-            # If anything goes wrong determining the model, omit it gracefully
+            # Check for alert flags in user messages
+            alert_flags: set[str] = set()
+            error_seen = False
+            for message in agent.message_history:
+                if message.channels:
+                    if message.channels.get(FAST_AGENT_ERROR_CHANNEL):
+                        error_seen = True
+                if message.role == "user" and message.channels:
+                    meta_blocks = message.channels.get(FAST_AGENT_REMOVED_METADATA_CHANNEL, [])
+                    alert_flags.update(_extract_alert_flags_from_meta(meta_blocks))
+
+            if error_seen and not alert_flags:
+                alert_flags.add("T")
+
+            def _style_flag(letter: str, supported: bool) -> str:
+                # Enabled uses the same color as NORMAL mode (ansigreen), disabled is dim
+                if letter in alert_flags:
+                    return f"<style fg='ansired' bg='ansiblack'>{letter}</style>"
+
+                enabled_color = "ansigreen"
+                if supported:
+                    return f"<style fg='{enabled_color}' bg='ansiblack'>{letter}</style>"
+                return f"<style fg='ansiblack' bg='ansiwhite'>{letter}</style>"
+
+            tdv_segment = f"{_style_flag('T', t)}{_style_flag('D', d)}{_style_flag('V', v)}"
+        else:
             model_display = None
             tdv_segment = None
 
@@ -700,17 +783,44 @@ async def get_enhanced_input(
         # Version/app label in green (dynamic version)
         version_segment = f"fast-agent {app_version}"
 
+        # Add notifications - prioritize active events over completed ones
+        from fast_agent.ui import notification_tracker
+
+        notification_segment = ""
+
+        # Check for active events first (highest priority)
+        active_status = notification_tracker.get_active_status()
+        if active_status:
+            event_type = active_status["type"].upper()
+            server = active_status["server"]
+            notification_segment = (
+                f" | <style fg='ansired' bg='ansiblack'>◀ {event_type} ({server})</style>"
+            )
+        elif notification_tracker.get_count() > 0:
+            # Show completed events summary when no active events
+            counts_by_type = notification_tracker.get_counts_by_type()
+            total_events = sum(counts_by_type.values()) if counts_by_type else 0
+
+            if len(counts_by_type) == 1:
+                event_type, count = next(iter(counts_by_type.items()))
+                label_text = notification_tracker.format_event_label(event_type, count)
+                notification_segment = f" | ◀ {label_text}"
+            else:
+                summary = notification_tracker.get_summary(compact=True)
+                heading = "event" if total_events == 1 else "events"
+                notification_segment = f" | ◀ {total_events} {heading} ({summary})"
+
         if middle:
             return HTML(
                 f" <style fg='{toolbar_color}' bg='ansiblack'> {agent_name} </style> "
                 f" {middle} | <style fg='{mode_style}' bg='ansiblack'> {mode_text} </style> | "
-                f"{version_segment}"
+                f"{version_segment}{notification_segment}"
             )
         else:
             return HTML(
                 f" <style fg='{toolbar_color}' bg='ansiblack'> {agent_name} </style> "
                 f"Mode: <style fg='{mode_style}' bg='ansiblack'> {mode_text} </style> | "
-                f"{version_segment}"
+                f"{version_segment}{notification_segment}"
             )
 
     # A more terminal-agnostic style that should work across themes
@@ -748,8 +858,34 @@ async def get_enhanced_input(
     )
     session.app.key_bindings = bindings
 
+    shell_agent = None
+    shell_enabled = False
+    shell_access_modes: tuple[str, ...] = ()
+    shell_name: str | None = None
+    if agent_provider:
+        try:
+            shell_agent = agent_provider._agent(agent_name)
+        except Exception:
+            shell_agent = None
+
+    if shell_agent:
+        shell_enabled = bool(getattr(shell_agent, "_shell_runtime_enabled", False))
+        modes_attr = getattr(shell_agent, "_shell_access_modes", ())
+        if isinstance(modes_attr, (list, tuple)):
+            shell_access_modes = tuple(str(mode) for mode in modes_attr)
+        elif modes_attr:
+            shell_access_modes = (str(modes_attr),)
+
+        # Get the detected shell name from the runtime
+        if shell_enabled:
+            shell_runtime = getattr(shell_agent, "_shell_runtime", None)
+            if shell_runtime:
+                runtime_info = shell_runtime.runtime_info()
+                shell_name = runtime_info.get("name")
+
     # Create formatted prompt text
-    prompt_text = f"<ansibrightblue>{agent_name}</ansibrightblue> > "
+    arrow_segment = "<ansibrightyellow>❯</ansibrightyellow>" if shell_enabled else "❯"
+    prompt_text = f"<ansibrightblue>{agent_name}</ansibrightblue> {arrow_segment} "
 
     # Add default value display if requested
     if show_default and default and default != "STOP":
@@ -776,6 +912,75 @@ async def get_enhanced_input(
                 # Display info for all available agents with tree structure for workflows
                 await _display_all_agents_with_hierarchy(available_agents, agent_provider)
 
+            # Show streaming status message
+            if agent_provider:
+                # Get logger settings from the agent's context (not agent_provider)
+                logger_settings = None
+                try:
+                    active_agent = shell_agent
+                    if active_agent is None:
+                        active_agent = agent_provider._agent(agent_name)
+                    agent_context = active_agent._context or active_agent.context
+                    logger_settings = agent_context.config.logger
+                except Exception:
+                    # If we can't get the agent or its context, logger_settings stays None
+                    pass
+
+                # Only show streaming messages if chat display is enabled AND we have logger_settings
+                if logger_settings:
+                    show_chat = getattr(logger_settings, "show_chat", True)
+
+                    if show_chat:
+                        # Check for parallel agents
+                        has_parallel = any(
+                            agent.agent_type == AgentType.PARALLEL
+                            for agent in agent_provider._agents.values()
+                        )
+
+                        # Note: streaming may have been disabled by fastagent.py if parallel agents exist
+                        # So we check has_parallel first to show the appropriate message
+                        if has_parallel:
+                            # Streaming is disabled due to parallel agents
+                            rich_print(
+                                "[dim]Markdown Streaming disabled (Parallel Agents configured)[/dim]"
+                            )
+                        else:
+                            # Check if streaming is enabled
+                            streaming_enabled = getattr(logger_settings, "streaming_display", True)
+                            streaming_mode = getattr(logger_settings, "streaming", "markdown")
+                            if streaming_enabled and streaming_mode != "none":
+                                # Streaming is enabled - notify users since it's experimental
+                                rich_print(
+                                    f"[dim]Experimental: Streaming Enabled - {streaming_mode} mode[/dim]"
+                                )
+
+        if shell_enabled:
+            modes_display = ", ".join(shell_access_modes or ("direct",))
+            shell_display = f"{modes_display}, {shell_name}" if shell_name else modes_display
+
+            # Add working directory info
+            shell_runtime = getattr(shell_agent, "_shell_runtime", None)
+            if shell_runtime:
+                working_dir = shell_runtime.working_directory()
+                try:
+                    # Try to show relative to cwd for cleaner display
+                    working_dir_display = str(working_dir.relative_to(Path.cwd()))
+                    if working_dir_display == ".":
+                        # Show last 2 parts of the path (e.g., "source/fast-agent")
+                        parts = Path.cwd().parts
+                        if len(parts) >= 2:
+                            working_dir_display = "/".join(parts[-2:])
+                        elif len(parts) == 1:
+                            working_dir_display = parts[0]
+                        else:
+                            working_dir_display = str(Path.cwd())
+                except ValueError:
+                    # If not relative to cwd, show absolute path
+                    working_dir_display = str(working_dir)
+                shell_display = f"{shell_display} | cwd: {working_dir_display}"
+
+            rich_print(f"[yellow]Shell Access ({shell_display})[/yellow]")
+
         rich_print()
         help_message_shown = True
 
@@ -791,14 +996,33 @@ async def get_enhanced_input(
 
             if cmd == "help":
                 return "HELP"
-            elif cmd == "clear":
-                return "CLEAR"
             elif cmd == "agents":
                 return "LIST_AGENTS"
             elif cmd == "system":
                 return "SHOW_SYSTEM"
             elif cmd == "usage":
                 return "SHOW_USAGE"
+            elif cmd == "history":
+                target_agent = None
+                if len(cmd_parts) > 1:
+                    candidate = cmd_parts[1].strip()
+                    if candidate:
+                        target_agent = candidate
+                return {"show_history": {"agent": target_agent}}
+            elif cmd == "clear":
+                target_agent = None
+                if len(cmd_parts) > 1:
+                    remainder = cmd_parts[1].strip()
+                    if remainder:
+                        tokens = remainder.split(maxsplit=1)
+                        if tokens and tokens[0].lower() == "last":
+                            if len(tokens) > 1:
+                                candidate = tokens[1].strip()
+                                if candidate:
+                                    target_agent = candidate
+                            return {"clear_last": {"agent": target_agent}}
+                        target_agent = remainder
+                return {"clear_history": {"agent": target_agent}}
             elif cmd == "markdown":
                 return "MARKDOWN"
             elif cmd in ("save_history", "save"):
@@ -808,6 +1032,8 @@ async def get_enhanced_input(
                     cmd_parts[1].strip() if len(cmd_parts) > 1 and cmd_parts[1].strip() else None
                 )
                 return {"save_history": True, "filename": filename}
+            elif cmd in ("mcpstatus", "mcp"):
+                return {"show_mcp_status": True}
             elif cmd == "prompt":
                 # Handle /prompt with no arguments as interactive mode
                 if len(cmd_parts) > 1:
@@ -824,6 +1050,8 @@ async def get_enhanced_input(
             elif cmd == "tools":
                 # Return a dictionary with list_tools action
                 return {"list_tools": True}
+            elif cmd == "skills":
+                return {"list_skills": True}
             elif cmd == "exit":
                 return "EXIT"
             elif cmd.lower() == "stop":
@@ -955,7 +1183,9 @@ async def get_argument_input(
             prompt_session.app.exit()
 
 
-async def handle_special_commands(command, agent_app=None):
+async def handle_special_commands(
+    command: Any, agent_app: "AgentApp | None" = None
+) -> bool | Dict[str, Any]:
     """
     Handle special input commands.
 
@@ -975,16 +1205,22 @@ async def handle_special_commands(command, agent_app=None):
     if isinstance(command, dict):
         return command
 
+    global agent_histories
+
     # Check for special string commands
     if command == "HELP":
         rich_print("\n[bold]Available Commands:[/bold]")
         rich_print("  /help          - Show this help")
-        rich_print("  /clear         - Clear screen")
         rich_print("  /agents        - List available agents")
         rich_print("  /system        - Show the current system prompt")
         rich_print("  /prompt <name> - Apply a specific prompt by name")
         rich_print("  /usage         - Show current usage statistics")
+        rich_print("  /skills        - List local skills for the active agent")
+        rich_print("  /history [agent_name] - Show chat history overview")
+        rich_print("  /clear [agent_name]   - Clear conversation history (keeps templates)")
+        rich_print("  /clear last [agent_name] - Remove the most recent message from history")
         rich_print("  /markdown      - Show last assistant message without markdown formatting")
+        rich_print("  /mcpstatus     - Show MCP server status summary for the active agent")
         rich_print("  /save_history <filename> - Save current chat history to a file")
         rich_print(
             "      [dim]Tip: Use a .json extension for MCP-compatible JSON; any other extension saves Markdown.[/dim]"
@@ -998,13 +1234,9 @@ async def handle_special_commands(command, agent_app=None):
         rich_print("  Ctrl+T         - Toggle multiline mode")
         rich_print("  Ctrl+E         - Edit in external editor")
         rich_print("  Ctrl+Y         - Copy last assistant response to clipboard")
-        rich_print("  Ctrl+L         - Clear input")
+        rich_print("  Ctrl+L         - Redraw the screen")
+        rich_print("  Ctrl+U         - Clear input")
         rich_print("  Up/Down        - Navigate history")
-        return True
-
-    elif command == "CLEAR":
-        # Clear screen (ANSI escape sequence)
-        print("\033c", end="")
         return True
 
     elif isinstance(command, str) and command.upper() == "EXIT":

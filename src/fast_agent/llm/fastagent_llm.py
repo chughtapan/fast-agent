@@ -3,6 +3,7 @@ from contextvars import ContextVar
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generic,
     List,
@@ -129,6 +130,7 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         self.history: Memory[MessageParamT] = SimpleMemory[MessageParamT]()
 
         self._message_history: List[PromptMessageExtended] = []
+        self._template_messages: List[PromptMessageExtended] = []
 
         # Initialize the display component
         from fast_agent.ui.console_display import ConsoleDisplay
@@ -156,6 +158,8 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
         # Initialize usage tracking
         self._usage_accumulator = UsageAccumulator()
+        self._stream_listeners: set[Callable[[str], None]] = set()
+        self._tool_stream_listeners: set[Callable[[str, Dict[str, Any] | None], None]] = set()
 
     def _initialize_default_params(self, kwargs: dict) -> RequestParams:
         """Initialize default parameters for the LLM.
@@ -482,6 +486,8 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         Returns:
             Updated estimated token count
         """
+        self._notify_stream_listeners(content)
+
         # Rough estimate: 1 token per 4 characters (OpenAI's typical ratio)
         text_length = len(content)
         additional_tokens = max(1, text_length // 4)
@@ -501,6 +507,64 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         self.logger.info("Streaming progress", data=data)
 
         return new_total
+
+    def add_stream_listener(self, listener: Callable[[str], None]) -> Callable[[], None]:
+        """
+        Register a callback invoked with streaming text chunks.
+
+        Args:
+            listener: Callable receiving the text chunk emitted by the provider.
+
+        Returns:
+            A function that removes the listener when called.
+        """
+        self._stream_listeners.add(listener)
+
+        def remove() -> None:
+            self._stream_listeners.discard(listener)
+
+        return remove
+
+    def _notify_stream_listeners(self, chunk: str) -> None:
+        """Notify registered listeners with a streaming text chunk."""
+        if not chunk:
+            return
+        for listener in list(self._stream_listeners):
+            try:
+                listener(chunk)
+            except Exception:
+                self.logger.exception("Stream listener raised an exception")
+
+    def add_tool_stream_listener(
+        self, listener: Callable[[str, Dict[str, Any] | None], None]
+    ) -> Callable[[], None]:
+        """Register a callback invoked with tool streaming events.
+
+        Args:
+            listener: Callable receiving event_type (str) and optional info dict.
+
+        Returns:
+            A function that removes the listener when called.
+        """
+
+        self._tool_stream_listeners.add(listener)
+
+        def remove() -> None:
+            self._tool_stream_listeners.discard(listener)
+
+        return remove
+
+    def _notify_tool_stream_listeners(
+        self, event_type: str, payload: Dict[str, Any] | None = None
+    ) -> None:
+        """Notify listeners about tool streaming lifecycle events."""
+
+        data = payload or {}
+        for listener in list(self._tool_stream_listeners):
+            try:
+                listener(event_type, data)
+            except Exception:
+                self.logger.exception("Tool stream listener raised an exception")
 
     def _log_chat_finished(self, model: Optional[str] = None) -> None:
         """Log a chat finished event"""
@@ -575,11 +639,15 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
         # Convert to PromptMessageExtended objects
         multipart_messages = PromptMessageExtended.parse_get_prompt_result(prompt_result)
+        # Store a local copy of template messages so we can retain them across clears
+        self._template_messages = [msg.model_copy(deep=True) for msg in multipart_messages]
 
         # Delegate to the provider-specific implementation
         result = await self._apply_prompt_provider_specific(
             multipart_messages, None, is_template=True
         )
+        # Ensure message history always includes the stored template when applied
+        self._message_history = [msg.model_copy(deep=True) for msg in self._template_messages]
         return result.first_text()
 
     async def _save_history(self, filename: str) -> None:
@@ -606,6 +674,31 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
             List of PromptMessageExtended objects representing the conversation history
         """
         return self._message_history
+
+    def pop_last_message(self) -> PromptMessageExtended | None:
+        """Remove and return the most recent message from the conversation history."""
+        if not self._message_history:
+            return None
+
+        removed = self._message_history.pop()
+        try:
+            self.history.pop()
+        except Exception:
+            # If provider-specific memory isn't available, ignore to avoid crashing UX
+            pass
+        return removed
+
+    def clear(self, *, clear_prompts: bool = False) -> None:
+        """Reset stored message history while optionally retaining prompt templates."""
+
+        self.history.clear(clear_prompts=clear_prompts)
+        if clear_prompts:
+            self._template_messages = []
+            self._message_history = []
+            return
+
+        # Restore message history to template messages only; new turns will append as normal
+        self._message_history = [msg.model_copy(deep=True) for msg in self._template_messages]
 
     def _api_key(self):
         if self._init_api_key:

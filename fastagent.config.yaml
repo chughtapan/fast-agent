@@ -31,6 +31,8 @@ logger:
   # Truncate long tool responses on the console
   truncate_tools: true
 
+  streaming: markdown
+
 # MCP Servers
 mcp:
   servers:
@@ -42,3 +44,8 @@ mcp:
       args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
     huggingface:
       url: "https://huggingface.co/mcp?login"
+    everything:
+      url: "http://localhost:3001/mcp"
+      elicitation:
+        mode: "auto-cancel"
+

@@ -8,6 +8,7 @@ without pulling in MCP-specific code, helping to avoid circular imports.
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     List,
     Mapping,
@@ -17,11 +18,12 @@ from typing import (
     Type,
     TypeVar,
     Union,
+    runtime_checkable,
 )
 
 from a2a.types import AgentCard
 from mcp import Tool
-from mcp.types import GetPromptResult, Prompt, PromptMessage, ReadResourceResult
+from mcp.types import GetPromptResult, ListToolsResult, Prompt, PromptMessage, ReadResourceResult
 from pydantic import BaseModel
 from rich.text import Text
 
@@ -58,6 +60,7 @@ class ModelFactoryFunctionProtocol(Protocol):
     def __call__(self, model: str | None = None) -> LLMFactoryProtocol: ...
 
 
+@runtime_checkable
 class FastAgentLLMProtocol(Protocol):
     """Protocol defining the interface for LLMs"""
 
@@ -79,8 +82,21 @@ class FastAgentLLMProtocol(Protocol):
         self, prompt_result: "GetPromptResult", prompt_name: str
     ) -> str: ...
 
+    def get_request_params(
+        self,
+        request_params: RequestParams | None = None,
+    ) -> RequestParams: ...
+
+    def add_stream_listener(self, listener: Callable[[str], None]) -> Callable[[], None]: ...
+
+    def add_tool_stream_listener(
+        self, listener: Callable[[str, Dict[str, Any] | None], None]
+    ) -> Callable[[], None]: ...
+
     @property
     def message_history(self) -> List[PromptMessageExtended]: ...
+
+    def pop_last_message(self) -> PromptMessageExtended | None: ...
 
     @property
     def usage_accumulator(self) -> UsageAccumulator | None: ...
@@ -94,7 +110,10 @@ class FastAgentLLMProtocol(Protocol):
     @property
     def model_info(self) -> "ModelInfo | None": ...
 
+    def clear(self, *, clear_prompts: bool = False) -> None: ...
 
+
+@runtime_checkable
 class LlmAgentProtocol(Protocol):
     """Protocol defining the minimal interface for LLM agents."""
 
@@ -111,8 +130,13 @@ class LlmAgentProtocol(Protocol):
 
     async def shutdown(self) -> None: ...
 
+    def clear(self, *, clear_prompts: bool = False) -> None: ...
 
-class AgentProtocol(LlmAgentProtocol):
+    def pop_last_message(self) -> PromptMessageExtended | None: ...
+
+
+@runtime_checkable
+class AgentProtocol(LlmAgentProtocol, Protocol):
     """Standard agent interface with flexible input types."""
 
     async def __call__(
@@ -185,6 +209,8 @@ class AgentProtocol(LlmAgentProtocol):
     async def list_resources(self, namespace: str | None = None) -> Mapping[str, List[str]]: ...
 
     async def list_mcp_tools(self, namespace: str | None = None) -> Mapping[str, List[Tool]]: ...
+
+    async def list_tools(self) -> ListToolsResult: ...
 
     async def get_resource(
         self, resource_uri: str, namespace: str | None = None

@@ -25,7 +25,7 @@ class RichProgressDisplay:
                 #                table_column=Column(max_width=16),
             ),
             TextColumn(text_format="{task.fields[target]:<16}", style="Bold Blue"),
-            TextColumn(text_format="{task.fields[details]}", style="dim white"),
+            TextColumn(text_format="{task.fields[details]}", style="white"),
             console=self.console,
             transient=False,
         )
@@ -78,6 +78,7 @@ class RichProgressDisplay:
             ProgressAction.INITIALIZED: "dim green",
             ProgressAction.CHATTING: "bold blue",
             ProgressAction.STREAMING: "bold green",  # Assistant Colour
+            ProgressAction.THINKING: "bold yellow",  # Assistant Colour
             ProgressAction.ROUTING: "bold blue",
             ProgressAction.PLANNING: "bold blue",
             ProgressAction.READY: "dim green",
@@ -108,7 +109,9 @@ class RichProgressDisplay:
 
         # Ensure no None values in the update
         # For streaming, use custom description immediately to avoid flashing
-        if event.action == ProgressAction.STREAMING and event.streaming_tokens:
+        if (
+            event.action == ProgressAction.STREAMING or event.action == ProgressAction.THINKING
+        ) and event.streaming_tokens:
             # Account for [dim][/dim] tags (11 characters) in padding calculation
             formatted_tokens = f"▎[dim]◀[/dim] {event.streaming_tokens.strip()}".ljust(17 + 11)
             description = f"[{self._get_action_style(event.action)}]{formatted_tokens}"

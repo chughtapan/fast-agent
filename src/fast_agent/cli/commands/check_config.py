@@ -13,6 +13,7 @@ from rich.text import Text
 
 from fast_agent.llm.provider_key_manager import API_KEY_HINT_TEXT, ProviderKeyManager
 from fast_agent.llm.provider_types import Provider
+from fast_agent.skills import SkillRegistry
 from fast_agent.ui.console import console
 
 app = typer.Typer(
@@ -144,7 +145,7 @@ def get_fastagent_version() -> str:
 
 def get_config_summary(config_path: Optional[Path]) -> dict:
     """Extract key information from the configuration file."""
-    from fast_agent.config import Settings
+    from fast_agent.config import MCPTimelineSettings, Settings
 
     # Get actual defaults from Settings class
     default_settings = Settings()
@@ -156,6 +157,7 @@ def get_config_summary(config_path: Optional[Path]) -> dict:
         "logger": {
             "level": default_settings.logger.level,
             "type": default_settings.logger.type,
+            "streaming": default_settings.logger.streaming,
             "progress_display": default_settings.logger.progress_display,
             "show_chat": default_settings.logger.show_chat,
             "show_tools": default_settings.logger.show_tools,
@@ -163,7 +165,12 @@ def get_config_summary(config_path: Optional[Path]) -> dict:
             "enable_markup": default_settings.logger.enable_markup,
         },
         "mcp_ui_mode": default_settings.mcp_ui_mode,
+        "timeline": {
+            "steps": default_settings.mcp_timeline.steps,
+            "step_seconds": default_settings.mcp_timeline.step_seconds,
+        },
         "mcp_servers": [],
+        "skills_directory": None,
     }
 
     if not config_path:
@@ -194,6 +201,7 @@ def get_config_summary(config_path: Optional[Path]) -> dict:
             result["logger"] = {
                 "level": logger_config.get("level", default_settings.logger.level),
                 "type": logger_config.get("type", default_settings.logger.type),
+                "streaming": logger_config.get("streaming", default_settings.logger.streaming),
                 "progress_display": logger_config.get(
                     "progress_display", default_settings.logger.progress_display
                 ),
@@ -210,6 +218,21 @@ def get_config_summary(config_path: Optional[Path]) -> dict:
         # Get MCP UI mode
         if "mcp_ui_mode" in config:
             result["mcp_ui_mode"] = config["mcp_ui_mode"]
+
+        # Get timeline settings
+        if "mcp_timeline" in config:
+            try:
+                timeline_override = MCPTimelineSettings(**(config.get("mcp_timeline") or {}))
+            except Exception as exc:  # pragma: no cover - defensive
+                console.print(
+                    "[yellow]Warning:[/yellow] Invalid mcp_timeline configuration; using defaults."
+                )
+                console.print(f"[yellow]Details:[/yellow] {exc}")
+            else:
+                result["timeline"] = {
+                    "steps": timeline_override.steps,
+                    "step_seconds": timeline_override.step_seconds,
+                }
 
         # Get MCP server info
         if "mcp" in config and "servers" in config["mcp"]:
@@ -256,6 +279,13 @@ def get_config_summary(config_path: Optional[Path]) -> dict:
                     server_info["url"] = server_info["url"][:57] + "..."
 
                 result["mcp_servers"].append(server_info)
+
+        # Skills directory override
+        skills_cfg = config.get("skills") if isinstance(config, dict) else None
+        if isinstance(skills_cfg, dict):
+            directory_value = skills_cfg.get("directory")
+            if isinstance(directory_value, str) and directory_value.strip():
+                result["skills_directory"] = directory_value.strip()
 
     except Exception as e:
         # File exists but has parse errors
@@ -367,6 +397,18 @@ def show_check_summary() -> None:
 
     console.print(env_table)
 
+    def _relative_path(path: Path) -> str:
+        try:
+            return str(path.relative_to(cwd))
+        except ValueError:
+            return str(path)
+
+    skills_override = config_summary.get("skills_directory")
+    override_directory = Path(skills_override).expanduser() if skills_override else None
+    skills_registry = SkillRegistry(base_dir=cwd, override_directory=override_directory)
+    skills_dir = skills_registry.directory
+    skills_manifests, skill_errors = skills_registry.load_manifests_with_errors()
+
     # Logger Settings panel with two-column layout
     logger = config_summary.get("logger", {})
     logger_table = Table(show_header=True, box=None)
@@ -385,16 +427,42 @@ def show_check_summary() -> None:
     else:
         mcp_ui_display = f"[green]{mcp_ui_mode}[/green]"
 
+    timeline_settings = config_summary.get("timeline", {})
+    timeline_steps = timeline_settings.get("steps", 20)
+    timeline_step_seconds = timeline_settings.get("step_seconds", 30)
+
+    def format_step_interval(seconds: int) -> str:
+        try:
+            total = int(seconds)
+        except (TypeError, ValueError):
+            return str(seconds)
+        if total <= 0:
+            return "0s"
+        if total % 86400 == 0:
+            return f"{total // 86400}d"
+        if total % 3600 == 0:
+            return f"{total // 3600}h"
+        if total % 60 == 0:
+            return f"{total // 60}m"
+        minutes, secs = divmod(total, 60)
+        if minutes:
+            return f"{minutes}m{secs:02d}s"
+        return f"{secs}s"
+
     # Prepare all settings as pairs
     settings_data = [
         ("Log Level", logger.get("level", "warning (default)")),
         ("Log Type", logger.get("type", "file (default)")),
         ("MCP-UI", mcp_ui_display),
+        ("Streaming Mode", f"[green]{logger.get('streaming', 'markdown')}[/green]"),
+        ("Streaming Display", bool_to_symbol(logger.get("streaming_display", True))),
         ("Progress Display", bool_to_symbol(logger.get("progress_display", True))),
         ("Show Chat", bool_to_symbol(logger.get("show_chat", True))),
         ("Show Tools", bool_to_symbol(logger.get("show_tools", True))),
         ("Truncate Tools", bool_to_symbol(logger.get("truncate_tools", True))),
         ("Enable Markup", bool_to_symbol(logger.get("enable_markup", True))),
+        ("Timeline Steps", f"[green]{timeline_steps}[/green]"),
+        ("Timeline Interval", f"[green]{format_step_interval(timeline_step_seconds)}[/green]"),
     ]
 
     # Add rows in two-column layout, styling some values in green
@@ -565,6 +633,70 @@ def show_check_summary() -> None:
 
             _print_section_header("MCP Servers", color="blue")
             console.print(servers_table)
+
+    _print_section_header("Agent Skills", color="blue")
+    if skills_dir:
+        console.print(f"Directory: [green]{_relative_path(skills_dir)}[/green]")
+
+        if skills_manifests or skill_errors:
+            skills_table = Table(show_header=True, box=None)
+            skills_table.add_column("Name", style="cyan", header_style="bold bright_white")
+            skills_table.add_column("Description", style="white", header_style="bold bright_white")
+            skills_table.add_column("Source", style="dim", header_style="bold bright_white")
+            skills_table.add_column("Status", style="green", header_style="bold bright_white")
+
+            def _truncate(text: str, length: int = 70) -> str:
+                if len(text) <= length:
+                    return text
+                return text[: length - 3] + "..."
+
+            for manifest in skills_manifests:
+                try:
+                    relative_source = manifest.path.parent.relative_to(skills_dir)
+                    source_display = str(relative_source) if relative_source != Path(".") else "."
+                except ValueError:
+                    source_display = _relative_path(manifest.path.parent)
+
+                skills_table.add_row(
+                    manifest.name,
+                    _truncate(manifest.description or ""),
+                    source_display,
+                    "[green]ok[/green]",
+                )
+
+            for error in skill_errors:
+                error_path_str = error.get("path", "")
+                source_display = "[dim]n/a[/dim]"
+                if error_path_str:
+                    error_path = Path(error_path_str)
+                    try:
+                        relative_error = error_path.parent.relative_to(skills_dir)
+                        source_display = str(relative_error) if relative_error != Path(".") else "."
+                    except ValueError:
+                        source_display = _relative_path(error_path.parent)
+                message = error.get("error", "Failed to parse skill manifest")
+                skills_table.add_row(
+                    "[red]—[/red]",
+                    "[red]n/a[/red]",
+                    source_display,
+                    f"[red]{_truncate(message, 60)}[/red]",
+                )
+
+            console.print(skills_table)
+        else:
+            console.print("[yellow]No skills found in the directory[/yellow]")
+    else:
+        if skills_registry.override_failed and override_directory:
+            console.print(
+                f"[red]Override directory not found:[/red] {_relative_path(override_directory)}"
+            )
+            console.print(
+                "[yellow]Default folders were not loaded because the override failed[/yellow]"
+            )
+        else:
+            console.print(
+                "[dim]Agent Skills not configured. Go to https://fast-agent.ai/agents/skills/[/dim]"
+            )
 
     # Show help tips
     if config_status == "not_found" or secrets_status == "not_found":

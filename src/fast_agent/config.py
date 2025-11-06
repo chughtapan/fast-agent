@@ -43,10 +43,93 @@ class MCPSamplingSettings(BaseModel):
 
 
 class MCPElicitationSettings(BaseModel):
-    mode: Literal["forms", "auto_cancel", "none"] = "none"
-    """Elicitation mode: 'forms' (default UI), 'auto_cancel', 'none' (no capability)"""
+    mode: Literal["forms", "auto-cancel", "none"] = "none"
+    """Elicitation mode: 'forms' (default UI), 'auto-cancel', 'none' (no capability)"""
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+
+class MCPTimelineSettings(BaseModel):
+    """Configuration for MCP activity timeline display."""
+
+    steps: int = 20
+    """Number of timeline buckets to render."""
+
+    step_seconds: int = 30
+    """Duration of each timeline bucket in seconds."""
+
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+    @staticmethod
+    def _parse_duration(value: str) -> int:
+        """Parse simple duration strings like '30s', '2m', '1h' into seconds."""
+        pattern = re.compile(r"^\s*(\d+)\s*([smhd]?)\s*$", re.IGNORECASE)
+        match = pattern.match(value)
+        if not match:
+            raise ValueError("Expected duration in seconds (e.g. 30, '45s', '2m').")
+        amount = int(match.group(1))
+        unit = match.group(2).lower()
+        multiplier = {
+            "": 1,
+            "s": 1,
+            "m": 60,
+            "h": 3600,
+            "d": 86400,
+        }.get(unit)
+        if multiplier is None:
+            raise ValueError("Duration unit must be one of s, m, h, or d.")
+        return amount * multiplier
+
+    @field_validator("steps", mode="before")
+    @classmethod
+    def _coerce_steps(cls, value: Any) -> int:
+        if isinstance(value, str):
+            if not value.strip().isdigit():
+                raise ValueError("Timeline steps must be a positive integer.")
+            value = int(value.strip())
+        elif isinstance(value, float):
+            value = int(value)
+        if not isinstance(value, int):
+            raise TypeError("Timeline steps must be an integer.")
+        if value <= 0:
+            raise ValueError("Timeline steps must be greater than zero.")
+        return value
+
+
+class SkillsSettings(BaseModel):
+    """Configuration for the skills directory override."""
+
+    directory: str | None = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class ShellSettings(BaseModel):
+    """Configuration for shell execution behavior."""
+
+    timeout_seconds: int = 90
+    """Maximum seconds to wait for command output before terminating (default: 90s)"""
+
+    warning_interval_seconds: int = 30
+    """Show timeout warnings every N seconds (default: 30s)"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    @field_validator("timeout_seconds", mode="before")
+    @classmethod
+    def _coerce_timeout(cls, value: Any) -> int:
+        """Support duration strings like '90s', '2m', '1h'"""
+        if isinstance(value, str):
+            return MCPTimelineSettings._parse_duration(value)
+        return int(value)
+
+    @field_validator("warning_interval_seconds", mode="before")
+    @classmethod
+    def _coerce_warning_interval(cls, value: Any) -> int:
+        """Support duration strings like '30s', '1m'"""
+        if isinstance(value, str):
+            return MCPTimelineSettings._parse_duration(value)
+        return int(value)
 
 
 class MCPRootSettings(BaseModel):
@@ -388,8 +471,8 @@ class LoggerSettings(BaseModel):
     """Truncate display of long tool calls"""
     enable_markup: bool = True
     """Enable markup in console output. Disable for outputs that may conflict with rich console formatting"""
-    use_legacy_display: bool = False
-    """Use the legacy console display instead of the new style display"""
+    streaming: Literal["markdown", "plain", "none"] = "markdown"
+    """Streaming renderer for assistant responses"""
 
 
 def find_fastagent_config_files(start_path: Path) -> Tuple[Optional[Path], Optional[Path]]:
@@ -527,6 +610,15 @@ class Settings(BaseSettings):
     # Output directory for MCP-UI generated HTML files (relative to CWD if not absolute)
     mcp_ui_output_dir: str = ".fast-agent/ui"
     """Directory where MCP-UI HTML files are written. Relative paths are resolved from CWD."""
+
+    mcp_timeline: MCPTimelineSettings = MCPTimelineSettings()
+    """Display settings for MCP activity timelines."""
+
+    skills: SkillsSettings = SkillsSettings()
+    """Local skills discovery and selection settings."""
+
+    shell_execution: ShellSettings = ShellSettings()
+    """Shell execution timeout and warning settings."""
 
     @classmethod
     def find_config(cls) -> Path | None:
