@@ -1,4 +1,4 @@
-"""Streaming buffer for markdown content with intelligent truncation.
+"""Streaming buffer for markdown content with lightweight truncation.
 
 This module provides a simple, robust streaming buffer that:
 1. Accumulates streaming chunks from LLM responses
@@ -6,20 +6,16 @@ This module provides a simple, robust streaming buffer that:
 3. Preserves markdown context when truncating:
    - Code blocks: retains opening ```language fence
    - Tables: retains header + separator rows
-   - Code blocks: adds closing ``` if unclosed
+4. Optionally adds a closing ``` fence for unclosed code blocks
 
-Design Philosophy
-=================
-KISS (Keep It Simple, Stupid):
-- No binary search (streaming is linear)
-- No dual modes (streaming always keeps recent content)
-- Parse once per truncation (not per chunk)
-- Position-based tracking (clear, testable)
+Design philosophy:
+- Keep the logic linear and easy to reason about.
+- Avoid expensive render passes; use width-based line estimation.
 """
 
 from dataclasses import dataclass
 from math import ceil
-from typing import List, Optional
+from typing import Generator
 
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
@@ -40,7 +36,7 @@ class Table:
 
     start_pos: int  # Character position where table starts
     end_pos: int  # Character position where table ends
-    header_lines: List[str]  # Header row + separator (e.g., ["| A | B |", "|---|---|"])
+    header_lines: list[str]  # Header row + separator (e.g., ["| A | B |", "|---|---|"])
 
 
 class StreamBuffer:
@@ -54,9 +50,12 @@ class StreamBuffer:
             render(display_text)
     """
 
-    def __init__(self):
+    def __init__(self, target_height_ratio: float = 0.7):
         """Initialize the stream buffer."""
-        self._chunks: List[str] = []
+        if not 0 < target_height_ratio <= 1:
+            raise ValueError("target_height_ratio must be between 0 and 1")
+        self._chunks: list[str] = []
+        self._target_height_ratio = target_height_ratio
         self._parser = MarkdownIt().enable("table")
 
     def append(self, chunk: str) -> None:
@@ -79,21 +78,18 @@ class StreamBuffer:
     def get_display_text(
         self,
         terminal_height: int,
-        target_ratio: float = 0.7,
-        terminal_width: Optional[int] = None,
+        target_ratio: float | None = None,
+        terminal_width: int | None = None,
+        *,
+        add_closing_fence: bool = False,
     ) -> str:
         """Get text for display, truncated to fit terminal.
 
-        This applies intelligent truncation when content exceeds terminal height:
-        1. Keeps most recent content (last N lines)
-        2. Preserves code block fences if truncated mid-block
-        3. Preserves table headers if truncated in table data
-        4. Adds closing fence if code block is unclosed
-
         Args:
             terminal_height: Height of terminal in lines
-            target_ratio: Keep this multiple of terminal height (default 1.5)
+            target_ratio: Ratio of terminal height to keep (defaults to instance ratio)
             terminal_width: Optional terminal width for estimating wrapped lines
+            add_closing_fence: Append a closing fence for unclosed code blocks
 
         Returns:
             Text ready for display (truncated if needed)
@@ -101,8 +97,34 @@ class StreamBuffer:
         full_text = self.get_full_text()
         if not full_text:
             return full_text
+        ratio = target_ratio if target_ratio is not None else self._target_height_ratio
         return self._truncate_for_display(
-            full_text, terminal_height, target_ratio, terminal_width
+            full_text,
+            terminal_height,
+            ratio,
+            terminal_width,
+            add_closing_fence=add_closing_fence,
+        )
+
+    def truncate_text(
+        self,
+        text: str,
+        terminal_height: int,
+        terminal_width: int | None = None,
+        *,
+        add_closing_fence: bool = False,
+        target_ratio: float | None = None,
+    ) -> str:
+        """Truncate the provided text without mutating the internal buffer."""
+        if not text:
+            return text
+        ratio = target_ratio if target_ratio is not None else self._target_height_ratio
+        return self._truncate_for_display(
+            text,
+            terminal_height,
+            ratio,
+            terminal_width,
+            add_closing_fence=add_closing_fence,
         )
 
     def clear(self) -> None:
@@ -114,7 +136,9 @@ class StreamBuffer:
         text: str,
         terminal_height: int,
         target_ratio: float,
-        terminal_width: Optional[int],
+        terminal_width: int | None,
+        *,
+        add_closing_fence: bool = False,
     ) -> str:
         """Truncate text to fit display with context preservation.
 
@@ -134,13 +158,11 @@ class StreamBuffer:
         Returns:
             Truncated text with preserved context
         """
-        lines = text.split("\n")
+        if terminal_height <= 0:
+            return text
 
-        if target_ratio <= 1:
-            extra_lines = 0
-        else:
-            extra_lines = int(ceil(terminal_height * (target_ratio - 1)))
-        raw_target_lines = terminal_height + extra_lines
+        lines = text.split("\n")
+        target_lines = max(1, int(terminal_height * target_ratio))
 
         # Estimate how many rendered lines the text will occupy
         if terminal_width and terminal_width > 0:
@@ -153,16 +175,10 @@ class StreamBuffer:
 
         # Fast path: no truncation needed if content still fits the viewport
         if total_display_lines <= terminal_height:
-            # Still need to check for unclosed code blocks
-            return self._add_closing_fence_if_needed(text)
+            return self._add_closing_fence_if_needed(text) if add_closing_fence else text
 
         # Determine how many display lines we want to keep after truncation
-        desired_display_lines = min(total_display_lines, raw_target_lines)
-        if desired_display_lines > terminal_height:
-            window_lines = max(1, terminal_height // 5)  # keep ~20% headroom
-            desired_display_lines = max(terminal_height, desired_display_lines - window_lines)
-        else:
-            desired_display_lines = terminal_height
+        desired_display_lines = min(total_display_lines, target_lines)
 
         # Determine how many logical lines we can keep based on estimated display rows
         if display_counts:
@@ -203,12 +219,13 @@ class StreamBuffer:
             text, truncated_text, truncation_pos, tables
         )
 
-        # Add closing fence if code block is unclosed
-        truncated_text = self._add_closing_fence_if_needed(truncated_text)
+        # Add closing fence if code block is unclosed (display-only)
+        if add_closing_fence:
+            truncated_text = self._add_closing_fence_if_needed(truncated_text)
 
         return truncated_text
 
-    def _find_code_blocks(self, text: str) -> List[CodeBlock]:
+    def _find_code_blocks(self, text: str) -> list[CodeBlock]:
         """Find all code blocks in text using markdown-it parser.
 
         Args:
@@ -235,7 +252,7 @@ class StreamBuffer:
 
         return blocks
 
-    def _find_tables(self, text: str) -> List[Table]:
+    def _find_tables(self, text: str) -> list[Table]:
         """Find all tables in text using markdown-it parser.
 
         Args:
@@ -249,21 +266,23 @@ class StreamBuffer:
         tables = []
 
         for i, token in enumerate(tokens):
-            if token.type == "table_open" and token.map:
+            token_map = token.map
+            if token.type == "table_open" and token_map is not None:
                 # Find tbody within this table to extract header
                 tbody_start_line = None
 
                 # Look ahead for tbody
                 for j in range(i + 1, len(tokens)):
-                    if tokens[j].type == "tbody_open" and tokens[j].map:
-                        tbody_start_line = tokens[j].map[0]
+                    tbody_map = tokens[j].map
+                    if tokens[j].type == "tbody_open" and tbody_map is not None:
+                        tbody_start_line = tbody_map[0]
                         break
                     elif tokens[j].type == "table_close":
                         break
 
                 if tbody_start_line is not None:
-                    table_start_line = token.map[0]
-                    table_end_line = token.map[1]
+                    table_start_line = token_map[0]
+                    table_end_line = token_map[1]
 
                     # Calculate positions
                     start_pos = sum(len(line) + 1 for line in lines[:table_start_line])
@@ -279,7 +298,7 @@ class StreamBuffer:
         return tables
 
     def _preserve_code_block_context(
-        self, original_text: str, truncated_text: str, truncation_pos: int, code_blocks: List[CodeBlock]
+        self, original_text: str, truncated_text: str, truncation_pos: int, code_blocks: list[CodeBlock]
     ) -> str:
         """Prepend code block opening fence if truncation removed it.
 
@@ -310,7 +329,7 @@ class StreamBuffer:
         return truncated_text
 
     def _preserve_table_context(
-        self, original_text: str, truncated_text: str, truncation_pos: int, tables: List[Table]
+        self, original_text: str, truncated_text: str, truncation_pos: int, tables: list[Table]
     ) -> str:
         """Prepend table header if truncation removed it.
 
@@ -346,9 +365,27 @@ class StreamBuffer:
                 data_start_line = table_start_line + len(table.header_lines)
                 data_start_pos = sum(len(line) + 1 for line in lines[:data_start_line])
 
-                # If we truncated in the data section, restore header
-                if truncation_pos >= data_start_pos:
-                    header_text = "\n".join(table.header_lines) + "\n"
+                header_text = "\n".join(table.header_lines) + "\n"
+                if truncated_text.startswith(header_text):
+                    return truncated_text
+
+                truncated_lines = truncated_text.splitlines()
+                header_lines = [line.rstrip() for line in table.header_lines]
+                if len(truncated_lines) >= len(header_lines):
+                    candidate = [line.rstrip() for line in truncated_lines[: len(header_lines)]]
+                    if candidate == header_lines:
+                        return truncated_text
+
+                first_non_empty = next(
+                    (line.rstrip() for line in truncated_lines if line.strip()), ""
+                )
+                separator_line = header_lines[-1] if header_lines else ""
+
+                # If we truncated in the data section, or we see the separator row
+                # without the header row, prepend the header.
+                if truncation_pos >= data_start_pos or (
+                    first_non_empty and first_non_empty == separator_line
+                ):
                     return header_text + truncated_text
 
                 # Found the relevant table, no need to check others
@@ -382,7 +419,7 @@ class StreamBuffer:
 
         return text
 
-    def _flatten_tokens(self, tokens: List[Token]) -> List[Token]:
+    def _flatten_tokens(self, tokens: list[Token]) -> Generator[Token, None, None]:
         """Flatten nested token tree.
 
         Args:
@@ -399,14 +436,14 @@ class StreamBuffer:
             else:
                 yield token
 
-    def _estimate_display_counts(self, lines: List[str], terminal_width: int) -> List[int]:
+    def _estimate_display_counts(self, lines: list[str], terminal_width: int) -> list[int]:
         """Estimate how many terminal rows each logical line will occupy."""
         return [
-            max(1, ceil(len(line) / terminal_width)) if line else 1
+            max(1, ceil(len(line.expandtabs()) / terminal_width)) if line else 1
             for line in lines
         ]
 
-    def _estimate_display_lines(self, text: str, terminal_width: int) -> int:
+    def estimate_display_lines(self, text: str, terminal_width: int) -> int:
         """Estimate how many terminal rows the given text will occupy."""
         if not text:
             return 0
@@ -424,7 +461,7 @@ class StreamBuffer:
         """Trim additional characters when a single line exceeds the viewport."""
         current_pos = truncation_pos
         current_text = truncated_text
-        estimated_lines = self._estimate_display_lines(current_text, terminal_width)
+        estimated_lines = self.estimate_display_lines(current_text, terminal_width)
 
         while estimated_lines > max_display_lines and current_pos < len(text):
             excess_display = estimated_lines - max_display_lines
@@ -444,6 +481,6 @@ class StreamBuffer:
 
             current_pos = candidate_pos
             current_text = text[current_pos:]
-            estimated_lines = self._estimate_display_lines(current_text, terminal_width)
+            estimated_lines = self.estimate_display_lines(current_text, terminal_width)
 
         return current_text, current_pos

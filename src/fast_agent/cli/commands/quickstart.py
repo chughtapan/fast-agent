@@ -1,8 +1,9 @@
 """Bootstrap command to create example applications."""
 
 import shutil
+from contextlib import ExitStack
 from dataclasses import dataclass
-from importlib.resources import files
+from importlib.resources import as_file, files
 from pathlib import Path
 
 import typer
@@ -20,6 +21,9 @@ console = shared_console
 
 
 BASE_EXAMPLES_DIR = files("fast_agent").joinpath("resources").joinpath("examples")
+
+# Subdirectories to copy for toad-cards quickstart (used by hf-inference-acp too)
+TOAD_CARDS_SUBDIRS = ["agent-cards", "tool-cards", "skills", "shared"]
 
 
 @dataclass
@@ -130,6 +134,16 @@ _EXAMPLE_CONFIGS = {
         create_subdir=True,
         path_in_examples=["elicitations"],
     ),
+    "toad-cards": ExampleConfig(
+        description=(
+            "Example Tool and Agent cards for (also used with Hugging Face Toad integration).\n"
+            "Includes ACP expert, MCP expert, and HF search tool cards.\n"
+            "Creates a '.fast-agent' directory in the current directory."
+        ),
+        files=[f"{d}/" for d in TOAD_CARDS_SUBDIRS],
+        create_subdir=False,
+        path_in_examples=["hf-toad-cards"],
+    ),
 }
 
 
@@ -156,31 +170,52 @@ def copy_example_files(example_type: str, target_dir: Path, force: bool = False)
             target_dir.mkdir(parents=True)
             console.print(f"Created subdirectory: {target_dir}")
 
+    # Determine source directory - try package resources first, then fallback
+    use_as_file = False
     # Try to use examples from the installed package first, or fall back to the top-level directory
     try:
         # First try to find examples in the package resources
-        source_dir = BASE_EXAMPLES_DIR
+        source_dir_traversable = BASE_EXAMPLES_DIR
         for dir in example_info.path_in_examples:
-            source_dir = source_dir.joinpath(dir)
+            source_dir_traversable = source_dir_traversable.joinpath(dir)
 
         # Check if we found a valid directory
-        if not source_dir.is_dir():
+        if not source_dir_traversable.is_dir():
             console.print(
-                f"[yellow]Resource directory not found: {source_dir}. "
+                f"[yellow]Resource directory not found: {source_dir_traversable}. "
                 "Falling back to development mode.[/yellow]"
             )
             # Fall back to the top-level directory for development mode
-            source_dir = _development_mode_fallback(example_info)
+            source_dir: Path = _development_mode_fallback(example_info)
+        else:
+            # We have a valid Traversable, will need to use as_file
+            source_dir = source_dir_traversable  # type: ignore
+            use_as_file = True
     except (ImportError, ModuleNotFoundError, ValueError) as e:
         console.print(
             f"[yellow]Error accessing resources: {e}. Falling back to development mode.[/yellow]"
         )
         source_dir = _development_mode_fallback(example_info)
 
-    if not source_dir.exists():
-        console.print(f"[red]Error: Source directory not found: {source_dir}[/red]")
-        return []
+    # Use as_file context manager if source_dir is a Traversable, otherwise use directly
+    with ExitStack() as stack:
+        if use_as_file:
+            source_path = stack.enter_context(as_file(source_dir))  # type: ignore
+        else:
+            assert isinstance(source_dir, Path)
+            source_path = source_dir
 
+        if not source_path.exists():
+            console.print(f"[red]Error: Source directory not found: {source_path}[/red]")
+            return []
+
+        return _copy_files_from_source(example_type, example_info, source_path, target_dir, force)
+
+
+def _copy_files_from_source(
+    example_type: str, example_info: ExampleConfig, source_dir: Path, target_dir: Path, force: bool
+) -> list[str]:
+    """Helper function to copy files from a source directory."""
     created = []
     for filename in example_info.files:
         source = source_dir / filename
@@ -457,15 +492,16 @@ def tensorzero(
     dest_project_dir = directory.resolve() / "tensorzero"
 
     # --- Find Source Directory ---
-    from importlib.resources import files
-
+    use_as_file = False
     try:
         # This path MUST match the "to" path from hatch_build.py
-        source_dir = (
+        source_dir_traversable = (
             files("fast_agent").joinpath("resources").joinpath("examples").joinpath("tensorzero")
         )
-        if not source_dir.is_dir():
+        if not source_dir_traversable.is_dir():
             raise FileNotFoundError  # Fallback to dev mode if resource isn't a dir
+        source_dir = source_dir_traversable  # type: ignore
+        use_as_file = True
     except (ImportError, ModuleNotFoundError, FileNotFoundError):
         console.print(
             "[yellow]Package resources not found. Falling back to development mode.[/yellow]"
@@ -473,39 +509,168 @@ def tensorzero(
         # This path is relative to the project root in a development environment
         source_dir = Path(__file__).parent.parent.parent.parent / "examples" / "tensorzero"
 
-    if not source_dir.exists() or not source_dir.is_dir():
-        console.print(f"[red]Error: Source project directory not found at '{source_dir}'[/red]")
-        raise typer.Exit(1)
+    # Use as_file context manager if needed
+    with ExitStack() as stack:
+        if use_as_file:
+            source_path = stack.enter_context(as_file(source_dir))  # type: ignore
+        else:
+            assert isinstance(source_dir, Path)
+            source_path = source_dir
 
-    console.print(f"Source directory: [dim]{source_dir}[/dim]")
-    console.print(f"Destination: [dim]{dest_project_dir}[/dim]")
+        if not source_path.exists() or not source_path.is_dir():
+            console.print(
+                f"[red]Error: Source project directory not found at '{source_path}'[/red]"
+            )
+            raise typer.Exit(1)
 
-    # --- Copy Project and Show Message ---
-    if copy_project_template(source_dir, dest_project_dir, console, force):
-        console.print(
-            f"\n[bold green]✅ Success![/bold green] Your TensorZero project has been created in: [cyan]{dest_project_dir}[/cyan]"
+        console.print(f"Source directory: [dim]{source_path}[/dim]")
+        console.print(f"Destination: [dim]{dest_project_dir}[/dim]")
+
+        # --- Copy Project and Show Message ---
+        if copy_project_template(source_path, dest_project_dir, console, force):
+            console.print(
+                f"\n[bold green]✅ Success![/bold green] Your TensorZero project has been created in: [cyan]{dest_project_dir}[/cyan]"
+            )
+            console.print("\n[bold yellow]Next Steps:[/bold yellow]")
+            console.print("\n1. [bold]Navigate to your new project directory:[/bold]")
+            console.print(f"   [cyan]cd {dest_project_dir.relative_to(Path.cwd())}[/cyan]")
+
+            console.print("\n2. [bold]Set up your API keys:[/bold]")
+            console.print("   [cyan]cp .env.sample .env[/cyan]")
+            console.print(
+                "   [dim]Then, open the new '.env' file and add your OpenAI or Anthropic API key.[/dim]"
+            )
+
+            console.print(
+                "\n3. [bold]Start the required services (TensorZero Gateway & MCP Server):[/bold]"
+            )
+            console.print("   [cyan]docker compose up --build -d[/cyan]")
+            console.print(
+                "   [dim](This builds and starts the necessary containers in the background)[/dim]"
+            )
+
+            console.print("\n4. [bold]Run the interactive agent:[/bold]")
+            console.print("   [cyan]make agent[/cyan]  (or `uv run agent.py`)")
+            console.print("\nEnjoy exploring the TensorZero integration with fast-agent! ✨")
+
+
+@app.command(name="toad-cards")
+def toad_cards(
+    directory: Path = typer.Argument(
+        Path("."),
+        help="Directory where .fast-agent will be created (defaults to current directory)",
+    ),
+    force: bool = typer.Option(False, "--force", "-f", help="Force overwrite existing files"),
+) -> None:
+    """Create .fast-agent directory with example agent and tool cards for HuggingFace Toad."""
+    console.print("[bold green]Setting up toad-cards example...[/bold green]")
+
+    target_base = directory.resolve()
+    fast_agent_dir = target_base / ".fast-agent"
+
+    # Create .fast-agent directory if it doesn't exist
+    if fast_agent_dir.exists():
+        if not force:
+            console.print(
+                f"[bold yellow]Directory '{fast_agent_dir}' already exists.[/bold yellow] "
+                "Use --force to overwrite."
+            )
+            # Continue anyway, but will skip existing files
+        else:
+            console.print("[yellow]--force specified. Overwriting existing files...[/yellow]")
+    else:
+        fast_agent_dir.mkdir(parents=True, exist_ok=True)
+        console.print(f"Created directory: {fast_agent_dir}")
+
+    created = _copy_toad_cards(fast_agent_dir, force)
+    _show_toad_cards_completion_message(created)
+
+
+def _copy_toad_cards(target_dir: Path, force: bool = False) -> list[str]:
+    """Copy toad-cards files from resources to .fast-agent directory."""
+    created: list[str] = []
+
+    # Determine source directory - try package resources first, then fallback
+    use_as_file = False
+    try:
+        source_dir_traversable = BASE_EXAMPLES_DIR.joinpath("hf-toad-cards")
+        if not source_dir_traversable.is_dir():
+            console.print(
+                "[yellow]Package resources not found. Falling back to development mode.[/yellow]"
+            )
+            source_dir: Path = (
+                Path(__file__).parent.parent.parent.parent.parent / "examples" / "hf-toad-cards"
+            )
+        else:
+            source_dir = source_dir_traversable  # type: ignore
+            use_as_file = True
+    except (ImportError, ModuleNotFoundError, FileNotFoundError):
+        source_dir = (
+            Path(__file__).parent.parent.parent.parent.parent / "examples" / "hf-toad-cards"
         )
-        console.print("\n[bold yellow]Next Steps:[/bold yellow]")
-        console.print("\n1. [bold]Navigate to your new project directory:[/bold]")
-        console.print(f"   [cyan]cd {dest_project_dir.relative_to(Path.cwd())}[/cyan]")
 
-        console.print("\n2. [bold]Set up your API keys:[/bold]")
-        console.print("   [cyan]cp .env.sample .env[/cyan]")
-        console.print(
-            "   [dim]Then, open the new '.env' file and add your OpenAI or Anthropic API key.[/dim]"
-        )
+    with ExitStack() as stack:
+        if use_as_file:
+            source_path: Path = stack.enter_context(as_file(source_dir))  # type: ignore
+        else:
+            assert isinstance(source_dir, Path)
+            source_path = source_dir
 
-        console.print(
-            "\n3. [bold]Start the required services (TensorZero Gateway & MCP Server):[/bold]"
-        )
-        console.print("   [cyan]docker compose up --build -d[/cyan]")
-        console.print(
-            "   [dim](This builds and starts the necessary containers in the background)[/dim]"
-        )
+        if not source_path.exists():
+            console.print(f"[red]Error: Source directory not found: {source_path}[/red]")
+            return []
 
-        console.print("\n4. [bold]Run the interactive agent:[/bold]")
-        console.print("   [cyan]make agent[/cyan]  (or `uv run agent.py`)")
-        console.print("\nEnjoy exploring the TensorZero integration with fast-agent! ✨")
+        # Copy each subdirectory
+        for subdir_name in TOAD_CARDS_SUBDIRS:
+            source_subdir: Path = source_path / subdir_name
+            target_subdir = target_dir / subdir_name
+
+            if not source_subdir.exists():
+                continue
+
+            # Create target subdirectory
+            target_subdir.mkdir(parents=True, exist_ok=True)
+
+            # Copy all files recursively
+            for src_file in source_subdir.rglob("*"):
+                if src_file.is_file():
+                    rel_path = src_file.relative_to(source_subdir)
+                    dest_file = target_subdir / rel_path
+
+                    # Create parent directories if needed
+                    dest_file.parent.mkdir(parents=True, exist_ok=True)
+
+                    if dest_file.exists() and not force:
+                        console.print(
+                            f"[yellow]Skipping[/yellow] {subdir_name}/{rel_path} (already exists)"
+                        )
+                        continue
+
+                    shutil.copy2(src_file, dest_file)
+                    created.append(f".fast-agent/{subdir_name}/{rel_path}")
+                    console.print(f"[green]Created[/green] .fast-agent/{subdir_name}/{rel_path}")
+
+    return created
+
+
+def _show_toad_cards_completion_message(created: list[str]) -> None:
+    """Show completion message for toad-cards command."""
+    if created:
+        console.print("\n[green]Toad cards setup completed successfully![/green]")
+        console.print(f"\nCreated {len(created)} files in .fast-agent/")
+        console.print("\n[bold]Directory structure:[/bold]")
+        console.print("  .fast-agent/")
+        console.print("  ├── agent-cards/          # Agent card definitions")
+        console.print("  ├── tool-cards/           # Tool card definitions")
+        console.print("  ├── shared/               # Shared context snippets")
+        console.print("  ├── skills/               # Agent Skills (loaded on-demand)")
+
+        console.print("\n[bold]Next Steps:[/bold]")
+        console.print("1. The cards are automatically loaded when running hf-inference-acp")
+        console.print("2. Customize the cards by editing the markdown files")
+        console.print("3. Add more agent cards to agent-cards/ or tool cards to tool-cards/")
+    else:
+        console.print("\n[yellow]No files were created.[/yellow]")
 
 
 @app.command(name="t0", help="Alias for the TensorZero quickstart.", hidden=True)

@@ -1,4 +1,4 @@
-from asyncio import Lock, gather
+from asyncio import Lock
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -6,11 +6,9 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
-    Dict,
-    List,
     Mapping,
-    Optional,
     TypeVar,
+    Union,
     cast,
 )
 
@@ -29,10 +27,13 @@ from opentelemetry import trace
 from pydantic import AnyUrl, BaseModel, ConfigDict, Field
 
 from fast_agent.context_dependent import ContextDependent
+from fast_agent.core.exceptions import ServerSessionTerminatedError
 from fast_agent.core.logging.logger import get_logger
+from fast_agent.core.model_resolution import HARDCODED_DEFAULT_MODEL, resolve_model_spec
 from fast_agent.event_progress import ProgressAction
 from fast_agent.mcp.common import SEP, create_namespaced_name, is_namespaced_name
 from fast_agent.mcp.gen_client import gen_client
+from fast_agent.mcp.interfaces import ServerRegistryProtocol
 from fast_agent.mcp.mcp_agent_client_session import MCPAgentClientSession
 from fast_agent.mcp.mcp_connection_manager import MCPConnectionManager
 from fast_agent.mcp.skybridge import (
@@ -41,10 +42,14 @@ from fast_agent.mcp.skybridge import (
     SkybridgeServerConfig,
     SkybridgeToolConfig,
 )
+from fast_agent.mcp.tool_execution_handler import NoOpToolExecutionHandler, ToolExecutionHandler
+from fast_agent.mcp.tool_permission_handler import NoOpToolPermissionHandler, ToolPermissionHandler
 from fast_agent.mcp.transport_tracking import TransportSnapshot
+from fast_agent.utils.async_utils import gather_with_cancel
 
 if TYPE_CHECKING:
     from fast_agent.context import Context
+    from fast_agent.mcp_server_registry import ServerRegistry
 
 
 logger = get_logger(__name__)  # This will be replaced per-instance when agent_name is available
@@ -69,6 +74,7 @@ class ServerStats:
     call_counts: Counter = field(default_factory=Counter)
     last_call_at: datetime | None = None
     last_error_at: datetime | None = None
+    reconnect_count: int = 0
 
     def record(self, operation_type: str, success: bool) -> None:
         self.call_counts[operation_type] += 1
@@ -76,6 +82,10 @@ class ServerStats:
         self.last_call_at = now
         if not success:
             self.last_error_at = now
+
+    def record_reconnect(self) -> None:
+        """Record a successful reconnection."""
+        self.reconnect_count += 1
 
 
 class ServerStatus(BaseModel):
@@ -91,7 +101,7 @@ class ServerStatus(BaseModel):
     last_call_at: datetime | None = None
     last_error_at: datetime | None = None
     staleness_seconds: float | None = None
-    call_counts: Dict[str, int] = Field(default_factory=dict)
+    call_counts: dict[str, int] = Field(default_factory=dict)
     error_message: str | None = None
     instructions_available: bool | None = None
     instructions_enabled: bool | None = None
@@ -104,6 +114,18 @@ class ServerStatus(BaseModel):
     session_id: str | None = None
     transport_channels: TransportSnapshot | None = None
     skybridge: SkybridgeServerConfig | None = None
+    reconnect_count: int = 0
+    ping_interval_seconds: int | None = None
+    ping_max_missed: int | None = None
+    ping_ok_count: int | None = None
+    ping_fail_count: int | None = None
+    ping_consecutive_failures: int | None = None
+    ping_last_ok_at: datetime | None = None
+    ping_last_fail_at: datetime | None = None
+    ping_last_error: str | None = None
+    ping_activity_buckets: list[str] | None = None
+    ping_activity_bucket_seconds: int | None = None
+    ping_activity_bucket_count: int | None = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -120,7 +142,7 @@ class MCPAggregator(ContextDependent):
     connection_persistence: bool = False
     """Whether to maintain a persistent connection to the server."""
 
-    server_names: List[str]
+    server_names: list[str]
     """A list of server names to connect to."""
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
@@ -131,18 +153,17 @@ class MCPAggregator(ContextDependent):
 
         # Keep a connection manager to manage persistent connections for this aggregator
         if self.connection_persistence:
+            context = self._require_context()
             # Try to get existing connection manager from context
-            context = self.context
             if not hasattr(context, "_connection_manager") or context._connection_manager is None:
-                server_registry = context.server_registry
-                if server_registry is None:
-                    raise RuntimeError("Context is missing server registry for MCP connections")
+                server_registry = cast("ServerRegistry", self._require_server_registry())
                 manager = MCPConnectionManager(server_registry, context=context)
                 await manager.__aenter__()
                 context._connection_manager = manager
-            self._persistent_connection_manager = cast(
-                "MCPConnectionManager", context._connection_manager
-            )
+                self._owns_connection_manager = True
+            self._persistent_connection_manager = context._connection_manager
+        else:
+            self._persistent_connection_manager = None
 
         # Import the display component here to avoid circular imports
         from fast_agent.ui.console_display import ConsoleDisplay
@@ -159,17 +180,21 @@ class MCPAggregator(ContextDependent):
 
     def __init__(
         self,
-        server_names: List[str],
+        server_names: list[str],
         connection_persistence: bool = True,
-        context: Optional["Context"] = None,
+        context: Union["Context", None] = None,
         name: str | None = None,
-        config: Optional[Any] = None,  # Accept the agent config for elicitation_handler access
+        config: Any | None = None,  # Accept the agent config for elicitation_handler access
+        tool_handler: ToolExecutionHandler | None = None,
+        permission_handler: ToolPermissionHandler | None = None,
         **kwargs,
     ) -> None:
         """
         :param server_names: A list of server names to connect to.
         :param connection_persistence: Whether to maintain persistent connections to servers (default: True).
         :param config: Optional agent config containing elicitation_handler and other settings.
+        :param tool_handler: Optional handler for tool execution lifecycle events (e.g., for ACP notifications).
+        :param permission_handler: Optional handler for tool permission checks (e.g., for ACP permissions).
         Note: The server names must be resolvable by the gen_client function, and specified in the server registry.
         """
         super().__init__(
@@ -181,6 +206,16 @@ class MCPAggregator(ContextDependent):
         self.connection_persistence = connection_persistence
         self.agent_name = name
         self.config = config  # Store the config for access in session factory
+        self._persistent_connection_manager: MCPConnectionManager | None = None
+        self._owns_connection_manager = False
+
+        # Store tool execution handler for integration with ACP or other protocols
+        # Default to NoOpToolExecutionHandler if none provided
+        self._tool_handler = tool_handler or NoOpToolExecutionHandler()
+
+        # Store tool permission handler for ACP or other permission systems
+        # Default to NoOpToolPermissionHandler if none provided (allows all)
+        self._permission_handler = permission_handler or NoOpToolPermissionHandler()
 
         # Set up logger with agent name in namespace if available
         global logger
@@ -188,27 +223,51 @@ class MCPAggregator(ContextDependent):
         logger = get_logger(logger_name)
 
         # Maps namespaced_tool_name -> namespaced tool info
-        self._namespaced_tool_map: Dict[str, NamespacedTool] = {}
+        self._namespaced_tool_map: dict[str, NamespacedTool] = {}
         # Maps server_name -> list of tools
-        self._server_to_tool_map: Dict[str, List[NamespacedTool]] = {}
+        self._server_to_tool_map: dict[str, list[NamespacedTool]] = {}
         self._tool_map_lock = Lock()
 
         # Cache for prompt objects, maps server_name -> list of prompt objects
-        self._prompt_cache: Dict[str, List[Prompt]] = {}
+        self._prompt_cache: dict[str, list[Prompt]] = {}
         self._prompt_cache_lock = Lock()
 
         # Lock for refreshing tools from a server
         self._refresh_lock = Lock()
 
         # Track runtime stats per server
-        self._server_stats: Dict[str, ServerStats] = {}
+        self._server_stats: dict[str, ServerStats] = {}
         self._stats_lock = Lock()
 
         # Track discovered Skybridge configurations per server
-        self._skybridge_configs: Dict[str, SkybridgeServerConfig] = {}
+        self._skybridge_configs: dict[str, SkybridgeServerConfig] = {}
 
-    def _create_progress_callback(self, server_name: str, tool_name: str) -> "ProgressFnT":
+    def _require_context(self) -> "Context":
+        if self.context is None:
+            raise RuntimeError("MCPAggregator requires a context")
+        return self.context
+
+    def _require_server_registry(self) -> ServerRegistryProtocol:
+        context = self._require_context()
+        server_registry = getattr(context, "server_registry", None)
+        if server_registry is None:
+            raise RuntimeError("Context is missing server registry for MCP connections")
+        return server_registry
+
+    def _require_connection_manager(self) -> MCPConnectionManager:
+        if self._persistent_connection_manager is None:
+            raise RuntimeError("Persistent connection manager is not initialized")
+        return self._persistent_connection_manager
+
+    def _create_progress_callback(
+        self,
+        server_name: str,
+        tool_name: str,
+        tool_call_id: str,
+        request_tool_handler: ToolExecutionHandler | None = None,
+    ) -> "ProgressFnT":
         """Create a progress callback function for tool execution."""
+        handler_for_request = request_tool_handler or self._tool_handler
 
         async def progress_callback(
             progress: float, total: float | None, message: str | None
@@ -227,6 +286,14 @@ class MCPAggregator(ContextDependent):
                 },
             )
 
+            # Forward progress to tool handler (e.g., for ACP notifications)
+            try:
+                await handler_for_request.on_tool_progress(
+                    tool_call_id, progress, total, message
+                )
+            except Exception as e:
+                logger.error(f"Error in tool progress handler: {e}", exc_info=True)
+
         return progress_callback
 
     async def close(self) -> None:
@@ -236,7 +303,7 @@ class MCPAggregator(ContextDependent):
         if self.connection_persistence and self._persistent_connection_manager:
             try:
                 # Only attempt cleanup if we own the connection manager
-                if (
+                if self._owns_connection_manager and (
                     hasattr(self.context, "_connection_manager")
                     and self.context._connection_manager == self._persistent_connection_manager
                 ):
@@ -251,7 +318,7 @@ class MCPAggregator(ContextDependent):
     @classmethod
     async def create(
         cls,
-        server_names: List[str],
+        server_names: list[str],
         connection_persistence: bool = False,
     ) -> "MCPAggregator":
         """
@@ -276,6 +343,7 @@ class MCPAggregator(ContextDependent):
         except Exception as e:
             logger.error(f"Error creating MCPAggregator: {e}")
             await instance.__aexit__(None, None, None)
+            raise
 
     def _create_session_factory(self, server_name: str):
         """
@@ -298,7 +366,23 @@ class MCPAggregator(ContextDependent):
 
             # Access config directly if it was passed from BaseAgent
             if self.config:
-                agent_model = self.config.model
+                cli_model_override = None
+                if self.context and getattr(self.context, "config", None):
+                    cli_model_override = getattr(
+                        self.context.config, "cli_model_override", None
+                    )
+                agent_model, model_source = resolve_model_spec(
+                    self.context,
+                    model=self.config.model,
+                    cli_model=cli_model_override,
+                    hardcoded_default=HARDCODED_DEFAULT_MODEL,
+                )
+                if model_source:
+                    logger.info(
+                        f"Resolved MCP agent model '{agent_model}' via {model_source}",
+                        model=agent_model,
+                        source=model_source,
+                    )
                 agent_name = self.config.name
                 elicitation_handler = self.config.elicitation_handler
                 api_key = self.config.api_key
@@ -318,12 +402,14 @@ class MCPAggregator(ContextDependent):
 
         return session_factory
 
-    async def load_servers(self) -> None:
+    async def load_servers(self, *, force_connect: bool = False) -> None:
         """
         Discover tools from each server in parallel and build an index of namespaced tool names.
         Also populate the prompt cache.
+
+        Set force_connect=True to override load_on_start guards (e.g., when a user issues /connect).
         """
-        if self.initialized:
+        if self.initialized and not force_connect:
             logger.debug("MCPAggregator already initialized.")
             return
 
@@ -336,7 +422,25 @@ class MCPAggregator(ContextDependent):
 
         self._skybridge_configs.clear()
 
+        servers_to_load: list[str] = []
+        skipped_servers: list[str] = []
+
         for server_name in self.server_names:
+            # Check if server should be loaded on start
+            server_registry = self.context.server_registry if self.context else None
+            if server_registry is not None:
+                server_config = server_registry.get_server_config(server_name)
+                if (
+                    server_config
+                    and not getattr(server_config, "load_on_start", True)
+                    and not force_connect
+                ):
+                    logger.debug(f"Skipping server '{server_name}' - load_on_start=False")
+                    skipped_servers.append(server_name)
+                    continue
+
+            servers_to_load.append(server_name)
+
             if self.connection_persistence:
                 logger.info(
                     f"Creating persistent connection to server: {server_name}",
@@ -347,7 +451,8 @@ class MCPAggregator(ContextDependent):
                     },
                 )
 
-                await self._persistent_connection_manager.get_server(
+                manager = self._require_connection_manager()
+                await manager.get_server(
                     server_name, client_session_factory=self._create_session_factory(server_name)
                 )
 
@@ -362,7 +467,16 @@ class MCPAggregator(ContextDependent):
                 },
             )
 
-        async def fetch_tools(server_name: str) -> List[Tool]:
+        if skipped_servers:
+            logger.debug(
+                "Deferred MCP servers due to load_on_start=False",
+                data={
+                    "agent_name": self.agent_name,
+                    "servers": skipped_servers,
+                },
+            )
+
+        async def fetch_tools(server_name: str) -> list[Tool]:
             # Only fetch tools if the server supports them
             if not await self.server_supports_feature(server_name, "tools"):
                 logger.debug(f"Server '{server_name}' does not support tools")
@@ -381,7 +495,7 @@ class MCPAggregator(ContextDependent):
                 logger.error(f"Error loading tools from server '{server_name}'", data=e)
                 return []
 
-        async def fetch_prompts(server_name: str) -> List[Prompt]:
+        async def fetch_prompts(server_name: str) -> list[Prompt]:
             # Only fetch prompts if the server supports them
             if not await self.server_supports_feature(server_name, "prompts"):
                 logger.debug(f"Server '{server_name}' does not support prompts")
@@ -401,8 +515,8 @@ class MCPAggregator(ContextDependent):
                 return []
 
         async def load_server_data(server_name: str):
-            tools: List[Tool] = []
-            prompts: List[Prompt] = []
+            tools: list[Tool] = []
+            prompts: list[Prompt] = []
 
             # Use _execute_on_server for consistent tracking regardless of connection mode
             tools = await fetch_tools(server_name)
@@ -410,10 +524,13 @@ class MCPAggregator(ContextDependent):
 
             return server_name, tools, prompts
 
+        if not servers_to_load:
+            self.initialized = True
+            return
+
         # Gather data from all servers concurrently
-        results = await gather(
-            *(load_server_data(server_name) for server_name in self.server_names),
-            return_exceptions=True,
+        results = await gather_with_cancel(
+            load_server_data(server_name) for server_name in servers_to_load
         )
 
         total_tool_count = 0
@@ -458,21 +575,22 @@ class MCPAggregator(ContextDependent):
                 },
             )
 
-        await self._initialize_skybridge_configs()
+        await self._initialize_skybridge_configs(servers_to_load)
 
         self._display_startup_state(total_tool_count, total_prompt_count)
 
         self.initialized = True
 
-    async def _initialize_skybridge_configs(self) -> None:
+    async def _initialize_skybridge_configs(self, server_names: list[str] | None = None) -> None:
         """Discover Skybridge resources across servers."""
-        if not self.server_names:
+        target_servers = server_names if server_names is not None else self.server_names
+        if not target_servers:
             return
 
         tasks = [
-            self._evaluate_skybridge_for_server(server_name) for server_name in self.server_names
+            self._evaluate_skybridge_for_server(server_name) for server_name in target_servers
         ]
-        results = await gather(*tasks, return_exceptions=True)
+        results = await gather_with_cancel(tasks)
 
         for result in results:
             if isinstance(result, BaseException):
@@ -489,7 +607,7 @@ class MCPAggregator(ContextDependent):
         config = SkybridgeServerConfig(server_name=server_name)
 
         tool_entries = self._server_to_tool_map.get(server_name, [])
-        tool_configs: List[SkybridgeToolConfig] = []
+        tool_configs: list[SkybridgeToolConfig] = []
 
         for namespaced_tool in tool_entries:
             tool_meta = getattr(namespaced_tool.tool, "meta", None) or {}
@@ -568,7 +686,7 @@ class MCPAggregator(ContextDependent):
                 continue
 
             contents = getattr(read_result, "contents", []) or []
-            seen_mime_types: List[str] = []
+            seen_mime_types: list[str] = []
 
             for content in contents:
                 mime_type = getattr(content, "mimeType", None)
@@ -584,9 +702,7 @@ class MCPAggregator(ContextDependent):
 
             if not sky_resource.is_skybridge:
                 observed_type = sky_resource.mime_type or "unknown MIME type"
-                warning = (
-                    f"served as '{observed_type}' instead of '{SKYBRIDGE_MIME_TYPE}'"
-                )
+                warning = f"served as '{observed_type}' instead of '{SKYBRIDGE_MIME_TYPE}'"
                 sky_resource.warning = warning
                 config.warnings.append(f"{uri_str}: {warning}")
 
@@ -654,7 +770,8 @@ class MCPAggregator(ContextDependent):
             return None
 
         try:
-            server_conn = await self._persistent_connection_manager.get_server(
+            manager = self._require_connection_manager()
+            server_conn = await manager.get_server(
                 server_name, client_session_factory=self._create_session_factory(server_name)
             )
             # server_capabilities is a property, not a coroutine
@@ -706,7 +823,7 @@ class MCPAggregator(ContextDependent):
         except Exception:  # noqa: BLE001
             return True
 
-    async def list_servers(self) -> List[str]:
+    async def list_servers(self) -> list[str]:
         """Return the list of server names aggregated by this agent."""
         if not self.initialized:
             await self.load_servers()
@@ -720,7 +837,7 @@ class MCPAggregator(ContextDependent):
         if not self.initialized:
             await self.load_servers()
 
-        tools: List[Tool] = []
+        tools: list[Tool] = []
 
         for namespaced_tool_name, namespaced_tool in self._namespaced_tool_map.items():
             tool_copy = namespaced_tool.tool.model_copy(
@@ -764,6 +881,12 @@ class MCPAggregator(ContextDependent):
             # For stdio servers, also emit synthetic transport events to create activity timeline
             await self._notify_stdio_transport_activity(server_name, operation_type, success)
 
+    async def _record_reconnect(self, server_name: str) -> None:
+        """Record a successful server reconnection."""
+        async with self._stats_lock:
+            stats = self._server_stats.setdefault(server_name, ServerStats())
+            stats.record_reconnect()
+
     async def _notify_stdio_transport_activity(
         self, server_name: str, operation_type: str, success: bool
     ) -> None:
@@ -777,12 +900,12 @@ class MCPAggregator(ContextDependent):
             if not server_conn:
                 return
 
-            server_config = getattr(server_conn, "server_config", None)
-            if not server_config or server_config.transport != "stdio":
+            server_config = server_conn.server_config
+            if server_config.transport != "stdio":
                 return
 
             # Get transport metrics and emit synthetic message event
-            transport_metrics = getattr(server_conn, "transport_metrics", None)
+            transport_metrics = server_conn.transport_metrics
             if transport_metrics:
                 # Import here to avoid circular imports
                 from fast_agent.mcp.transport_tracking import ChannelEvent
@@ -800,44 +923,61 @@ class MCPAggregator(ContextDependent):
                 "Failed to notify stdio transport activity for %s", server_name, exc_info=True
             )
 
-    async def get_server_instructions(self) -> Dict[str, tuple[str, List[str]]]:
+    async def get_server_instructions(self) -> dict[str, tuple[str | None, list[str]]]:
         """
-        Get instructions from all connected servers along with their tool names.
+        Get instructions from currently-connected servers along with their tool names.
 
         Returns:
-            Dict mapping server name to tuple of (instructions, list of tool names)
-        """
-        instructions = {}
+            Dict mapping server name to tuple of (instructions, list of tool names).
 
-        if self.connection_persistence and hasattr(self, "_persistent_connection_manager"):
-            # Get instructions from persistent connections
-            for server_name in self.server_names:
-                try:
-                    server_conn = await self._persistent_connection_manager.get_server(
-                        server_name,
-                        client_session_factory=self._create_session_factory(server_name),
-                    )
-                    # Always include server, even if no instructions
-                    # Get tool names for this server
-                    tool_names = [
-                        namespaced_tool.tool.name
-                        for namespaced_tool_name, namespaced_tool in self._namespaced_tool_map.items()
-                        if namespaced_tool.server_name == server_name
-                    ]
-                    # Include server even if instructions is None
-                    instructions[server_name] = (server_conn.server_instructions, tool_names)
-                except Exception as e:
-                    logger.debug(f"Failed to get instructions from server {server_name}: {e}")
+        Notes:
+            This method must not implicitly connect to servers. Connection is controlled
+            by `load_servers()` (and its `load_on_start` / `force_connect` behavior).
+            This ensures optional MCP servers don't get launched just because an agent
+            prompt contains the `{{serverInstructions}}` placeholder.
+        """
+        instructions: dict[str, tuple[str | None, list[str]]] = {}
+
+        if not self.connection_persistence:
+            return instructions
+
+        manager = getattr(self, "_persistent_connection_manager", None)
+        if manager is None:
+            return instructions
+
+        # Only read from already-running server connections to avoid implicit connects.
+        running_servers = getattr(manager, "running_servers", {}) or {}
+        for server_name in self.server_names:
+            server_conn = running_servers.get(server_name)
+            if not server_conn:
+                continue
+
+            try:
+                if not server_conn.is_healthy():
+                    continue
+            except Exception:
+                continue
+
+            tool_names = [
+                namespaced_tool.tool.name
+                for _, namespaced_tool in self._namespaced_tool_map.items()
+                if namespaced_tool.server_name == server_name
+            ]
+
+            try:
+                instructions[server_name] = (server_conn.server_instructions, tool_names)
+            except Exception as e:
+                logger.debug(f"Failed to get instructions from server {server_name}: {e}")
 
         return instructions
 
-    async def collect_server_status(self) -> Dict[str, ServerStatus]:
+    async def collect_server_status(self) -> dict[str, ServerStatus]:
         """Return aggregated status information for each configured server."""
         if not self.initialized:
             await self.load_servers()
 
         now = datetime.now(timezone.utc)
-        status_map: Dict[str, ServerStatus] = {}
+        status_map: dict[str, ServerStatus] = {}
 
         for server_name in self.server_names:
             stats = self._server_stats.get(server_name)
@@ -845,6 +985,7 @@ class MCPAggregator(ContextDependent):
             last_error = stats.last_error_at if stats else None
             staleness = (now - last_call).total_seconds() if last_call else None
             call_counts = dict(stats.call_counts) if stats else {}
+            reconnect_count = stats.reconnect_count if stats else 0
 
             implementation_name = None
             implementation_version = None
@@ -867,68 +1008,101 @@ class MCPAggregator(ContextDependent):
             server_conn = None
             transport: str | None = None
             transport_snapshot: TransportSnapshot | None = None
+            ping_interval_seconds: int | None = None
+            ping_max_missed: int | None = None
+            ping_ok_count: int | None = None
+            ping_fail_count: int | None = None
+            ping_consecutive_failures: int | None = None
+            ping_last_ok_at: datetime | None = None
+            ping_last_fail_at: datetime | None = None
+            ping_last_error: str | None = None
+            ping_activity_buckets: list[str] | None = None
+            ping_activity_bucket_seconds: int | None = None
+            ping_activity_bucket_count: int | None = None
 
             manager = getattr(self, "_persistent_connection_manager", None)
             if self.connection_persistence and manager is not None:
                 try:
-                    server_conn = await manager.get_server(
-                        server_name,
-                        client_session_factory=self._create_session_factory(server_name),
-                    )
-                    implementation = getattr(server_conn, "server_implementation", None)
-                    if implementation:
-                        implementation_name = getattr(implementation, "name", None)
-                        implementation_version = getattr(implementation, "version", None)
-                    capabilities = getattr(server_conn, "server_capabilities", None)
-                    client_capabilities = getattr(server_conn, "client_capabilities", None)
-                    session = server_conn.session
-                    client_info = getattr(session, "client_info", None) if session else None
-                    if client_info:
-                        client_info_name = getattr(client_info, "name", None)
-                        client_info_version = getattr(client_info, "version", None)
-                    is_connected = server_conn.is_healthy()
-                    error_message = getattr(server_conn, "_error_message", None)
-                    instructions_available = getattr(
-                        server_conn, "server_instructions_available", None
-                    )
-                    instructions_enabled = getattr(server_conn, "server_instructions_enabled", None)
-                    instructions_included = bool(getattr(server_conn, "server_instructions", None))
-                    server_cfg = getattr(server_conn, "server_config", None)
-                    if session:
-                        elicitation_mode = getattr(
-                            session, "effective_elicitation_mode", elicitation_mode
-                        )
-                        session_id = getattr(server_conn, "session_id", None)
-                        if not session_id and getattr(server_conn, "_get_session_id_cb", None):
+                    async with manager._lock:
+                        server_conn = manager.running_servers.get(server_name)
+                    if server_conn is None:
+                        is_connected = False
+                    else:
+                        implementation = server_conn.server_implementation
+                        if implementation is not None:
+                            implementation_name = implementation.name
+                            implementation_version = implementation.version
+                        capabilities = server_conn.server_capabilities
+                        client_capabilities = server_conn.client_capabilities
+                        session = server_conn.session
+                        client_info = getattr(session, "client_info", None) if session else None
+                        if client_info:
+                            client_info_name = getattr(client_info, "name", None)
+                            client_info_version = getattr(client_info, "version", None)
+                        if server_conn._initialized_event.is_set():
+                            is_connected = server_conn.is_healthy()
+                        else:
+                            is_connected = False
+                            error_message = error_message or "initializing..."
+                        error_message = error_message or server_conn._error_message
+                        instructions_available = server_conn.server_instructions_available
+                        instructions_enabled = server_conn.server_instructions_enabled
+                        instructions_included = bool(server_conn.server_instructions)
+                        server_cfg = server_conn.server_config
+                        ping_interval_seconds = server_cfg.ping_interval_seconds
+                        ping_max_missed = server_cfg.max_missed_pings
+                        ping_ok_count = server_conn._ping_ok_count
+                        ping_fail_count = server_conn._ping_fail_count
+                        ping_consecutive_failures = server_conn._ping_consecutive_failures
+                        ping_last_ok_at = server_conn._ping_last_ok_at
+                        ping_last_fail_at = server_conn._ping_last_fail_at
+                        ping_last_error = server_conn._ping_last_error
+                        if session:
+                            elicitation_mode = session.effective_elicitation_mode
+                            session_id = server_conn.session_id
+                            if not session_id and server_conn._get_session_id_cb:
+                                try:
+                                    session_id = server_conn._get_session_id_cb()  # type: ignore[attr-defined]
+                                except Exception:
+                                    session_id = None
+                        metrics = server_conn.transport_metrics
+                        if metrics is not None:
                             try:
-                                session_id = server_conn._get_session_id_cb()  # type: ignore[attr-defined]
+                                transport_snapshot = metrics.snapshot()
                             except Exception:
-                                session_id = None
-                    metrics = getattr(server_conn, "transport_metrics", None)
-                    if metrics is not None:
-                        try:
-                            transport_snapshot = metrics.snapshot()
-                        except Exception:
-                            logger.debug(
-                                "Failed to snapshot transport metrics for server '%s'",
-                                server_name,
-                                exc_info=True,
-                            )
+                                logger.debug(
+                                    "Failed to snapshot transport metrics for server '%s'",
+                                    server_name,
+                                    exc_info=True,
+                                )
+                        bucket_seconds = (
+                            transport_snapshot.activity_bucket_seconds
+                            if transport_snapshot and transport_snapshot.activity_bucket_seconds
+                            else 30
+                        )
+                        bucket_count = (
+                            transport_snapshot.activity_bucket_count
+                            if transport_snapshot and transport_snapshot.activity_bucket_count
+                            else 20
+                        )
+                        ping_activity_buckets = server_conn.build_ping_activity_buckets(
+                            bucket_seconds, bucket_count
+                        )
+                        ping_activity_bucket_seconds = bucket_seconds
+                        ping_activity_bucket_count = bucket_count
                 except Exception as exc:
                     logger.debug(
                         f"Failed to collect status for server '{server_name}'",
                         data={"error": str(exc)},
                     )
 
-            if (
-                server_cfg is None
-                and self.context
-                and getattr(self.context, "server_registry", None)
-            ):
-                try:
-                    server_cfg = self.context.server_registry.get_server_config(server_name)
-                except Exception:
-                    server_cfg = None
+            if server_cfg is None:
+                server_registry = self.context.server_registry if self.context else None
+                if server_registry is not None:
+                    try:
+                        server_cfg = server_registry.get_server_config(server_name)
+                    except Exception:
+                        server_cfg = None
 
             if server_cfg is not None:
                 instructions_enabled = (
@@ -936,23 +1110,25 @@ class MCPAggregator(ContextDependent):
                     if instructions_enabled is not None
                     else server_cfg.include_instructions
                 )
-                roots = getattr(server_cfg, "roots", None)
+                roots = server_cfg.roots
                 roots_configured = bool(roots)
                 roots_count = len(roots) if roots else 0
-                transport = getattr(server_cfg, "transport", transport)
-                elicitation = getattr(server_cfg, "elicitation", None)
+                transport = server_cfg.transport or transport
+                elicitation = server_cfg.elicitation
                 elicitation_mode = (
                     getattr(elicitation, "mode", None) if elicitation else elicitation_mode
                 )
-                sampling_cfg = getattr(server_cfg, "sampling", None)
-                spoofing_enabled = bool(getattr(server_cfg, "implementation", None))
-                if implementation_name is None and getattr(server_cfg, "implementation", None):
+                ping_interval_seconds = ping_interval_seconds or server_cfg.ping_interval_seconds
+                ping_max_missed = ping_max_missed or server_cfg.max_missed_pings
+                sampling_cfg = server_cfg.sampling
+                spoofing_enabled = server_cfg.implementation is not None
+                if implementation_name is None and server_cfg.implementation is not None:
                     implementation_name = server_cfg.implementation.name
-                    implementation_version = getattr(server_cfg.implementation, "version", None)
+                    implementation_version = server_cfg.implementation.version
                 if session_id is None:
                     if server_cfg.transport == "stdio":
                         session_id = "local"
-                    elif server_conn and getattr(server_conn, "_get_session_id_cb", None):
+                    elif server_conn and server_conn._get_session_id_cb:
                         try:
                             session_id = server_conn._get_session_id_cb()  # type: ignore[attr-defined]
                         except Exception:
@@ -998,11 +1174,23 @@ class MCPAggregator(ContextDependent):
                 session_id=session_id,
                 transport_channels=transport_snapshot,
                 skybridge=self._skybridge_configs.get(server_name),
+                reconnect_count=reconnect_count,
+                ping_interval_seconds=ping_interval_seconds,
+                ping_max_missed=ping_max_missed,
+                ping_ok_count=ping_ok_count,
+                ping_fail_count=ping_fail_count,
+                ping_consecutive_failures=ping_consecutive_failures,
+                ping_last_ok_at=ping_last_ok_at,
+                ping_last_fail_at=ping_last_fail_at,
+                ping_last_error=ping_last_error,
+                ping_activity_buckets=ping_activity_buckets,
+                ping_activity_bucket_seconds=ping_activity_bucket_seconds,
+                ping_activity_bucket_count=ping_activity_bucket_count,
             )
 
         return status_map
 
-    async def get_skybridge_configs(self) -> Dict[str, SkybridgeServerConfig]:
+    async def get_skybridge_configs(self) -> dict[str, SkybridgeServerConfig]:
         """Expose discovered Skybridge configurations keyed by server."""
         if not self.initialized:
             await self.load_servers()
@@ -1020,7 +1208,7 @@ class MCPAggregator(ContextDependent):
         operation_type: str,
         operation_name: str,
         method_name: str,
-        method_args: Dict[str, Any] = None,
+        method_args: dict[str, Any] | None = None,
         error_factory: Callable[[str], R] | None = None,
         progress_callback: ProgressFnT | None = None,
     ) -> R:
@@ -1065,6 +1253,9 @@ class MCPAggregator(ContextDependent):
             except ConnectionError:
                 # Let ConnectionError pass through for reconnection logic
                 raise
+            except ServerSessionTerminatedError:
+                # Let ServerSessionTerminatedError pass through for reconnection logic
+                raise
             except Exception as e:
                 error_msg = (
                     f"Failed to {method_name} '{operation_name}' on server '{server_name}': {e}"
@@ -1082,10 +1273,14 @@ class MCPAggregator(ContextDependent):
         # Try initial execution
         try:
             if self.connection_persistence:
-                server_connection = await self._persistent_connection_manager.get_server(
+                manager = self._require_connection_manager()
+                server_connection = await manager.get_server(
                     server_name, client_session_factory=self._create_session_factory(server_name)
                 )
-                result = await try_execute(server_connection.session)
+                session = server_connection.session
+                if session is None:
+                    raise RuntimeError(f"Server session not initialized for '{server_name}'")
+                result = await try_execute(session)
                 success_flag = True
             else:
                 logger.debug(
@@ -1096,8 +1291,9 @@ class MCPAggregator(ContextDependent):
                         "agent_name": self.agent_name,
                     },
                 )
+                server_registry = self._require_server_registry()
                 async with gen_client(
-                    server_name, server_registry=self.context.server_registry
+                    server_name, server_registry=server_registry
                 ) as client:
                     result = await try_execute(client)
                     logger.debug(
@@ -1111,47 +1307,14 @@ class MCPAggregator(ContextDependent):
                     success_flag = True
         except ConnectionError:
             # Server offline - attempt reconnection
-            from fast_agent.ui import console
-
-            console.console.print(
-                f"[dim yellow]MCP server {server_name} reconnecting...[/dim yellow]"
+            result, success_flag = await self._handle_connection_error(
+                server_name, try_execute, error_factory
             )
-
-            try:
-                if self.connection_persistence:
-                    # Force disconnect and create fresh connection
-                    await self._persistent_connection_manager.disconnect_server(server_name)
-                    import asyncio
-
-                    await asyncio.sleep(0.1)
-
-                    server_connection = await self._persistent_connection_manager.get_server(
-                        server_name,
-                        client_session_factory=self._create_session_factory(server_name),
-                    )
-                    result = await try_execute(server_connection.session)
-                else:
-                    # For non-persistent connections, just try again
-                    async with gen_client(
-                        server_name, server_registry=self.context.server_registry
-                    ) as client:
-                        result = await try_execute(client)
-
-                # Success!
-                console.console.print(f"[dim green]MCP server {server_name} online[/dim green]")
-                success_flag = True
-
-            except Exception:
-                # Reconnection failed
-                console.console.print(
-                    f"[dim red]MCP server {server_name} offline - failed to reconnect[/dim red]"
-                )
-                error_msg = f"MCP server {server_name} offline - failed to reconnect"
-                success_flag = False
-                if error_factory:
-                    result = error_factory(error_msg)
-                else:
-                    raise Exception(error_msg)
+        except ServerSessionTerminatedError as exc:
+            # Session terminated (e.g., 404 from restarted server)
+            result, success_flag = await self._handle_session_terminated(
+                server_name, try_execute, error_factory, exc
+            )
         except Exception:
             success_flag = False
             raise
@@ -1159,9 +1322,169 @@ class MCPAggregator(ContextDependent):
             if success_flag is not None:
                 await self._record_server_call(server_name, operation_type, success_flag)
 
+        if result is None:
+            error_msg = (
+                f"Failed to {method_name} '{operation_name}' on server '{server_name}'"
+            )
+            if error_factory:
+                return error_factory(error_msg)
+            raise RuntimeError(error_msg)
         return result
 
-    async def _parse_resource_name(self, name: str, resource_type: str) -> tuple[str, str]:
+    async def _handle_connection_error(
+        self,
+        server_name: str,
+        try_execute: Callable,
+        error_factory: Callable[[str], R] | None,
+    ) -> tuple[R | None, bool]:
+        """Handle ConnectionError by attempting to reconnect to the server."""
+        from fast_agent.ui import console
+
+        console.console.print(f"[dim yellow]MCP server {server_name} reconnecting...[/dim yellow]")
+
+        try:
+            if self.connection_persistence:
+                # Force disconnect and create fresh connection
+                manager = self._require_connection_manager()
+                server_connection = await manager.reconnect_server(
+                    server_name,
+                    client_session_factory=self._create_session_factory(server_name),
+                )
+                session = server_connection.session
+                if session is None:
+                    raise RuntimeError(f"Server session not initialized for '{server_name}'")
+                result = await try_execute(session)
+            else:
+                # For non-persistent connections, just try again
+                server_registry = self._require_server_registry()
+                async with gen_client(
+                    server_name, server_registry=server_registry
+                ) as client:
+                    result = await try_execute(client)
+
+            # Success!
+            console.console.print(f"[dim green]MCP server {server_name} online[/dim green]")
+            return result, True
+
+        except ServerSessionTerminatedError:
+            # After reconnecting for connection error, we got session terminated
+            # Don't loop - just report the error
+            console.console.print(
+                f"[dim red]MCP server {server_name} session terminated after reconnect[/dim red]"
+            )
+            error_msg = (
+                f"MCP server {server_name} reconnected but session was immediately terminated. "
+                "Please check server status."
+            )
+            if error_factory:
+                return error_factory(error_msg), False
+            else:
+                raise Exception(error_msg)
+
+        except Exception as e:
+            # Reconnection failed
+            console.console.print(
+                f"[dim red]MCP server {server_name} offline - failed to reconnect: {e}[/dim red]"
+            )
+            error_msg = f"MCP server {server_name} offline - failed to reconnect"
+            if error_factory:
+                return error_factory(error_msg), False
+            else:
+                raise Exception(error_msg)
+
+    async def _handle_session_terminated(
+        self,
+        server_name: str,
+        try_execute: Callable,
+        error_factory: Callable[[str], R] | None,
+        exc: ServerSessionTerminatedError,
+    ) -> tuple[R | None, bool]:
+        """Handle ServerSessionTerminatedError by attempting to reconnect if configured."""
+        from fast_agent.ui import console
+
+        # Check if reconnect_on_disconnect is enabled for this server
+        server_config = None
+        server_registry = self.context.server_registry if self.context else None
+        if server_registry is not None:
+            server_config = server_registry.get_server_config(server_name)
+
+        reconnect_enabled = server_config and server_config.reconnect_on_disconnect
+
+        if not reconnect_enabled:
+            # Reconnection not enabled - inform user and fail
+            console.console.print(
+                f"[dim red]MCP server {server_name} session terminated (404)[/dim red]"
+            )
+            console.console.print(
+                "[dim]Tip: Enable 'reconnect_on_disconnect: true' in config to auto-reconnect[/dim]"
+            )
+            error_msg = f"MCP server {server_name} session terminated - reconnection not enabled"
+            if error_factory:
+                return error_factory(error_msg), False
+            else:
+                raise exc
+
+        # Attempt reconnection
+        console.console.print(
+            f"[dim yellow]MCP server {server_name} session terminated - reconnecting...[/dim yellow]"
+        )
+
+        try:
+            if self.connection_persistence:
+                manager = self._require_connection_manager()
+                server_connection = await manager.reconnect_server(
+                    server_name,
+                    client_session_factory=self._create_session_factory(server_name),
+                )
+                session = server_connection.session
+                if session is None:
+                    raise RuntimeError(f"Server session not initialized for '{server_name}'")
+                result = await try_execute(session)
+            else:
+                # For non-persistent connections, just try again
+                server_registry = self._require_server_registry()
+                async with gen_client(
+                    server_name, server_registry=server_registry
+                ) as client:
+                    result = await try_execute(client)
+
+            # Success! Record the reconnection
+            await self._record_reconnect(server_name)
+            console.console.print(
+                f"[dim green]MCP server {server_name} reconnected successfully[/dim green]"
+            )
+            return result, True
+
+        except ServerSessionTerminatedError:
+            # Retry after reconnection ALSO failed with session terminated
+            # Do NOT attempt another reconnection - this would cause an infinite loop
+            console.console.print(
+                f"[dim red]MCP server {server_name} session terminated again after reconnect[/dim red]"
+            )
+            error_msg = (
+                f"MCP server {server_name} session terminated even after reconnection. "
+                "The server may be persistently rejecting this session. "
+                "Please check server status or try again later."
+            )
+            if error_factory:
+                return error_factory(error_msg), False
+            else:
+                raise Exception(error_msg)
+
+        except Exception as e:
+            # Other reconnection failure
+            console.console.print(
+                f"[dim red]MCP server {server_name} failed to reconnect: {e}[/dim red]"
+            )
+            error_msg = f"MCP server {server_name} failed to reconnect: {e}"
+            if error_factory:
+                return error_factory(error_msg), False
+            else:
+                raise Exception(error_msg)
+
+    async def _parse_resource_name(
+        self, name: str, resource_type: str
+    ) -> tuple[str | None, str]:
         """
         Parse a possibly namespaced resource name into server name and local resource name.
 
@@ -1199,9 +1522,22 @@ class MCPAggregator(ContextDependent):
         # For all other resource types, use the first server
         return (self.server_names[0] if self.server_names else None, name)
 
-    async def call_tool(self, name: str, arguments: dict | None = None) -> CallToolResult:
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict | None = None,
+        tool_use_id: str | None = None,
+        *,
+        request_tool_handler: ToolExecutionHandler | None = None,
+    ) -> CallToolResult:
         """
         Call a namespaced tool, e.g., 'server_name__tool_name'.
+
+        Args:
+            name: Tool name (possibly namespaced)
+            arguments: Tool arguments
+            tool_use_id: LLM's tool use ID (for matching with stream events)
+            request_tool_handler: Optional per-request handler for tool execution events
         """
         if not self.initialized:
             await self.load_servers()
@@ -1216,6 +1552,57 @@ class MCPAggregator(ContextDependent):
                 content=[TextContent(type="text", text=f"Tool '{name}' not found")],
             )
 
+        namespaced_tool_name = create_namespaced_name(server_name, local_tool_name)
+
+        active_tool_handler = request_tool_handler or self._tool_handler
+
+        # Check tool permission before execution
+        try:
+            permission_result = await self._permission_handler.check_permission(
+                tool_name=local_tool_name,
+                server_name=server_name,
+                arguments=arguments,
+                tool_use_id=tool_use_id,
+            )
+            if not permission_result.allowed:
+                error_msg = permission_result.error_message
+                if error_msg is None:
+                    if permission_result.remember:
+                        error_msg = (
+                            f"The user has permanently declined permission to use this tool: "
+                            f"{namespaced_tool_name}"
+                        )
+                    else:
+                        error_msg = f"The user has declined permission to use this tool: {namespaced_tool_name}"
+
+                # Notify tool handler so ACP clients can reflect the cancellation/denial
+                if hasattr(active_tool_handler, "on_tool_permission_denied"):
+                    try:
+                        await active_tool_handler.on_tool_permission_denied(
+                            local_tool_name, server_name, tool_use_id, error_msg
+                        )
+                    except Exception as e:
+                        logger.error(f"Error notifying permission denial: {e}", exc_info=True)
+                logger.info(
+                    "Tool execution denied by permission handler",
+                    data={
+                        "tool_name": local_tool_name,
+                        "server_name": server_name,
+                        "cancelled": permission_result.is_cancelled,
+                    },
+                )
+                return CallToolResult(
+                    isError=True,
+                    content=[TextContent(type="text", text=error_msg)],
+                )
+        except Exception as e:
+            logger.error(f"Error checking tool permission: {e}", exc_info=True)
+            # Fail-safe: deny on permission check error
+            return CallToolResult(
+                isError=True,
+                content=[TextContent(type="text", text=f"Permission check failed: {e}")],
+            )
+
         logger.info(
             "Requesting tool call",
             data={
@@ -1226,28 +1613,92 @@ class MCPAggregator(ContextDependent):
             },
         )
 
+        # Notify tool handler that execution is starting
+        try:
+            tool_call_id = await active_tool_handler.on_tool_start(
+                local_tool_name, server_name, arguments, tool_use_id
+            )
+        except Exception as e:
+            logger.error(f"Error in tool start handler: {e}", exc_info=True)
+            # Generate fallback ID if handler fails
+            import uuid
+
+            tool_call_id = str(uuid.uuid4())
+
         tracer = trace.get_tracer(__name__)
-        with tracer.start_as_current_span(f"MCP Tool: {server_name}/{local_tool_name}"):
+        with tracer.start_as_current_span(f"MCP Tool: {namespaced_tool_name}"):
             trace.get_current_span().set_attribute("tool_name", local_tool_name)
             trace.get_current_span().set_attribute("server_name", server_name)
+            trace.get_current_span().set_attribute("namespaced_tool_name", namespaced_tool_name)
 
             # Create progress callback for this tool execution
-            progress_callback = self._create_progress_callback(server_name, local_tool_name)
-
-            return await self._execute_on_server(
-                server_name=server_name,
-                operation_type="tools/call",
-                operation_name=local_tool_name,
-                method_name="call_tool",
-                method_args={
-                    "name": local_tool_name,
-                    "arguments": arguments,
-                },
-                error_factory=lambda msg: CallToolResult(
-                    isError=True, content=[TextContent(type="text", text=msg)]
-                ),
-                progress_callback=progress_callback,
+            progress_callback = self._create_progress_callback(
+                server_name,
+                local_tool_name,
+                tool_call_id,
+                active_tool_handler,
             )
+
+            try:
+                result = await self._execute_on_server(
+                    server_name=server_name,
+                    operation_type="tools/call",
+                    operation_name=local_tool_name,
+                    method_name="call_tool",
+                    method_args={
+                        "name": local_tool_name,
+                        "arguments": arguments,
+                    },
+                    error_factory=lambda msg: CallToolResult(
+                        isError=True, content=[TextContent(type="text", text=msg)]
+                    ),
+                    progress_callback=progress_callback,
+                )
+
+                # Notify tool handler of completion
+                try:
+                    # Pass the full content blocks to the handler
+                    content = result.content if result.content else None
+
+                    logger.debug(
+                        f"Tool execution completed, notifying handler: {tool_call_id}",
+                        name="mcp_tool_complete_notify",
+                        tool_call_id=tool_call_id,
+                        has_content=content is not None,
+                        content_count=len(content) if content else 0,
+                        is_error=result.isError,
+                    )
+
+                    # If there's an error, extract error text
+                    error_text = None
+                    if result.isError and content:
+                        # Extract text from content for error message
+                        text_parts = [c.text for c in content if hasattr(c, "text") and c.text]
+                        error_text = "\n".join(text_parts) if text_parts else None
+                        content = None  # Don't send content when there's an error
+
+                    await active_tool_handler.on_tool_complete(
+                        tool_call_id, not result.isError, content, error_text
+                    )
+
+                    logger.debug(
+                        f"Tool handler notified successfully: {tool_call_id}",
+                        name="mcp_tool_complete_done",
+                    )
+                except Exception as e:
+                    logger.error(f"Error in tool complete handler: {e}", exc_info=True)
+
+                return result
+
+            except Exception as e:
+                # Notify tool handler of error
+                try:
+                    await active_tool_handler.on_tool_complete(
+                        tool_call_id, False, None, str(e)
+                    )
+                except Exception as handler_error:
+                    logger.error(f"Error in tool complete handler: {handler_error}", exc_info=True)
+                raise
 
     async def get_prompt(
         self,
@@ -1485,7 +1936,7 @@ class MCPAggregator(ContextDependent):
 
     async def list_prompts(
         self, server_name: str | None = None, agent_name: str | None = None
-    ) -> Mapping[str, List[Prompt]]:
+    ) -> Mapping[str, list[Prompt]]:
         """
         List available prompts from one or all servers.
 
@@ -1497,7 +1948,7 @@ class MCPAggregator(ContextDependent):
         if not self.initialized:
             await self.load_servers()
 
-        results: Dict[str, List[Prompt]] = {}
+        results: dict[str, list[Prompt]] = {}
 
         # If specific server requested
         if server_name:
@@ -1756,7 +2207,7 @@ class MCPAggregator(ContextDependent):
 
     async def _list_resources_from_server(
         self, server_name: str, *, check_support: bool = True
-    ) -> List[Any]:
+    ) -> list[Any]:
         """
         Internal helper method to list resources from a specific server.
 
@@ -1780,7 +2231,7 @@ class MCPAggregator(ContextDependent):
 
         return getattr(result, "resources", []) or []
 
-    async def list_resources(self, server_name: str | None = None) -> Dict[str, List[str]]:
+    async def list_resources(self, server_name: str | None = None) -> dict[str, list[str]]:
         """
         List available resources from one or all servers.
 
@@ -1794,7 +2245,7 @@ class MCPAggregator(ContextDependent):
         if not self.initialized:
             await self.load_servers()
 
-        results: Dict[str, List[str]] = {}
+        results: dict[str, list[str]] = {}
 
         # Get the list of servers to check
         servers_to_check = [server_name] if server_name else self.server_names
@@ -1815,7 +2266,7 @@ class MCPAggregator(ContextDependent):
 
             try:
                 resources = await self._list_resources_from_server(s_name, check_support=False)
-                formatted_resources: List[str] = []
+                formatted_resources: list[str] = []
                 for resource in resources:
                     uri = getattr(resource, "uri", None)
                     if uri is not None:
@@ -1826,7 +2277,7 @@ class MCPAggregator(ContextDependent):
 
         return results
 
-    async def list_mcp_tools(self, server_name: str | None = None) -> Dict[str, List[Tool]]:
+    async def list_mcp_tools(self, server_name: str | None = None) -> dict[str, list[Tool]]:
         """
         List available tools from one or all servers, grouped by server name.
 
@@ -1840,7 +2291,7 @@ class MCPAggregator(ContextDependent):
         if not self.initialized:
             await self.load_servers()
 
-        results: Dict[str, List[Tool]] = {}
+        results: dict[str, list[Tool]] = {}
 
         # Get the list of servers to check
         servers_to_check = [server_name] if server_name else self.server_names

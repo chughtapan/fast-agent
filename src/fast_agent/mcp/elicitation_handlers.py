@@ -36,7 +36,10 @@ async def forms_elicitation_handler(
     context: RequestContext["ClientSession", Any], params: ElicitRequestParams
 ) -> ElicitResult:
     """
-    Interactive forms-based elicitation handler using enhanced input handler.
+    Combined elicitation handler supporting both form and URL modes.
+
+    For form mode: Uses interactive forms-based UI for data collection.
+    For URL mode: Displays the URL inline for out-of-band user interaction.
     """
     logger.info(f"Eliciting response for params: {params}")
 
@@ -60,16 +63,46 @@ async def forms_elicitation_handler(
     if not agent_name:
         agent_name = "Unknown Agent"
 
-    # Create human input request
+    # Detect URL mode - params will have 'url' attribute for ElicitRequestURLParams
+    url_value = getattr(params, "url", None)
+    if url_value:
+        # URL elicitation - display URL and return accept
+        # The user interaction happens out-of-band (in browser, etc.)
+        url: str = str(url_value)  # Ensure it's a string
+        message = params.message
+        elicitation_id = getattr(params, "elicitationId", None)
+
+        logger.info(
+            f"URL elicitation from {server_name}: {url} (elicitationId={elicitation_id})"
+        )
+
+        # Display the URL to the user
+        from fast_agent.ui.console_display import ConsoleDisplay
+
+        display = ConsoleDisplay()
+        display.show_url_elicitation(
+            message=message,
+            url=url,
+            server_name=server_name or "Unknown Server",
+            agent_name=agent_name,
+        )
+
+        # Per MCP spec: return accept to indicate user has been shown the URL
+        # The actual interaction (OAuth, payment, etc.) happens out-of-band
+        return ElicitResult(action="accept")
+
+    # Form mode - use interactive form UI
+    # Note: requestedSchema is only present on ElicitRequestFormParams, not ElicitRequestURLParams
+    requested_schema = getattr(params, "requestedSchema", None)
     request = HumanInputRequest(
         prompt=params.message,
-        description=f"Schema: {params.requestedSchema}" if params.requestedSchema else None,
+        description=f"Schema: {requested_schema}" if requested_schema else None,
         request_id=f"elicit_{id(params)}",
         metadata={
             "agent_name": agent_name,
             "server_name": server_name,
             "elicitation": True,
-            "requested_schema": params.requestedSchema,
+            "requested_schema": requested_schema,
         },
     )
 
@@ -98,20 +131,21 @@ async def forms_elicitation_handler(
             try:
                 from fast_agent.human_input.elicitation_state import elicitation_state
 
-                elicitation_state.disable_server(server_name)
+                if server_name is not None:
+                    elicitation_state.disable_server(server_name)
             except Exception:
                 # Do not fail the flow if state update fails
                 pass
             return ElicitResult(action="cancel")
 
         # Parse response based on schema if provided
-        if params.requestedSchema:
+        if requested_schema:
             # Check if the response is already JSON (from our form)
             try:
                 # Try to parse as JSON first (from schema-driven form)
                 content = json.loads(response_data)
                 # Validate that all required fields are present
-                required_fields = params.requestedSchema.get("required", [])
+                required_fields = requested_schema.get("required", [])
                 for field in required_fields:
                     if field not in content:
                         logger.warning(f"Missing required field '{field}' in elicitation response")
@@ -119,10 +153,10 @@ async def forms_elicitation_handler(
             except json.JSONDecodeError:
                 # Not JSON, try to handle as simple text response
                 # This is a fallback for simple schemas or text-based responses
-                properties = params.requestedSchema.get("properties", {})
+                properties = requested_schema.get("properties", {})
                 if len(properties) == 1:
                     # Single field schema - try to parse based on type
-                    field_name = list(properties.keys())[0]
+                    field_name = next(iter(properties))
                     field_def = properties[field_name]
                     field_type = field_def.get("type")
 

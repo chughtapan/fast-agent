@@ -83,6 +83,7 @@ fast-agent serve [OPTIONS]
 - `--instruction`, `-i TEXT`: Instruction for the agent (defaults to the standard FastAgent instruction)
 - `--config-path`, `-c TEXT`: Path to config file
 - `--servers TEXT`: Comma-separated list of server names to enable from config
+- `--card`, `--agent-cards TEXT`: Path or URL to an AgentCard file or directory (repeatable)
 - `--url TEXT`: Comma-separated list of HTTP/SSE URLs to connect to
 - `--auth TEXT`: Bearer token for authorization with URL-based servers
 - `--model TEXT`: Override the default model (e.g., haiku, sonnet, gpt-4)
@@ -90,12 +91,18 @@ fast-agent serve [OPTIONS]
 - `--npx TEXT`: NPX package and args to run as an MCP server (quoted)
 - `--uvx TEXT`: UVX package and args to run as an MCP server (quoted)
 - `--stdio TEXT`: Command to run as STDIO MCP server (quoted)
-- `--transport [http|sse|stdio]`: Transport protocol to expose (default: http)
+- `--transport [http|sse|stdio|acp]`: Transport protocol to expose (default: http)
 - `--host TEXT`: Host address when using HTTP or SSE transport (default: 0.0.0.0)
 - `--port INTEGER`: Port when using HTTP or SSE transport (default: 8000)
 - `--shell`, `-x`: Enable a local shell runtime and expose the execute tool
 - `--description`, `-d TEXT`: Description used for each send tool (supports `{agent}` placeholder)
 - `--instance-scope [shared|connection|request]`: Control how MCP clients receive isolated agent instances (default: shared)
+- `--reload`: Enable manual AgentCard reloads (ACP: `/reload`, MCP: `reload_agent_cards`)
+- `--watch`: Watch AgentCard paths and reload
+
+### Skills behavior
+
+When configuring agents in code, `skills=None` explicitly disables skills for that agent. If `skills` is omitted, the default skills registry is used.
 
 ### Examples
 
@@ -115,6 +122,16 @@ fast-agent serve --url=https://api.example.com/mcp --npx "@modelcontextprotocol/
 # Custom tool description (the {agent} placeholder is replaced with the agent name)
 fast-agent serve --description "Interact with the {agent} workflow via MCP"
 
+# Load AgentCards from a file or directory
+fast-agent serve --card ./agents --transport=http
+
+# Watch AgentCard directory for changes
+fast-agent serve --card ./agents --watch --transport=http
+
 # Use per-connection instances to isolate history between clients
 fast-agent serve --instance-scope=connection --transport=http
 ```
+
+### Environment toggles
+
+- uvloop is enabled by default when installed (non-Windows); set `FAST_AGENT_DISABLE_UV_LOOP=1` to opt out.

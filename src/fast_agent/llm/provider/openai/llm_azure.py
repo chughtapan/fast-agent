@@ -1,13 +1,19 @@
+from typing import Any
+
+try:
+    from azure.identity import (  # ty: ignore[unresolved-import]
+        DefaultAzureCredential as _DefaultAzureCredential,
+    )
+except ImportError:
+    _DefaultAzureCredential = None  # type: ignore[assignment]
+
 from openai import AsyncAzureOpenAI, AsyncOpenAI, AuthenticationError
 
 from fast_agent.core.exceptions import ProviderKeyError
 from fast_agent.llm.provider.openai.llm_openai import OpenAILLM
 from fast_agent.llm.provider_types import Provider
 
-try:
-    from azure.identity import DefaultAzureCredential
-except ImportError:
-    DefaultAzureCredential = None
+DefaultAzureCredential: type[Any] | None = _DefaultAzureCredential
 
 
 def _extract_resource_name(url: str) -> str | None:
@@ -27,9 +33,10 @@ class AzureOpenAILLM(OpenAILLM):
     Handles both API Key and DefaultAzureCredential authentication.
     """
 
-    def __init__(self, provider: Provider = Provider.AZURE, *args, **kwargs):
+    def __init__(self, provider: Provider = Provider.AZURE, **kwargs):
         # Set provider to AZURE, pass through to base
-        super().__init__(provider=provider, *args, **kwargs)
+        kwargs.pop("provider", None)
+        super().__init__(provider=provider, **kwargs)
 
         # Context/config extraction
         context = getattr(self, "context", None)

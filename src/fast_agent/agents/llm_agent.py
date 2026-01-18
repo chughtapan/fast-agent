@@ -18,10 +18,19 @@ from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.llm_decorator import LlmDecorator, ModelT
 from fast_agent.constants import FAST_AGENT_ERROR_CHANNEL
 from fast_agent.context import Context
-from fast_agent.mcp.helpers.content_helpers import get_text
+from fast_agent.mcp.helpers.content_helpers import (
+    get_text,
+    is_image_content,
+    is_resource_content,
+    is_resource_link,
+)
 from fast_agent.types import PromptMessageExtended, RequestParams
 from fast_agent.types.llm_stop_reason import LlmStopReason
 from fast_agent.ui.console_display import ConsoleDisplay
+from fast_agent.workflow_telemetry import (
+    NoOpWorkflowTelemetryProvider,
+    WorkflowTelemetryProvider,
+)
 
 # TODO -- decide what to do with type safety for model/chat_turn()
 
@@ -48,6 +57,9 @@ class LlmAgent(LlmDecorator):
 
         # Initialize display component
         self._display = ConsoleDisplay(config=self._context.config if self._context else None)
+        self._workflow_telemetry_provider: WorkflowTelemetryProvider = (
+            NoOpWorkflowTelemetryProvider()
+        )
 
     @property
     def display(self) -> ConsoleDisplay:
@@ -58,6 +70,17 @@ class LlmAgent(LlmDecorator):
     def display(self, value: ConsoleDisplay) -> None:
         self._display = value
 
+    @property
+    def workflow_telemetry(self) -> WorkflowTelemetryProvider:
+        """Telemetry provider for emitting workflow delegation steps."""
+        return self._workflow_telemetry_provider
+
+    @workflow_telemetry.setter
+    def workflow_telemetry(self, provider: WorkflowTelemetryProvider | None) -> None:
+        if provider is None:
+            provider = NoOpWorkflowTelemetryProvider()
+        self._workflow_telemetry_provider = provider
+
     async def show_assistant_message(
         self,
         message: PromptMessageExtended,
@@ -67,6 +90,7 @@ class LlmAgent(LlmDecorator):
         name: str | None = None,
         model: str | None = None,
         additional_message: Optional[Text] = None,
+        render_markdown: bool | None = None,
     ) -> None:
         """Display an assistant message with appropriate styling based on stop reason.
 
@@ -78,6 +102,7 @@ class LlmAgent(LlmDecorator):
             name: Optional agent name to display
             model: Optional model name to display
             additional_message: Optional additional message to display
+            render_markdown: Force markdown rendering (True) or plain rendering (False)
         """
 
         # Determine display content based on stop reason if not provided
@@ -148,6 +173,11 @@ class LlmAgent(LlmDecorator):
                         Text("\n\nAn error occurred during generation.", style="dim red italic")
                     )
 
+            case LlmStopReason.CANCELLED:
+                additional_segments.append(
+                    Text("\n\nGeneration cancelled by user.", style="dim yellow italic")
+                )
+
             case _:
                 if message.stop_reason:
                     additional_segments.append(
@@ -175,7 +205,7 @@ class LlmAgent(LlmDecorator):
 
         # Use provided name/model or fall back to defaults
         display_name = name if name is not None else self.name
-        display_model = model if model is not None else (self.llm.model_name if self._llm else None)
+        display_model = model if model is not None else (self.llm.model_name if self.llm else None)
 
         # Convert highlight_items to highlight_index
         highlight_index = None
@@ -199,13 +229,41 @@ class LlmAgent(LlmDecorator):
             name=display_name,
             model=display_model,
             additional_message=additional_message_text,
+            render_markdown=render_markdown,
         )
 
     def show_user_message(self, message: PromptMessageExtended) -> None:
         """Display a user message in a formatted panel."""
-        model = self.llm.model_name
-        chat_turn = self._llm.chat_turn()
-        self.display.show_user_message(message.last_text() or "", model, chat_turn, name=self.name)
+        model = self.llm.model_name if self.llm else None
+        chat_turn = self.llm.chat_turn() if self.llm else 0
+
+        # Extract attachment descriptions from non-text content
+        attachments: list[str] = []
+        for content in message.content:
+            if is_resource_link(content):
+                # ResourceLink: show name or mime type
+                from mcp.types import ResourceLink
+
+                assert isinstance(content, ResourceLink)
+                label = content.name or content.mimeType or "resource"
+                attachments.append(label)
+            elif is_image_content(content):
+                attachments.append("image")
+            elif is_resource_content(content):
+                # EmbeddedResource: show name or uri
+                from mcp.types import EmbeddedResource
+
+                assert isinstance(content, EmbeddedResource)
+                label = getattr(content.resource, "name", None) or str(content.resource.uri)
+                attachments.append(label)
+
+        self.display.show_user_message(
+            message.last_text() or "",
+            model,
+            chat_turn,
+            name=self.name,
+            attachments=attachments if attachments else None,
+        )
 
     def _should_stream(self) -> bool:
         """Determine whether streaming display should be used."""
@@ -225,14 +283,23 @@ class LlmAgent(LlmDecorator):
         Messages are already normalized to List[PromptMessageExtended].
         """
         if "user" == messages[-1].role:
-            self.show_user_message(message=messages[-1])
+            trailing_users: list[PromptMessageExtended] = []
+            for message in reversed(messages):
+                if message.role != "user":
+                    break
+                trailing_users.append(message)
+            for message in reversed(trailing_users):
+                self.show_user_message(message=message)
 
         # TODO - manage error catch, recovery, pause
         summary_text: Text | None = None
 
         if self._should_stream():
+            llm = self._require_llm()
             display_name = self.name
-            display_model = self.llm.model_name if self._llm else None
+            display_model = llm.model_name
+            _, streaming_mode = self.display.resolve_streaming_preferences()
+            render_markdown = True if streaming_mode == "markdown" else False
 
             remove_listener: Callable[[], None] | None = None
             remove_tool_listener: Callable[[], None] | None = None
@@ -242,8 +309,8 @@ class LlmAgent(LlmDecorator):
                 model=display_model,
             ) as stream_handle:
                 try:
-                    remove_listener = self.llm.add_stream_listener(stream_handle.update)
-                    remove_tool_listener = self.llm.add_tool_stream_listener(
+                    remove_listener = llm.add_stream_listener(stream_handle.update_chunk)
+                    remove_tool_listener = llm.add_tool_stream_listener(
                         stream_handle.handle_tool_event
                     )
                 except Exception:
@@ -265,9 +332,15 @@ class LlmAgent(LlmDecorator):
 
                 stream_handle.finalize(result)
 
-            await self.show_assistant_message(result, additional_message=summary_text)
+            await self.show_assistant_message(
+                result,
+                additional_message=summary_text,
+                render_markdown=render_markdown,
+            )
         else:
-            result, summary = await self._generate_with_summary(messages, request_params, tools)
+            result, summary = await self._generate_with_summary(
+                messages, request_params, tools
+            )
 
             summary_text = (
                 Text(f"\n\n{summary.message}", style="dim red italic") if summary else None
@@ -283,7 +356,13 @@ class LlmAgent(LlmDecorator):
         request_params: RequestParams | None = None,
     ) -> Tuple[ModelT | None, PromptMessageExtended]:
         if "user" == messages[-1].role:
-            self.show_user_message(message=messages[-1])
+            trailing_users: list[PromptMessageExtended] = []
+            for message in reversed(messages):
+                if message.role != "user":
+                    break
+                trailing_users.append(message)
+            for message in reversed(trailing_users):
+                self.show_user_message(message=message)
 
         (result, message), summary = await self._structured_with_summary(
             messages, model, request_params

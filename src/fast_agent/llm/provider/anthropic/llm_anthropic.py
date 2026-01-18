@@ -1,13 +1,27 @@
+import asyncio
 import json
-from typing import Any, List, Tuple, Type, Union, cast
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Type, Union, cast
 
 from anthropic import APIError, AsyncAnthropic, AuthenticationError
 from anthropic.lib.streaming import AsyncMessageStream
 from anthropic.types import (
+    InputJSONDelta,
     Message,
     MessageParam,
+    RawContentBlockDeltaEvent,
+    RawContentBlockStartEvent,
+    RawContentBlockStopEvent,
+    RawMessageDeltaEvent,
+    RedactedThinkingBlock,
+    SignatureDelta,
     TextBlock,
     TextBlockParam,
+    TextDelta,
+    ThinkingBlock,
+    ThinkingDelta,
     ToolParam,
     ToolUseBlock,
     ToolUseBlockParam,
@@ -22,7 +36,7 @@ from mcp.types import (
     TextContent,
 )
 
-from fast_agent.constants import FAST_AGENT_ERROR_CHANNEL
+from fast_agent.constants import ANTHROPIC_THINKING_BLOCKS, FAST_AGENT_ERROR_CHANNEL, REASONING
 from fast_agent.core.exceptions import ProviderKeyError
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.core.prompt import Prompt
@@ -32,10 +46,12 @@ from fast_agent.llm.fastagent_llm import (
     FastAgentLLM,
     RequestParams,
 )
+from fast_agent.llm.provider.anthropic.cache_planner import AnthropicCachePlanner
 from fast_agent.llm.provider.anthropic.multipart_converter_anthropic import (
     AnthropicConverter,
 )
 from fast_agent.llm.provider_types import Provider
+from fast_agent.llm.stream_types import StreamChunk
 from fast_agent.llm.usage_tracking import TurnUsage
 from fast_agent.mcp.helpers.content_helpers import text_content
 from fast_agent.types import PromptMessageExtended
@@ -44,13 +60,45 @@ from fast_agent.types.llm_stop_reason import LlmStopReason
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-0"
 STRUCTURED_OUTPUT_TOOL_NAME = "return_structured_output"
 
+# Stream capture mode - when enabled, saves all streaming chunks to files for debugging
+# Set FAST_AGENT_LLM_TRACE=1 (or any non-empty value) to enable
+STREAM_CAPTURE_ENABLED = bool(os.environ.get("FAST_AGENT_LLM_TRACE"))
+STREAM_CAPTURE_DIR = Path("stream-debug")
+
 # Type alias for system field - can be string or list of text blocks with cache control
-SystemParam = Union[str, List[TextBlockParam]]
+SystemParam = Union[str, list[TextBlockParam]]
 
 logger = get_logger(__name__)
 
 
+def _stream_capture_filename(turn: int) -> Path | None:
+    """Generate filename for stream capture. Returns None if capture is disabled."""
+    if not STREAM_CAPTURE_ENABLED:
+        return None
+    STREAM_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return STREAM_CAPTURE_DIR / f"anthropic_{timestamp}_turn{turn}"
+
+
+def _save_stream_chunk(filename_base: Path | None, chunk: Any) -> None:
+    """Save a streaming chunk to file when capture mode is enabled."""
+    if not filename_base:
+        return
+    try:
+        chunk_file = filename_base.with_name(f"{filename_base.name}.jsonl")
+        try:
+            payload: Any = chunk.model_dump()
+        except Exception:
+            payload = {"type": type(chunk).__name__, "str": str(chunk)}
+        with open(chunk_file, "a") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception as e:
+        logger.debug(f"Failed to save stream chunk: {e}")
+
+
 class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
+    CONVERSATION_CACHE_WALK_DISTANCE = 6
+    MAX_CONVERSATION_CACHE_BLOCKS = 2
     # Anthropic-specific parameter exclusions
     ANTHROPIC_EXCLUDE_FIELDS = {
         FastAgentLLM.PARAM_MESSAGES,
@@ -66,9 +114,10 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
         FastAgentLLM.PARAM_MCP_METADATA,
     }
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, **kwargs) -> None:
         # Initialize logger - keep it simple without name reference
-        super().__init__(*args, provider=Provider.ANTHROPIC, **kwargs)
+        kwargs.pop("provider", None)
+        super().__init__(provider=Provider.ANTHROPIC, **kwargs)
 
     def _initialize_default_params(self, kwargs: dict) -> RequestParams:
         """Initialize Anthropic-specific default parameters"""
@@ -92,9 +141,26 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
             cache_mode = self.context.config.anthropic.cache_mode
         return cache_mode
 
+    def _is_thinking_enabled(self, model: str) -> bool:
+        """Check if extended thinking should be enabled for this request."""
+        from fast_agent.llm.model_database import ModelDatabase
+
+        if ModelDatabase.get_reasoning(model) != "anthropic_thinking":
+            return False
+        if self.context.config and self.context.config.anthropic:
+            return self.context.config.anthropic.thinking_enabled
+        return False
+
+    def _get_thinking_budget(self) -> int:
+        """Get the thinking budget tokens (minimum 1024)."""
+        if self.context.config and self.context.config.anthropic:
+            budget = getattr(self.context.config.anthropic, "thinking_budget_tokens", 10000)
+            return max(1024, budget)
+        return 10000
+
     async def _prepare_tools(
-        self, structured_model: Type[ModelT] | None = None, tools: List[Tool] | None = None
-    ) -> List[ToolParam]:
+        self, structured_model: Type[ModelT] | None = None, tools: list[Tool] | None = None
+    ) -> list[ToolParam]:
         """Prepare tools based on whether we're in structured output mode."""
         if structured_model:
             return [
@@ -115,7 +181,7 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
                 for tool in tools or []
             ]
 
-    def _apply_system_cache(self, base_args: dict, cache_mode: str) -> None:
+    def _apply_system_cache(self, base_args: dict, cache_mode: str) -> int:
         """Apply cache control to system prompt if cache mode allows it."""
         system_content: SystemParam | None = base_args.get("system")
 
@@ -130,43 +196,33 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
                 logger.debug(
                     "Applied cache_control to system prompt (caches tools+system in one block)"
                 )
+                return 1
             # If it's already a list (shouldn't happen in current flow but type-safe)
             elif isinstance(system_content, list):
                 logger.debug("System prompt already in list format")
             else:
                 logger.debug(f"Unexpected system prompt type: {type(system_content)}")
 
-    async def _apply_conversation_cache(self, messages: List[MessageParam], cache_mode: str) -> int:
-        """Apply conversation caching if in auto mode. Returns number of cache blocks applied."""
-        applied_count = 0
-        if cache_mode == "auto" and self.history.should_apply_conversation_cache():
-            cache_updates = self.history.get_conversation_cache_updates()
+        return 0
 
-            # Remove cache control from old positions
-            if cache_updates["remove"]:
-                self.history.remove_cache_control_from_messages(messages, cache_updates["remove"])
-                logger.debug(
-                    f"Removed conversation cache_control from positions {cache_updates['remove']}"
-                )
+    @staticmethod
+    def _apply_cache_control_to_message(message: MessageParam) -> bool:
+        """Apply cache control to the last content block of a message."""
+        if not isinstance(message, dict) or "content" not in message:
+            return False
 
-            # Add cache control to new positions
-            if cache_updates["add"]:
-                applied_count = self.history.add_cache_control_to_messages(
-                    messages, cache_updates["add"]
-                )
-                if applied_count > 0:
-                    self.history.apply_conversation_cache_updates(cache_updates)
-                    logger.debug(
-                        f"Applied conversation cache_control to positions {cache_updates['add']} ({applied_count} blocks)"
-                    )
-                else:
-                    logger.debug(
-                        f"Failed to apply conversation cache_control to positions {cache_updates['add']}"
-                    )
+        content_list = message["content"]
+        if not isinstance(content_list, list) or not content_list:
+            return False
 
-        return applied_count
+        for content_block in reversed(content_list):
+            if isinstance(content_block, dict):
+                content_block["cache_control"] = {"type": "ephemeral"}
+                return True
 
-    def _is_structured_output_request(self, tool_uses: List[Any]) -> bool:
+        return False
+
+    def _is_structured_output_request(self, tool_uses: list[Any]) -> bool:
         """
         Check if the tool uses contain a structured output request.
 
@@ -178,7 +234,7 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
         """
         return any(tool.name == STRUCTURED_OUTPUT_TOOL_NAME for tool in tool_uses)
 
-    def _build_tool_calls_dict(self, tool_uses: List[ToolUseBlock]) -> dict[str, CallToolRequest]:
+    def _build_tool_calls_dict(self, tool_uses: list[ToolUseBlock]) -> dict[str, CallToolRequest]:
         """
         Convert Anthropic tool use blocks into our CallToolRequest.
 
@@ -204,8 +260,8 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
         self,
         tool_use_block: ToolUseBlock,
         structured_model: Type[ModelT],
-        messages: List[MessageParam],
-    ) -> Tuple[LlmStopReason, List[ContentBlock]]:
+        messages: list[MessageParam],
+    ) -> tuple[LlmStopReason, list[ContentBlock]]:
         """
         Handle a structured output tool response from Anthropic.
 
@@ -240,82 +296,99 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
 
         return LlmStopReason.END_TURN, [structured_content]
 
-    async def _process_stream(self, stream: AsyncMessageStream, model: str) -> Message:
+    async def _process_stream(
+        self,
+        stream: AsyncMessageStream,
+        model: str,
+        capture_filename: Path | None = None,
+    ) -> tuple[Message, list[str]]:
         """Process the streaming response and display real-time token usage."""
         # Track estimated output tokens by counting text chunks
         estimated_tokens = 0
         tool_streams: dict[int, dict[str, Any]] = {}
+        thinking_segments: list[str] = []
+        thinking_indices: set[int] = set()
 
         try:
             # Process the raw event stream to get token counts
+            # Cancellation is handled via asyncio.Task.cancel() which raises CancelledError
             async for event in stream:
-                if (
-                    event.type == "content_block_start"
-                    and hasattr(event, "content_block")
-                    and getattr(event.content_block, "type", None) == "tool_use"
-                ):
+                # Save chunk if stream capture is enabled
+                _save_stream_chunk(capture_filename, event)
+
+                if isinstance(event, RawContentBlockStartEvent):
                     content_block = event.content_block
-                    tool_streams[event.index] = {
-                        "name": content_block.name,
-                        "id": content_block.id,
-                        "buffer": [],
-                    }
-                    self._notify_tool_stream_listeners(
-                        "start",
-                        {
-                            "tool_name": content_block.name,
-                            "tool_use_id": content_block.id,
-                            "index": event.index,
-                            "streams_arguments": False,  # Anthropic doesn't stream arguments
-                        },
-                    )
-                    self.logger.info(
-                        "Model started streaming tool input",
-                        data={
-                            "progress_action": ProgressAction.CALLING_TOOL,
-                            "agent_name": self.name,
-                            "model": model,
-                            "tool_name": content_block.name,
-                            "tool_use_id": content_block.id,
-                            "tool_event": "start",
-                        },
-                    )
-                    continue
-
-                if (
-                    event.type == "content_block_delta"
-                    and hasattr(event, "delta")
-                    and event.delta.type == "input_json_delta"
-                ):
-                    info = tool_streams.get(event.index)
-                    if info is not None:
-                        chunk = event.delta.partial_json or ""
-                        info["buffer"].append(chunk)
-                        preview = chunk if len(chunk) <= 80 else chunk[:77] + "..."
+                    if isinstance(content_block, (ThinkingBlock, RedactedThinkingBlock)):
+                        thinking_indices.add(event.index)
+                        continue
+                    if isinstance(content_block, ToolUseBlock):
+                        tool_streams[event.index] = {
+                            "name": content_block.name,
+                            "id": content_block.id,
+                            "buffer": [],
+                        }
                         self._notify_tool_stream_listeners(
-                            "delta",
+                            "start",
                             {
-                                "tool_name": info.get("name"),
-                                "tool_use_id": info.get("id"),
+                                "tool_name": content_block.name,
+                                "tool_use_id": content_block.id,
                                 "index": event.index,
-                                "chunk": chunk,
-                                "streams_arguments": False,
                             },
                         )
-                        self.logger.debug(
-                            "Streaming tool input delta",
+                        self.logger.info(
+                            "Model started streaming tool input",
                             data={
-                                "tool_name": info.get("name"),
-                                "tool_use_id": info.get("id"),
-                                "chunk": preview,
+                                "progress_action": ProgressAction.CALLING_TOOL,
+                                "agent_name": self.name,
+                                "model": model,
+                                "tool_name": content_block.name,
+                                "tool_use_id": content_block.id,
+                                "tool_event": "start",
                             },
                         )
+                        continue
+
+                if isinstance(event, RawContentBlockDeltaEvent):
+                    delta = event.delta
+                    if isinstance(delta, ThinkingDelta):
+                        if delta.thinking:
+                            self._notify_stream_listeners(
+                                StreamChunk(text=delta.thinking, is_reasoning=True)
+                            )
+                            thinking_segments.append(delta.thinking)
+                        continue
+                    if isinstance(delta, SignatureDelta):
+                        continue
+                    if isinstance(delta, InputJSONDelta):
+                        info = tool_streams.get(event.index)
+                        if info is not None:
+                            chunk = delta.partial_json or ""
+                            info["buffer"].append(chunk)
+                            preview = chunk if len(chunk) <= 80 else chunk[:77] + "..."
+                            self._notify_tool_stream_listeners(
+                                "delta",
+                                {
+                                    "tool_name": info.get("name"),
+                                    "tool_use_id": info.get("id"),
+                                    "index": event.index,
+                                    "chunk": chunk,
+                                },
+                            )
+                            self.logger.debug(
+                                "Streaming tool input delta",
+                                data={
+                                    "tool_name": info.get("name"),
+                                    "tool_use_id": info.get("id"),
+                                    "chunk": preview,
+                                },
+                            )
+                        continue
+
+                if isinstance(event, RawContentBlockStopEvent) and event.index in thinking_indices:
+                    thinking_indices.discard(event.index)
                     continue
 
-                if (
-                    event.type == "content_block_stop"
-                    and event.index in tool_streams
-                ):
+                if isinstance(event, RawContentBlockStopEvent) and event.index in tool_streams:
                     info = tool_streams.pop(event.index)
                     preview_raw = "".join(info.get("buffer", []))
                     if preview_raw:
@@ -336,7 +409,6 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
                             "tool_name": info.get("name"),
                             "tool_use_id": info.get("id"),
                             "index": event.index,
-                            "streams_arguments": False,
                         },
                     )
                     self.logger.info(
@@ -353,30 +425,27 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
                     continue
 
                 # Count tokens in real-time from content_block_delta events
-                if (
-                    event.type == "content_block_delta"
-                    and hasattr(event, "delta")
-                    and event.delta.type == "text_delta"
-                ):
-                    # Use base class method for token estimation and progress emission
-                    estimated_tokens = self._update_streaming_progress(
-                        event.delta.text, model, estimated_tokens
-                    )
-                    self._notify_tool_stream_listeners(
-                        "text",
-                        {
-                            "chunk": event.delta.text,
-                            "index": event.index,
-                            "streams_arguments": False,
-                        },
-                    )
+                if isinstance(event, RawContentBlockDeltaEvent):
+                    delta = event.delta
+                    if isinstance(delta, TextDelta):
+                        # Notify stream listeners for UI streaming
+                        self._notify_stream_listeners(
+                            StreamChunk(text=delta.text, is_reasoning=False)
+                        )
+                        # Use base class method for token estimation and progress emission
+                        estimated_tokens = self._update_streaming_progress(
+                            delta.text, model, estimated_tokens
+                        )
+                        self._notify_tool_stream_listeners(
+                            "text",
+                            {
+                                "chunk": delta.text,
+                                "index": event.index,
+                            },
+                        )
 
                 # Also check for final message_delta events with actual usage info
-                elif (
-                    event.type == "message_delta"
-                    and hasattr(event, "usage")
-                    and event.usage.output_tokens
-                ):
+                elif isinstance(event, RawMessageDeltaEvent) and event.usage.output_tokens:
                     actual_tokens = event.usage.output_tokens
                     # Emit final progress with actual token count
                     token_str = str(actual_tokens).rjust(5)
@@ -398,16 +467,16 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
                     f"Streaming complete - Model: {model}, Input tokens: {message.usage.input_tokens}, Output tokens: {message.usage.output_tokens}"
                 )
 
-            return message
+            return message, thinking_segments
         except APIError as error:
             logger.error("Streaming APIError during Anthropic completion", exc_info=error)
             raise  # Re-raise to be handled by _anthropic_completion
         except Exception as error:
             logger.error("Unexpected error during Anthropic stream processing", exc_info=error)
-            # Convert to APIError for consistent handling
-            raise APIError(f"Stream processing error: {str(error)}") from error
+            # Re-raise for consistent handling - caller handles the error
+            raise
 
-    def _stream_failure_response(self, error: APIError, model_name: str) -> PromptMessageExtended:
+    def _stream_failure_response(self, error: Exception, model_name: str) -> PromptMessageExtended:
         """Convert streaming API errors into a graceful assistant reply."""
 
         provider_label = (
@@ -454,13 +523,48 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
             stop_reason=LlmStopReason.ERROR,
         )
 
+    def _handle_retry_failure(self, error: Exception) -> PromptMessageExtended | None:
+        """Return the legacy error-channel response when retries are exhausted."""
+        if isinstance(error, APIError):
+            model_name = self.default_request_params.model or DEFAULT_ANTHROPIC_MODEL
+            return self._stream_failure_response(error, model_name)
+        return None
+
+    def _build_request_messages(
+        self,
+        params: RequestParams,
+        message_param: MessageParam,
+        pre_messages: list[MessageParam] | None = None,
+        history: list[PromptMessageExtended] | None = None,
+    ) -> list[MessageParam]:
+        """
+        Build the list of Anthropic message parameters for the next request.
+
+        Ensures that the current user message is only included once when history
+        is enabled, which prevents duplicate tool_result blocks from being sent.
+        """
+        messages: list[MessageParam] = list(pre_messages) if pre_messages else []
+
+        history_messages: list[MessageParam] = []
+        if params.use_history and history:
+            history_messages = self._convert_to_provider_format(history)
+            messages.extend(history_messages)
+
+        include_current = not params.use_history or not history_messages
+        if include_current:
+            messages.append(message_param)
+
+        return messages
+
     async def _anthropic_completion(
         self,
         message_param,
         request_params: RequestParams | None = None,
         structured_model: Type[ModelT] | None = None,
-        tools: List[Tool] | None = None,
-        pre_messages: List[MessageParam] | None = None,
+        tools: list[Tool] | None = None,
+        pre_messages: list[MessageParam] | None = None,
+        history: list[PromptMessageExtended] | None = None,
+        current_extended: PromptMessageExtended | None = None,
     ) -> PromptMessageExtended:
         """
         Process a query using an LLM and available tools.
@@ -474,17 +578,15 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
 
         try:
             anthropic = AsyncAnthropic(api_key=api_key, base_url=base_url)
-            messages: List[MessageParam] = list(pre_messages) if pre_messages else []
             params = self.get_request_params(request_params)
+            messages = self._build_request_messages(
+                params, message_param, pre_messages, history=history
+            )
         except AuthenticationError as e:
             raise ProviderKeyError(
                 "Invalid Anthropic API key",
                 "The configured Anthropic API key was rejected.\nPlease check that your API key is valid and not expired.",
             ) from e
-
-        # Always include prompt messages, but only include conversation history if enabled
-        messages.extend(self.history.get(include_completion_history=params.use_history))
-        messages.append(message_param)  # message_param is the current user turn
 
         # Get cache mode configuration
         cache_mode = self._get_cache_mode()
@@ -492,7 +594,7 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
 
         available_tools = await self._prepare_tools(structured_model, tools)
 
-        response_content_blocks: List[ContentBlock] = []
+        response_content_blocks: list[ContentBlock] = []
         tool_calls: dict[str, CallToolRequest] | None = None
         model = self.default_request_params.model or DEFAULT_ANTHROPIC_MODEL
 
@@ -508,10 +610,33 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
             base_args["system"] = self.instruction or params.systemPrompt
 
         if structured_model:
+            if self._is_thinking_enabled(model):
+                logger.warning(
+                    "Extended thinking is incompatible with structured output. "
+                    "Disabling thinking for this request."
+                )
             base_args["tool_choice"] = {"type": "tool", "name": STRUCTURED_OUTPUT_TOOL_NAME}
 
-        if params.maxTokens is not None:
+        thinking_enabled = self._is_thinking_enabled(model)
+        if thinking_enabled and structured_model:
+            thinking_enabled = False
+
+        if thinking_enabled:
+            thinking_budget = self._get_thinking_budget()
+            base_args["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": thinking_budget,
+            }
+            current_max = params.maxTokens or 16000
+            if current_max <= thinking_budget:
+                base_args["max_tokens"] = thinking_budget + 8192
+            else:
+                base_args["max_tokens"] = current_max
+        elif params.maxTokens is not None:
             base_args["max_tokens"] = params.maxTokens
+
+        if thinking_enabled and available_tools:
+            base_args["extra_headers"] = {"anthropic-beta": "interleaved-thinking-2025-05-14"}
 
         self._log_chat_progress(self.chat_turn(), model=model)
         # Use the base class method to prepare all arguments with Anthropic-specific exclusions
@@ -521,30 +646,49 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
         )
 
         # Apply cache control to system prompt AFTER merging arguments
-        self._apply_system_cache(arguments, cache_mode)
+        system_cache_applied = self._apply_system_cache(arguments, cache_mode)
 
-        # Apply conversation caching
-        applied_count = await self._apply_conversation_cache(messages, cache_mode)
+        # Apply cache_control markers using planner
+        planner = AnthropicCachePlanner(
+            self.CONVERSATION_CACHE_WALK_DISTANCE, self.MAX_CONVERSATION_CACHE_BLOCKS
+        )
+        plan_messages: list[PromptMessageExtended] = []
+        include_current = not params.use_history or not history
+        if params.use_history and history:
+            plan_messages.extend(history)
+        if include_current and current_extended:
+            plan_messages.append(current_extended)
 
-        # Verify we don't exceed Anthropic's 4 cache block limit
-        if applied_count > 0:
-            total_cache_blocks = applied_count
-            if cache_mode != "off" and arguments["system"]:
-                total_cache_blocks += 1  # tools+system cache block
-            if total_cache_blocks > 4:
-                logger.warning(
-                    f"Total cache blocks ({total_cache_blocks}) exceeds Anthropic limit of 4"
-                )
+        cache_indices = planner.plan_indices(
+            plan_messages, cache_mode=cache_mode, system_cache_blocks=system_cache_applied
+        )
+        for idx in cache_indices:
+            if 0 <= idx < len(messages):
+                self._apply_cache_control_to_message(messages[idx])
 
         logger.debug(f"{arguments}")
+
+        # Generate stream capture filename once (before streaming starts)
+        capture_filename = _stream_capture_filename(self.chat_turn())
+
         # Use streaming API with helper
         try:
             async with anthropic.messages.stream(**arguments) as stream:
                 # Process the stream
-                response = await self._process_stream(stream, model)
+                response, thinking_segments = await self._process_stream(
+                    stream, model, capture_filename
+                )
+        except asyncio.CancelledError as e:
+            reason = str(e) if e.args else "cancelled"
+            logger.info(f"Anthropic completion cancelled: {reason}")
+            # Return a response indicating cancellation
+            return Prompt.assistant(
+                TextContent(type="text", text=""),
+                stop_reason=LlmStopReason.CANCELLED,
+            )
         except APIError as error:
             logger.error("Streaming APIError during Anthropic completion", exc_info=error)
-            return self._stream_failure_response(error, model)
+            raise error
 
         # Track usage if response is valid and has usage data
         if (
@@ -569,9 +713,7 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
             # This path shouldn't be reached anymore since we handle APIError above,
             # but keeping for backward compatibility
             logger.error(f"Unexpected error type: {type(response).__name__}", exc_info=response)
-            return self._stream_failure_response(
-                APIError(f"Unexpected error: {str(response)}"), model
-            )
+            return self._stream_failure_response(response, model)
 
         logger.debug(
             f"{model} response:",
@@ -580,8 +722,12 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
 
         response_as_message = self.convert_message_to_message_param(response)
         messages.append(response_as_message)
-        if response.content and response.content[0].type == "text":
-            response_content_blocks.append(TextContent(type="text", text=response.content[0].text))
+        if response.content:
+            for content_block in response.content:
+                if isinstance(content_block, TextBlock):
+                    response_content_blocks.append(
+                        TextContent(type="text", text=content_block.text)
+                    )
 
         stop_reason: LlmStopReason = LlmStopReason.END_TURN
 
@@ -597,7 +743,7 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
             case "tool_use":
                 stop_reason = LlmStopReason.TOOL_USE
                 tool_uses: list[ToolUseBlock] = [
-                    c for c in response.content if c.type == "tool_use"
+                    c for c in response.content if isinstance(c, ToolUseBlock)
                 ]
                 if structured_model and self._is_structured_output_request(tool_uses):
                     stop_reason, structured_blocks = await self._handle_structured_output_response(
@@ -607,71 +753,83 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
                 else:
                     tool_calls = self._build_tool_calls_dict(tool_uses)
 
-        # Only save the new conversation messages to history if use_history is true
-        # Keep the prompt messages separate
-        if params.use_history:
-            # Get current prompt messages
-            prompt_messages = self.history.get(include_completion_history=False)
-            new_messages = messages[len(prompt_messages) :]
-            self.history.set(new_messages)
+        # Update diagnostic snapshot (never read again)
+        # This provides a snapshot of what was sent to the provider for debugging
+        self.history.set(messages)
 
         self._log_chat_finished(model=model)
 
-        return Prompt.assistant(
-            *response_content_blocks, stop_reason=stop_reason, tool_calls=tool_calls
+        channels: dict[str, list[Any]] | None = None
+        if thinking_segments:
+            channels = {REASONING: [TextContent(type="text", text="".join(thinking_segments))]}
+        elif response.content:
+            thinking_texts = [
+                block.thinking
+                for block in response.content
+                if isinstance(block, ThinkingBlock) and block.thinking
+            ]
+            if thinking_texts:
+                channels = {REASONING: [TextContent(type="text", text="".join(thinking_texts))]}
+
+        raw_thinking_blocks = []
+        if response.content:
+            raw_thinking_blocks = [
+                block
+                for block in response.content
+                if isinstance(block, (ThinkingBlock, RedactedThinkingBlock))
+            ]
+        if raw_thinking_blocks:
+            if channels is None:
+                channels = {}
+            serialized_blocks = []
+            for block in raw_thinking_blocks:
+                try:
+                    payload = block.model_dump()
+                except Exception:
+                    payload = {"type": getattr(block, "type", "thinking")}
+                    if isinstance(block, ThinkingBlock):
+                        payload.update(
+                            {"thinking": block.thinking, "signature": block.signature}
+                        )
+                    elif isinstance(block, RedactedThinkingBlock):
+                        payload.update({"data": block.data})
+                serialized_blocks.append(TextContent(type="text", text=json.dumps(payload)))
+            channels[ANTHROPIC_THINKING_BLOCKS] = serialized_blocks
+
+        return PromptMessageExtended(
+            role="assistant",
+            content=response_content_blocks,
+            tool_calls=tool_calls,
+            channels=channels,
+            stop_reason=stop_reason,
         )
 
     async def _apply_prompt_provider_specific(
         self,
-        multipart_messages: List["PromptMessageExtended"],
+        multipart_messages: list["PromptMessageExtended"],
         request_params: RequestParams | None = None,
-        tools: List[Tool] | None = None,
+        tools: list[Tool] | None = None,
         is_template: bool = False,
     ) -> PromptMessageExtended:
-        # Effective params for this turn
-        params = self.get_request_params(request_params)
-
+        """
+        Provider-specific prompt application.
+        Templates are handled by the agent; messages already include them.
+        """
         # Check the last message role
         last_message = multipart_messages[-1]
-
-        # Add all previous messages to history (or all messages if last is from assistant)
-        messages_to_add = (
-            multipart_messages[:-1] if last_message.role == "user" else multipart_messages
-        )
-        converted: List[MessageParam] = []
-
-        # Get cache mode configuration
-        cache_mode = self._get_cache_mode()
-
-        for msg in messages_to_add:
-            anthropic_msg = AnthropicConverter.convert_to_anthropic(msg)
-
-            # Apply caching to template messages if cache_mode is "prompt" or "auto"
-            if is_template and cache_mode in ["prompt", "auto"] and anthropic_msg.get("content"):
-                content_list = anthropic_msg["content"]
-                if isinstance(content_list, list) and content_list:
-                    # Apply cache control to the last content block
-                    last_block = content_list[-1]
-                    if isinstance(last_block, dict):
-                        last_block["cache_control"] = {"type": "ephemeral"}
-                        logger.debug(
-                            f"Applied cache_control to template message with role {anthropic_msg.get('role')}"
-                        )
-
-            converted.append(anthropic_msg)
-
-        # Persist prior only when history is enabled; otherwise inline for this call
-        pre_messages: List[MessageParam] | None = None
-        if params.use_history:
-            self.history.extend(converted, is_prompt=is_template)
-        else:
-            pre_messages = converted
 
         if last_message.role == "user":
             logger.debug("Last message in prompt is from user, generating assistant response")
             message_param = AnthropicConverter.convert_to_anthropic(last_message)
+            # No need to pass pre_messages - conversion happens in _anthropic_completion
+            # via _convert_to_provider_format()
             return await self._anthropic_completion(
-                message_param, request_params, tools=tools, pre_messages=pre_messages
+                message_param,
+                request_params,
+                tools=tools,
+                pre_messages=None,
+                history=multipart_messages,
+                current_extended=last_message,
             )
         else:
             # For assistant messages: Return the last message content as text
@@ -680,26 +838,19 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
 
     async def _apply_prompt_provider_specific_structured(
         self,
-        multipart_messages: List[PromptMessageExtended],
+        multipart_messages: list[PromptMessageExtended],
         model: Type[ModelT],
         request_params: RequestParams | None = None,
-    ) -> Tuple[ModelT | None, PromptMessageExtended]:  # noqa: F821
+    ) -> tuple[ModelT | None, PromptMessageExtended]:  # noqa: F821
+        """
+        Provider-specific structured output implementation.
+        Note: Message history is managed by base class and converted via
+        _convert_to_provider_format() on each call.
+        """
         request_params = self.get_request_params(request_params)
 
         # Check the last message role
         last_message = multipart_messages[-1]
-
-        # Add all previous messages to history (or all messages if last is from assistant)
-        messages_to_add = (
-            multipart_messages[:-1] if last_message.role == "user" else multipart_messages
-        )
-        converted = []
-
-        for msg in messages_to_add:
-            anthropic_msg = AnthropicConverter.convert_to_anthropic(msg)
-            converted.append(anthropic_msg)
-
-        self.history.extend(converted, is_prompt=False)
 
         if last_message.role == "user":
             logger.debug("Last message in prompt is from user, generating structured response")
@@ -707,11 +858,15 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
 
             # Call _anthropic_completion with the structured model
             result: PromptMessageExtended = await self._anthropic_completion(
-                message_param, request_params, structured_model=model
+                message_param,
+                request_params,
+                structured_model=model,
+                history=multipart_messages,
+                current_extended=last_message,
             )
 
             for content in result.content:
-                if content.type == "text":
+                if isinstance(content, TextContent):
                     try:
                         data = json.loads(content.text)
                         parsed_model = model(**data)
@@ -727,15 +882,30 @@ class AnthropicLLM(FastAgentLLM[MessageParam, Message]):
             logger.debug("Last message in prompt is from assistant, returning it directly")
             return None, last_message
 
+    def _convert_extended_messages_to_provider(
+        self, messages: list[PromptMessageExtended]
+    ) -> list[MessageParam]:
+        """
+        Convert PromptMessageExtended list to Anthropic MessageParam format.
+        This is called fresh on every API call from _convert_to_provider_format().
+
+        Args:
+            messages: List of PromptMessageExtended objects
+
+        Returns:
+            List of Anthropic MessageParam objects
+        """
+        return [AnthropicConverter.convert_to_anthropic(msg) for msg in messages]
+
     @classmethod
     def convert_message_to_message_param(cls, message: Message, **kwargs) -> MessageParam:
         """Convert a response object to an input parameter object to allow LLM calls to be chained."""
         content = []
 
         for content_block in message.content:
-            if content_block.type == "text":
+            if isinstance(content_block, TextBlock):
                 content.append(TextBlock(type="text", text=content_block.text))
-            elif content_block.type == "tool_use":
+            elif isinstance(content_block, ToolUseBlock):
                 content.append(
                     ToolUseBlockParam(
                         type="tool_use",

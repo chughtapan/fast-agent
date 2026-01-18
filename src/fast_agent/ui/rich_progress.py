@@ -2,19 +2,20 @@
 
 import time
 from contextlib import contextmanager
-from typing import Optional
+from typing import Any
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TaskID, TextColumn
 
 from fast_agent.event_progress import ProgressAction, ProgressEvent
 from fast_agent.ui.console import console as default_console
+from fast_agent.ui.console import ensure_blocking_console
 
 
 class RichProgressDisplay:
     """Rich-based display for progress events."""
 
-    def __init__(self, console: Optional[Console] = None) -> None:
+    def __init__(self, console: Console | None = None) -> None:
         """Initialize the progress display."""
         self.console = console or default_console
         self._taskmap: dict[str, TaskID] = {}
@@ -33,22 +34,24 @@ class RichProgressDisplay:
 
     def start(self) -> None:
         """start"""
-
+        ensure_blocking_console()
         self._progress.start()
 
     def stop(self) -> None:
         """Stop and clear the progress display."""
+        ensure_blocking_console()
+        # Set paused first to prevent race with incoming updates
+        self._paused = True
         # Hide all tasks before stopping (like pause does)
         for task in self._progress.tasks:
             task.visible = False
         self._progress.stop()
-        self._paused = True
 
     def pause(self) -> None:
         """Pause the progress display."""
         if not self._paused:
+            ensure_blocking_console()
             self._paused = True
-
             for task in self._progress.tasks:
                 task.visible = False
             self._progress.stop()
@@ -56,10 +59,21 @@ class RichProgressDisplay:
     def resume(self) -> None:
         """Resume the progress display."""
         if self._paused:
+            ensure_blocking_console()
             for task in self._progress.tasks:
                 task.visible = True
             self._paused = False
             self._progress.start()
+
+    def hide_task(self, task_name: str) -> None:
+        """Hide an existing task from the progress display by name."""
+        task_id = self._taskmap.get(task_name)
+        if task_id is None:
+            return
+        for task in self._progress.tasks:
+            if task.id == task_id:
+                task.visible = False
+                break
 
     @contextmanager
     def paused(self):
@@ -92,6 +106,10 @@ class RichProgressDisplay:
 
     def update(self, event: ProgressEvent) -> None:
         """Update the progress display with a new event."""
+        # Skip updates when display is paused (e.g., during streaming)
+        if self._paused:
+            return
+
         task_name = event.agent_name or "default"
 
         # Create new task if needed
@@ -138,7 +156,7 @@ class RichProgressDisplay:
             description = f"[{self._get_action_style(event.action)}]▎ {event.action.value:<15}"
 
         # Update basic task information
-        update_kwargs: dict[str, object] = {
+        update_kwargs: dict[str, Any] = {
             "description": description,
             "target": event.target or task_name,  # Use task_name as fallback for target
             "details": event.details or "",
@@ -172,9 +190,6 @@ class RichProgressDisplay:
                 details=f" / Elapsed Time {time.strftime('%H:%M:%S', time.gmtime(self._progress.tasks[task_id].elapsed))}",
                 task_name=task_name,
             )
-            for task in self._progress.tasks:
-                if task.id != task_id:
-                    task.visible = False
         elif event.action == ProgressAction.FATAL_ERROR:
             self._progress.update(
                 task_id,
@@ -184,8 +199,5 @@ class RichProgressDisplay:
                 details=f" / {event.details}",
                 task_name=task_name,
             )
-            for task in self._progress.tasks:
-                if task.id != task_id:
-                    task.visible = False
         else:
             self._progress.reset(task_id)

@@ -7,7 +7,7 @@ EmbeddedResource, and other MCP content types with minimal boilerplate.
 
 import base64
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Union
+from typing import Any, Literal, Union
 
 from mcp.types import (
     Annotations,
@@ -15,6 +15,7 @@ from mcp.types import (
     ContentBlock,
     EmbeddedResource,
     ImageContent,
+    PromptMessage,
     ReadResourceResult,
     ResourceContents,
     TextContent,
@@ -27,12 +28,13 @@ from fast_agent.mcp.mime_utils import (
     is_binary_content,
     is_image_mime_type,
 )
+from fast_agent.types import PromptMessageExtended
 
 
 def MCPText(
     text: str,
     role: Literal["user", "assistant"] = "user",
-    annotations: Annotations = None,
+    annotations: Annotations | None = None,
 ) -> dict:
     """
     Create a message with text content.
@@ -54,7 +56,7 @@ def MCPText(
 def MCPImage(
     path: str | Path | None = None,
     data: bytes | None = None,
-    mime_type: Optional[str] = None,
+    mime_type: str | None = None,
     role: Literal["user", "assistant"] = "user",
     annotations: Annotations | None = None,
 ) -> dict:
@@ -87,6 +89,9 @@ def MCPImage(
     if not mime_type:
         mime_type = "image/png"  # Default
 
+    if data is None:
+        raise ValueError("Image data is missing after path resolution")
+
     b64_data = base64.b64encode(data).decode("ascii")
 
     return {
@@ -99,7 +104,7 @@ def MCPImage(
 
 def MCPFile(
     path: Union[str, Path],
-    mime_type: Optional[str] = None,
+    mime_type: str | None = None,
     role: Literal["user", "assistant"] = "user",
     annotations: Annotations | None = None,
 ) -> dict:
@@ -150,9 +155,19 @@ def MCPFile(
 
 
 def MCPPrompt(
-    *content_items: Union[dict, str, Path, bytes, ContentBlock, ReadResourceResult],
+    *content_items: Union[
+        dict,
+        str,
+        Path,
+        bytes,
+        ContentBlock,
+        ResourceContents,
+        ReadResourceResult,
+        PromptMessage,
+        PromptMessageExtended,
+    ],
     role: Literal["user", "assistant"] = "user",
-) -> List[dict]:
+) -> list[dict]:
     """
     Create one or more prompt messages with various content types.
 
@@ -181,6 +196,16 @@ def MCPPrompt(
         if isinstance(item, dict) and "role" in item and "content" in item:
             # Already a fully formed message
             result.append(item)
+        elif isinstance(item, PromptMessage):
+            # Use the prompt message role/content directly
+            result.append({"role": item.role, "content": item.content})
+        elif isinstance(item, PromptMessageExtended):
+            # Expand multipart messages into standard PromptMessages
+            for msg in item.from_multipart():
+                result.append({"role": msg.role, "content": msg.content})
+        elif isinstance(item, ContentBlock):
+            # Already a content block, wrap in a message
+            result.append({"role": role, "content": item})
         elif isinstance(item, str):
             # Simple text content
             result.append(MCPText(item, role=role))
@@ -198,25 +223,23 @@ def MCPPrompt(
         elif isinstance(item, bytes):
             # Raw binary data, assume image
             result.append(MCPImage(data=item, role=role))
-        elif isinstance(item, TextContent):
-            # Already a TextContent, wrap in a message
-            result.append({"role": role, "content": item})
-        elif isinstance(item, ImageContent):
-            # Already an ImageContent, wrap in a message
-            result.append({"role": role, "content": item})
-        elif isinstance(item, EmbeddedResource):
-            # Already an EmbeddedResource, wrap in a message
-            result.append({"role": role, "content": item})
         elif hasattr(item, "type") and item.type == "resource" and hasattr(item, "resource"):
             # Looks like an EmbeddedResource but may not be the exact class
-            result.append(
-                {"role": role, "content": EmbeddedResource(type="resource", resource=item.resource)}
-            )
-        elif isinstance(item, ResourceContents):
-            # It's a ResourceContents, wrap it in an EmbeddedResource
+            resource = item.resource
+            if isinstance(resource, (TextResourceContents, BlobResourceContents)):
+                result.append(
+                    {"role": role, "content": EmbeddedResource(type="resource", resource=resource)}
+                )
+            else:
+                result.append(MCPText(str(item), role=role))
+        elif isinstance(item, (TextResourceContents, BlobResourceContents)):
+            # It's a concrete ResourceContents, wrap it in an EmbeddedResource
             result.append(
                 {"role": role, "content": EmbeddedResource(type="resource", resource=item)}
             )
+        elif isinstance(item, ResourceContents):
+            # Fallback for unknown resource content shapes
+            result.append(MCPText(str(item), role=role))
         elif isinstance(item, ReadResourceResult):
             # It's a ReadResourceResult, convert each resource content
             for resource_content in item.contents:
@@ -234,15 +257,35 @@ def MCPPrompt(
 
 
 def User(
-    *content_items: Union[dict, str, Path, bytes, ContentBlock, ReadResourceResult],
-) -> List[dict]:
+    *content_items: Union[
+        dict,
+        str,
+        Path,
+        bytes,
+        ContentBlock,
+        ResourceContents,
+        ReadResourceResult,
+        PromptMessage,
+        PromptMessageExtended,
+    ],
+) -> list[dict]:
     """Create user message(s) with various content types."""
     return MCPPrompt(*content_items, role="user")
 
 
 def Assistant(
-    *content_items: Union[dict, str, Path, bytes, ContentBlock, ReadResourceResult],
-) -> List[dict]:
+    *content_items: Union[
+        dict,
+        str,
+        Path,
+        bytes,
+        ContentBlock,
+        ResourceContents,
+        ReadResourceResult,
+        PromptMessage,
+        PromptMessageExtended,
+    ],
+) -> list[dict]:
     """Create assistant message(s) with various content types."""
     return MCPPrompt(*content_items, role="assistant")
 

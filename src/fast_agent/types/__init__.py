@@ -7,13 +7,20 @@ Goals:
 
 # Re-export common enums/types
 # Public request parameters used to configure LLM calls
+# Re-export ResourceLink from MCP for convenience
+from mcp.types import ResourceLink
+
 from fast_agent.llm.request_params import RequestParams
 
 # Content helpers commonly used by users to build messages
 from fast_agent.mcp.helpers.content_helpers import (
+    audio_link,
     ensure_multipart_messages,
+    image_link,
     normalize_to_extended_list,
+    resource_link,
     text_content,
+    video_link,
 )
 
 # Public message model used across providers and MCP integration
@@ -28,13 +35,21 @@ from .llm_stop_reason import LlmStopReason
 # Message search utilities
 from .message_search import extract_first, extract_last, find_matches, search_messages
 
+# Tool timing metadata
+from .tool_timing import ToolTimingInfo, ToolTimings
+
 __all__ = [
     # Enums / types
     "LlmStopReason",
     "PromptMessageExtended",
     "RequestParams",
+    "ResourceLink",
     # Content helpers
     "text_content",
+    "resource_link",
+    "image_link",
+    "video_link",
+    "audio_link",
     "ensure_multipart_messages",
     "normalize_to_extended_list",
     # Analysis utilities
@@ -44,4 +59,7 @@ __all__ = [
     "find_matches",
     "extract_first",
     "extract_last",
+    # Tool timing types
+    "ToolTimingInfo",
+    "ToolTimings",
 ]

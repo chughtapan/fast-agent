@@ -1,9 +1,15 @@
 import asyncio
 from contextlib import AsyncExitStack
+from typing import TYPE_CHECKING, cast
+
+from mcp import types
 
 from fast_agent.core.agent_app import AgentApp
 from fast_agent.core.fastagent import AgentInstance
 from fast_agent.mcp.server.agent_server import AgentMCPServer
+
+if TYPE_CHECKING:
+    from fast_agent.interfaces import AgentProtocol
 
 
 class _DummyLLM:
@@ -22,9 +28,28 @@ class _DummyAgent:
         return None
 
 
+def _assert_prompts_enabled(server: AgentMCPServer) -> None:
+    handlers = server.mcp_server._mcp_server.request_handlers
+    assert types.ListPromptsRequest in handlers
+    assert types.GetPromptRequest in handlers
+
+
+def _assert_prompts_disabled(server: AgentMCPServer) -> None:
+    handlers = server.mcp_server._mcp_server.request_handlers
+    assert types.ListPromptsRequest not in handlers
+    assert types.GetPromptRequest not in handlers
+
+
+def _assert_resources_disabled(server: AgentMCPServer) -> None:
+    handlers = server.mcp_server._mcp_server.request_handlers
+    assert types.ListResourcesRequest not in handlers
+    assert types.ReadResourceRequest not in handlers
+    assert types.ListResourceTemplatesRequest not in handlers
+
+
 def test_tool_description_supports_agent_placeholder():
     async def create_instance() -> AgentInstance:
-        agent = _DummyAgent()
+        agent = cast("AgentProtocol", _DummyAgent())
         app = AgentApp({"worker": agent})
         return AgentInstance(app=app, agents={"worker": agent})
 
@@ -41,13 +66,16 @@ def test_tool_description_supports_agent_placeholder():
         tool_description="Use {agent}",
     )
 
+    _assert_prompts_enabled(server)
+    _assert_resources_disabled(server)
+
     tool = server.mcp_server._tool_manager._tools["worker_send"]
     assert tool.description == "Use worker"
 
 
 def test_tool_description_defaults_when_not_provided():
     async def create_instance() -> AgentInstance:
-        agent = _DummyAgent()
+        agent = cast("AgentProtocol", _DummyAgent())
         app = AgentApp({"writer": agent})
         return AgentInstance(app=app, agents={"writer": agent})
 
@@ -64,6 +92,9 @@ def test_tool_description_defaults_when_not_provided():
         tool_description="Custom text",
     )
 
+    _assert_prompts_enabled(server)
+    _assert_resources_disabled(server)
+
     tool = server.mcp_server._tool_manager._tools["writer_send"]
     assert tool.description == "Custom text"
 
@@ -79,7 +110,7 @@ async def _exercise_request_scope():
     async def create_instance() -> AgentInstance:
         nonlocal create_count
         create_count += 1
-        agent = _DummyAgent()
+        agent = cast("AgentProtocol", _DummyAgent())
         app = AgentApp({"worker": agent})
         return AgentInstance(app=app, agents={"worker": agent})
 
@@ -96,6 +127,9 @@ async def _exercise_request_scope():
         instance_scope="request",
         tool_description="Request scoped",
     )
+
+    _assert_prompts_disabled(server)
+    _assert_resources_disabled(server)
 
     ctx = type(
         "Ctx",
@@ -127,7 +161,7 @@ async def _exercise_connection_scope():
     async def create_instance() -> AgentInstance:
         nonlocal create_count
         create_count += 1
-        agent = _DummyAgent()
+        agent = cast("AgentProtocol", _DummyAgent())
         app = AgentApp({"worker": agent})
         return AgentInstance(app=app, agents={"worker": agent})
 
@@ -144,6 +178,9 @@ async def _exercise_connection_scope():
         instance_scope="connection",
         tool_description="Connection scoped",
     )
+
+    _assert_prompts_enabled(server)
+    _assert_resources_disabled(server)
 
     class _DummySession:
         def __init__(self) -> None:

@@ -4,32 +4,36 @@ It adds logging and supports sampling requests.
 """
 
 from datetime import timedelta
-from time import perf_counter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from mcp import ClientSession, ServerNotification
+from mcp.shared.context import RequestContext
 from mcp.shared.message import MessageMetadata
 from mcp.shared.session import (
     ProgressFnT,
     ReceiveResultT,
-    SendRequestT,
 )
 from mcp.types import (
     CallToolRequest,
     CallToolRequestParams,
     CallToolResult,
+    ClientRequest,
+    EmptyResult,
     GetPromptRequest,
     GetPromptRequestParams,
     GetPromptResult,
     Implementation,
     ListRootsResult,
+    PingRequest,
     ReadResourceRequest,
     ReadResourceRequestParams,
     ReadResourceResult,
     Root,
+    SamplingCapability,
+    SamplingToolsCapability,
     ToolListChangedNotification,
 )
-from pydantic import AnyUrl
+from pydantic import AnyUrl, FileUrl
 
 from fast_agent.context_dependent import ContextDependent
 from fast_agent.core.logging.logger import get_logger
@@ -43,10 +47,10 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-async def list_roots(ctx: ClientSession) -> ListRootsResult:
+async def list_roots(context: RequestContext[ClientSession, None]) -> ListRootsResult:
     """List roots callback that will be called by the MCP library."""
 
-    if server_config := get_server_config(ctx):
+    if server_config := get_server_config(context.session):
         if server_config.roots:
             roots = [
                 Root(
@@ -73,7 +77,7 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
     Developers can extend this class to add more custom functionality as needed
     """
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, read_stream, write_stream, read_timeout=None, **kwargs) -> None:
         # Extract server_name if provided in kwargs
         from importlib.metadata import version
 
@@ -100,8 +104,8 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
         # Track the effective elicitation mode for diagnostics
         self.effective_elicitation_mode: str | None = "none"
 
-        version = version("fast-agent-mcp") or "dev"
-        fast_agent: Implementation = Implementation(name="fast-agent-mcp", version=version)
+        fast_agent_version = version("fast-agent-mcp") or "dev"
+        fast_agent: Implementation = Implementation(name="fast-agent-mcp", version=fast_agent_version)
         if self.server_config and self.server_config.implementation:
             fast_agent = self.server_config.implementation
 
@@ -112,11 +116,7 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
         # 1. Sampling is explicitly configured, OR
         # 2. Application-level auto_sampling is enabled
         sampling_cb = None
-        if (
-            self.server_config
-            and hasattr(self.server_config, "sampling")
-            and self.server_config.sampling
-        ):
+        if self.server_config and self.server_config.sampling:
             # Explicit sampling configuration
             sampling_cb = sample
         elif self._should_enable_auto_sampling():
@@ -177,11 +177,29 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
         else:
             self.effective_elicitation_mode = "none"
 
+        # Pop parameters we're explicitly setting to avoid duplicates
+        kwargs.pop("list_roots_callback", None)
+        kwargs.pop("sampling_callback", None)
+        kwargs.pop("sampling_capabilities", None)
+        kwargs.pop("client_info", None)
+        kwargs.pop("elicitation_callback", None)
+
+        # Create sampling capabilities with tools support when sampling is enabled
+        sampling_caps = None
+        if sampling_cb is not None:
+            # Advertise full sampling capability including tools support
+            sampling_caps = SamplingCapability(
+                tools=SamplingToolsCapability()
+            )
+
         super().__init__(
-            *args,
+            read_stream,
+            write_stream,
+            read_timeout,
             **kwargs,
             list_roots_callback=list_roots_cb,
             sampling_callback=sampling_cb,
+            sampling_capabilities=sampling_caps,
             client_info=fast_agent,
             elicitation_callback=elicitation_handler,
         )
@@ -200,7 +218,7 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
 
     async def send_request(
         self,
-        request: SendRequestT,
+        request: ClientRequest,
         result_type: type[ReceiveResultT],
         request_read_timeout_seconds: timedelta | None = None,
         metadata: MessageMetadata | None = None,
@@ -208,7 +226,13 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
     ) -> ReceiveResultT:
         logger.debug("send_request: request=", data=request.model_dump())
         request_id = getattr(self, "_request_id", None)
-        start_time = perf_counter()
+        is_ping_request = self._is_ping_request(request)
+        if (
+            is_ping_request
+            and request_id is not None
+            and self._transport_metrics is not None
+        ):
+            self._transport_metrics.register_ping_request(request_id)
         try:
             result = await super().send_request(
                 request=request,
@@ -222,24 +246,65 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
                 data=result.model_dump() if result is not None else "no response returned",
             )
             self._attach_transport_channel(request_id, result)
-            self._attach_transport_elapsed(result, perf_counter() - start_time)
+            if (
+                is_ping_request
+                and request_id is not None
+                and self._transport_metrics is not None
+            ):
+                self._transport_metrics.discard_ping_request(request_id)
             return result
         except Exception as e:
-            # Handle connection errors cleanly
-            # Looking at the MCP SDK, this should probably handle MCPError
+            if (
+                is_ping_request
+                and request_id is not None
+                and self._transport_metrics is not None
+            ):
+                self._transport_metrics.discard_ping_request(request_id)
             from anyio import ClosedResourceError
 
+            from fast_agent.core.exceptions import ServerSessionTerminatedError
+
+            # Check for session terminated error (404 from server)
+            if self._is_session_terminated_error(e):
+                raise ServerSessionTerminatedError(
+                    server_name=self.session_server_name or "unknown",
+                    details="Server returned 404 - session may have expired due to server restart",
+                ) from e
+
+            # Handle connection closure errors (transport closed)
             if isinstance(e, ClosedResourceError):
-                # Show clean offline message and convert to ConnectionError
                 from fast_agent.ui import console
 
                 console.console.print(
                     f"[dim red]MCP server {self.session_server_name} offline[/dim red]"
                 )
                 raise ConnectionError(f"MCP server {self.session_server_name} offline") from e
-            else:
-                logger.error(f"send_request failed: {str(e)}")
-                raise
+
+            logger.error(f"send_request failed: {str(e)}")
+            raise
+
+    @staticmethod
+    def _is_ping_request(request: ClientRequest) -> bool:
+        root = getattr(request, "root", None)
+        method = getattr(root, "method", None)
+        if not isinstance(method, str):
+            return False
+        method_lower = method.lower()
+        return method_lower == "ping" or method_lower.endswith("/ping") or method_lower.endswith(".ping")
+
+    def _is_session_terminated_error(self, exc: Exception) -> bool:
+        """Check if exception is a session terminated error (code 32600 from 404)."""
+        from mcp.shared.exceptions import McpError
+
+        from fast_agent.core.exceptions import ServerSessionTerminatedError
+
+        if isinstance(exc, McpError):
+            error_data = getattr(exc, "error", None)
+            if error_data:
+                code = getattr(error_data, "code", None)
+                if code == ServerSessionTerminatedError.SESSION_TERMINATED_CODE:
+                    return True
+        return False
 
     def _attach_transport_channel(self, request_id, result) -> None:
         if self._transport_metrics is None or request_id is None or result is None:
@@ -251,16 +316,6 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
             setattr(result, "transport_channel", channel)
         except Exception:
             # If result cannot be mutated, ignore silently
-            pass
-
-    @staticmethod
-    def _attach_transport_elapsed(result, elapsed: float | None) -> None:
-        if result is None or elapsed is None:
-            return
-        try:
-            setattr(result, "transport_elapsed", max(elapsed, 0.0))
-        except Exception:
-            # Ignore if result is immutable
             pass
 
     async def _received_notification(self, notification: ServerNotification) -> None:
@@ -307,46 +362,65 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
         except Exception as e:
             logger.error(f"Error in tool list changed callback: {e}")
 
-    # TODO -- decide whether to make this override type safe or not (modify SDK)
     async def call_tool(
-        self, name: str, arguments: dict | None = None, _meta: dict | None = None, **kwargs
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        read_timeout_seconds: timedelta | None = None,
+        progress_callback: ProgressFnT | None = None,
+        *,
+        meta: dict[str, Any] | None = None,
     ) -> CallToolResult:
-        """Call a tool with optional metadata support."""
-        if _meta:
-            from mcp.types import RequestParams
+        """Call a tool with optional metadata and progress callback support.
 
-            # Safe merge - preserve existing meta fields like progressToken
-            existing_meta = kwargs.get("meta")
-            if existing_meta:
-                meta_dict = (
-                    existing_meta.model_dump() if hasattr(existing_meta, "model_dump") else {}
-                )
-                meta_dict.update(_meta)
-                meta_obj = RequestParams.Meta(**meta_dict)
-            else:
-                meta_obj = RequestParams.Meta(**_meta)
+        Always uses our overridden send_request to ensure session terminated errors
+        are properly detected and converted to ServerSessionTerminatedError.
+        """
+        from mcp.types import RequestParams
 
-            # Create CallToolRequestParams without meta, then add _meta via model_dump
-            params = CallToolRequestParams(name=name, arguments=arguments)
-            params_dict = params.model_dump(by_alias=True)
-            params_dict["_meta"] = meta_obj.model_dump()
+        # Always create request ourselves to ensure we go through our send_request override
+        # This is critical for session terminated detection to work
+        _meta: RequestParams.Meta | None = None
+        if meta is not None:
+            _meta = RequestParams.Meta(**meta)
 
-            # Create request with proper types
-            request = CallToolRequest(
-                method="tools/call", params=CallToolRequestParams.model_validate(params_dict)
-            )
+        # ty doesn't recognize _meta from pydantic alias - this matches SDK pattern
+        params = CallToolRequestParams(name=name, arguments=arguments, _meta=_meta)  # ty: ignore[unknown-argument]
 
-            return await self.send_request(request, CallToolResult)
-        else:
-            return await super().call_tool(name, arguments, **kwargs)
+        request = CallToolRequest(method="tools/call", params=params)
+        return await self.send_request(
+            ClientRequest(request),
+            CallToolResult,
+            request_read_timeout_seconds=read_timeout_seconds,
+            progress_callback=progress_callback,
+        )
+
+    async def ping(self, read_timeout_seconds: timedelta | None = None) -> EmptyResult:
+        """Send a ping request to check server liveness."""
+        request = PingRequest(method="ping")
+        return await self.send_request(
+            ClientRequest(request),
+            EmptyResult,
+            request_read_timeout_seconds=read_timeout_seconds,
+        )
 
     async def read_resource(
-        self, uri: str, _meta: dict | None = None, **kwargs
+        self, uri: AnyUrl | str, _meta: dict | None = None, **kwargs
     ) -> ReadResourceResult:
-        """Read a resource with optional metadata support."""
-        if _meta:
-            from mcp.types import RequestParams
+        """Read a resource with optional metadata support.
 
+        Always uses our overridden send_request to ensure session terminated errors
+        are properly detected and converted to ServerSessionTerminatedError.
+        """
+        from mcp.types import RequestParams
+
+        # Convert str to AnyUrl if needed
+        uri_obj: AnyUrl = uri if isinstance(uri, AnyUrl) else AnyUrl(uri)
+
+        # Always create request ourselves to ensure we go through our send_request override
+        params = ReadResourceRequestParams(uri=uri_obj)
+
+        if _meta:
             # Safe merge - preserve existing meta fields like progressToken
             existing_meta = kwargs.get("meta")
             if existing_meta:
@@ -357,21 +431,25 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
                 meta_obj = RequestParams.Meta(**meta_dict)
             else:
                 meta_obj = RequestParams.Meta(**_meta)
+            params = ReadResourceRequestParams(uri=uri_obj, meta=meta_obj)
 
-            request = ReadResourceRequest(
-                method="resources/read", params=ReadResourceRequestParams(uri=uri, meta=meta_obj)
-            )
-            return await self.send_request(request, ReadResourceResult)
-        else:
-            return await super().read_resource(uri, **kwargs)
+        request = ReadResourceRequest(method="resources/read", params=params)
+        return await self.send_request(ClientRequest(request), ReadResourceResult)
 
     async def get_prompt(
         self, name: str, arguments: dict | None = None, _meta: dict | None = None, **kwargs
     ) -> GetPromptResult:
-        """Get a prompt with optional metadata support."""
-        if _meta:
-            from mcp.types import RequestParams
+        """Get a prompt with optional metadata support.
 
+        Always uses our overridden send_request to ensure session terminated errors
+        are properly detected and converted to ServerSessionTerminatedError.
+        """
+        from mcp.types import RequestParams
+
+        # Always create request ourselves to ensure we go through our send_request override
+        params = GetPromptRequestParams(name=name, arguments=arguments)
+
+        if _meta:
             # Safe merge - preserve existing meta fields like progressToken
             existing_meta = kwargs.get("meta")
             if existing_meta:
@@ -382,11 +460,7 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
                 meta_obj = RequestParams.Meta(**meta_dict)
             else:
                 meta_obj = RequestParams.Meta(**_meta)
+            params = GetPromptRequestParams(name=name, arguments=arguments, meta=meta_obj)
 
-            request = GetPromptRequest(
-                method="prompts/get",
-                params=GetPromptRequestParams(name=name, arguments=arguments, meta=meta_obj),
-            )
-            return await self.send_request(request, GetPromptResult)
-        else:
-            return await super().get_prompt(name, arguments, **kwargs)
+        request = GetPromptRequest(method="prompts/get", params=params)
+        return await self.send_request(ClientRequest(request), GetPromptResult)

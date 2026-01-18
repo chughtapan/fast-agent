@@ -8,12 +8,17 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 from mcp.types import CallToolResult, TextContent, Tool
 
+from fast_agent.constants import (
+    DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT,
+    MAX_TERMINAL_OUTPUT_BYTE_LIMIT,
+)
 from fast_agent.ui import console
 from fast_agent.ui.progress_display import progress_display
+from fast_agent.utils.async_utils import gather_with_cancel
 
 
 class ShellRuntime:
@@ -26,12 +31,17 @@ class ShellRuntime:
         timeout_seconds: int = 90,
         warning_interval_seconds: int = 30,
         skills_directory: Path | None = None,
+        working_directory: Path | None = None,
+        output_byte_limit: int | None = None,
     ) -> None:
         self._activation_reason = activation_reason
         self._logger = logger
         self._timeout_seconds = timeout_seconds
         self._warning_interval_seconds = warning_interval_seconds
         self._skills_directory = skills_directory
+        self._working_directory = working_directory
+        resolved_limit = output_byte_limit or DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT
+        self._output_byte_limit = min(resolved_limit, MAX_TERMINAL_OUTPUT_BYTE_LIMIT)
         self.enabled: bool = activation_reason is not None
         self._tool: Tool | None = None
 
@@ -70,12 +80,12 @@ class ShellRuntime:
 
     def working_directory(self) -> Path:
         """Return the working directory used for shell execution."""
-        # TODO -- reinstate when we provide duplication/isolation of skill workspaces
-        if self._skills_directory and self._skills_directory.exists():
-            return self._skills_directory
+        if self._working_directory is not None:
+            return self._working_directory
+        # Skills now show their location relative to cwd in the system prompt
         return Path.cwd()
 
-    def runtime_info(self) -> Dict[str, str | None]:
+    def runtime_info(self) -> dict[str, str | None]:
         """Best-effort detection of the shell runtime used for local execution.
 
         Uses modern Python APIs (platform.system(), shutil.which()) to detect
@@ -108,7 +118,7 @@ class ShellRuntime:
             # Fallback to generic sh
             return {"name": "sh", "path": None}
 
-    def metadata(self, command: Optional[str]) -> Dict[str, Any]:
+    def metadata(self, command: str | None) -> dict[str, Any]:
         """Build metadata for display when the shell tool is invoked."""
         info = self.runtime_info()
         working_dir = self.working_directory()
@@ -126,11 +136,12 @@ class ShellRuntime:
             "working_dir_display": working_dir_display,
             "timeout_seconds": self._timeout_seconds,
             "warning_interval_seconds": self._warning_interval_seconds,
+            "output_byte_limit": self._output_byte_limit,
             "streams_output": True,
             "returns_exit_code": True,
         }
 
-    async def execute(self, arguments: Dict[str, Any] | None = None) -> CallToolResult:
+    async def execute(self, arguments: dict[str, Any] | None = None) -> CallToolResult:
         """Execute a shell command and stream output to the console with timeout detection."""
         command_value = (arguments or {}).get("command") if arguments else None
         if not isinstance(command_value, str) or not command_value.strip():
@@ -169,7 +180,9 @@ class ShellRuntime:
 
                 if is_windows:
                     # Windows: CREATE_NEW_PROCESS_GROUP allows killing process tree
-                    process_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                    creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    if creation_flags:
+                        process_kwargs["creationflags"] = creation_flags
                 else:
                     # Unix: start_new_session creates new process group
                     process_kwargs["start_new_session"] = True
@@ -193,14 +206,18 @@ class ShellRuntime:
                     )
 
                 output_segments: list[str] = []
+                output_bytes = 0
+                output_truncated = False
+                truncation_notice_printed = False
                 # Track last output time in a mutable container for sharing across coroutines
                 last_output_time = [time.time()]
                 timeout_occurred = [False]
                 watchdog_task = None
 
                 async def stream_output(
-                    stream, style: Optional[str], is_stderr: bool = False
+                    stream, style: str | None, is_stderr: bool = False
                 ) -> None:
+                    nonlocal output_bytes, output_truncated, truncation_notice_printed
                     if not stream:
                         return
                     while True:
@@ -208,7 +225,31 @@ class ShellRuntime:
                         if not line:
                             break
                         text = line.decode(errors="replace")
-                        output_segments.append(text if not is_stderr else f"[stderr] {text}")
+                        output_text = text if not is_stderr else f"[stderr] {text}"
+                        if not output_truncated:
+                            output_blob = output_text.encode("utf-8", errors="replace")
+                            remaining = self._output_byte_limit - output_bytes
+                            if remaining > 0:
+                                if len(output_blob) <= remaining:
+                                    output_segments.append(output_text)
+                                    output_bytes += len(output_blob)
+                                else:
+                                    truncated_text = output_blob[:remaining].decode(
+                                        "utf-8", errors="replace"
+                                    )
+                                    if truncated_text:
+                                        output_segments.append(truncated_text)
+                                    output_bytes += remaining
+                                    output_truncated = True
+                            else:
+                                output_truncated = True
+
+                        if output_truncated and not truncation_notice_printed:
+                            console.console.print(
+                                "▶ Output truncated - limit reached",
+                                style="black on red",
+                            )
+                            truncation_notice_printed = True
                         console.console.print(
                             text.rstrip("\n"),
                             style=style,
@@ -258,7 +299,9 @@ class ShellRuntime:
                                 if is_windows:
                                     # Windows: try to signal the entire process group before terminating
                                     try:
-                                        process.send_signal(signal.CTRL_BREAK_EVENT)
+                                        ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+                                        if ctrl_break is not None:
+                                            process.send_signal(ctrl_break)
                                         await asyncio.sleep(2)
                                     except AttributeError:
                                         # Older Python/asyncio may not support send_signal on Windows
@@ -300,7 +343,7 @@ class ShellRuntime:
                 watchdog_task = asyncio.create_task(watchdog())
 
                 # Wait for streams to complete
-                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                await gather_with_cancel([stdout_task, stderr_task])
 
                 # Cancel watchdog if still running
                 if watchdog_task and not watchdog_task.done():
@@ -331,6 +374,10 @@ class ShellRuntime:
                     combined_output = "".join(output_segments)
                     if combined_output and not combined_output.endswith("\n"):
                         combined_output += "\n"
+                    if output_truncated:
+                        combined_output += (
+                            f"[Output truncated after {self._output_byte_limit} bytes]\n"
+                        )
                     combined_output += (
                         f"(timeout after {self._timeout_seconds}s - process terminated)"
                     )
@@ -349,6 +396,10 @@ class ShellRuntime:
                     # Add explicit exit code message for the LLM
                     if combined_output and not combined_output.endswith("\n"):
                         combined_output += "\n"
+                    if output_truncated:
+                        combined_output += (
+                            f"[Output truncated after {self._output_byte_limit} bytes]\n"
+                        )
                     combined_output += f"process exit code was {return_code}"
 
                     result = CallToolResult(

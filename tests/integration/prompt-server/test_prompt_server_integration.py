@@ -1,4 +1,5 @@
-from typing import TYPE_CHECKING, Dict, List
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -108,7 +109,7 @@ async def test_agent_interface_returns_prompts_list(fast_agent):
     @fast.agent(name="test", servers=["prompts"])
     async def agent_function():
         async with fast.run() as agent:
-            prompts: Dict[str, List[Prompt]] = await agent.test.list_prompts()
+            prompts: dict[str, list[Prompt]] = await agent.test.list_prompts()
             assert 5 == len(prompts["prompts"])
 
     await agent_function()
@@ -174,17 +175,15 @@ async def test_handling_multipart_json_format(fast_agent):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_prompt_server_sse_can_set_ports(fast_agent):
+async def test_prompt_server_sse_can_set_ports(fast_agent, mcp_test_ports, wait_for_port):
     # Start the SSE server in a subprocess
-    import asyncio
-    import os
     import subprocess
 
     # Get the path to the test agent
-    test_dir = os.path.dirname(os.path.abspath(__file__))
+    test_dir = Path(__file__).resolve().parent
 
     # Port must match what's in the fastagent.config.yaml
-    port = 8723
+    port = mcp_test_ports["sse"]
 
     # Start the server process
     server_proc = subprocess.Popen(
@@ -196,8 +195,7 @@ async def test_prompt_server_sse_can_set_ports(fast_agent):
     )
 
     try:
-        # Give the server a moment to start
-        await asyncio.sleep(3)
+        await wait_for_port("127.0.0.1", port, process=server_proc)
 
         # Now connect to it via the configured MCP server
         @fast_agent.agent(name="client", servers=["prompt_sse"], model="passthrough")
@@ -222,17 +220,15 @@ async def test_prompt_server_sse_can_set_ports(fast_agent):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_prompt_server_http_can_set_ports(fast_agent):
+async def test_prompt_server_http_can_set_ports(fast_agent, mcp_test_ports, wait_for_port):
     # Start the SSE server in a subprocess
-    import asyncio
-    import os
     import subprocess
 
     # Get the path to the test agent
-    test_dir = os.path.dirname(os.path.abspath(__file__))
+    test_dir = Path(__file__).resolve().parent
 
     # Port must match what's in the fastagent.config.yaml
-    port = 8724
+    port = mcp_test_ports["http"]
 
     # Start the server process
     server_proc = subprocess.Popen(
@@ -244,8 +240,7 @@ async def test_prompt_server_http_can_set_ports(fast_agent):
     )
 
     try:
-        # Give the server a moment to start
-        await asyncio.sleep(3)
+        await wait_for_port("127.0.0.1", port, process=server_proc)
 
         # Now connect to it via the configured MCP server
         @fast_agent.agent(name="client", servers=["prompt_http"], model="passthrough")

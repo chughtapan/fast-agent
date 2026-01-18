@@ -1,18 +1,19 @@
+import asyncio
+import inspect
 import json
+import os
 import time
 from abc import abstractmethod
 from contextvars import ContextVar
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
     Callable,
-    Dict,
     Generic,
-    List,
-    Optional,
-    Tuple,
     Type,
     TypeVar,
+    Union,
     cast,
 )
 
@@ -25,9 +26,15 @@ from mcp.types import (
 from openai import NotGiven
 from openai.lib._parsing import type_to_response_format_param as _type_to_response_format
 from pydantic_core import from_json
+from rich import print as rich_print
 
-from fast_agent.constants import FAST_AGENT_TIMING
+from fast_agent.constants import (
+    CONTROL_MESSAGE_SAVE_HISTORY,
+    DEFAULT_MAX_ITERATIONS,
+    FAST_AGENT_TIMING,
+)
 from fast_agent.context_dependent import ContextDependent
+from fast_agent.core.exceptions import AgentConfigError, ProviderKeyError, ServerConfigError
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.core.prompt import Prompt
 from fast_agent.event_progress import ProgressAction
@@ -38,6 +45,7 @@ from fast_agent.interfaces import (
 from fast_agent.llm.memory import Memory, SimpleMemory
 from fast_agent.llm.model_database import ModelDatabase
 from fast_agent.llm.provider_types import Provider
+from fast_agent.llm.stream_types import StreamChunk
 from fast_agent.llm.usage_tracking import TurnUsage, UsageAccumulator
 from fast_agent.mcp.helpers.content_helpers import get_text
 from fast_agent.types import PromptMessageExtended, RequestParams
@@ -52,10 +60,10 @@ if TYPE_CHECKING:
 
 
 # Context variable for storing MCP metadata
-_mcp_metadata_var: ContextVar[Dict[str, Any] | None] = ContextVar("mcp_metadata", default=None)
+_mcp_metadata_var: ContextVar[dict[str, Any] | None] = ContextVar("mcp_metadata", default=None)
 
 
-def deep_merge(dict1: Dict[Any, Any], dict2: Dict[Any, Any]) -> Dict[Any, Any]:
+def deep_merge(dict1: dict[Any, Any], dict2: dict[Any, Any]) -> dict[Any, Any]:
     """
     Recursively merges `dict2` into `dict1` in place.
 
@@ -91,9 +99,11 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
     PARAM_MAX_ITERATIONS = "max_iterations"
     PARAM_TEMPLATE_VARS = "template_vars"
     PARAM_MCP_METADATA = "mcp_metadata"
+    PARAM_TOOL_HANDLER = "tool_execution_handler"
+    PARAM_LOOP_PROGRESS = "emit_loop_progress"
 
     # Base set of fields that should always be excluded
-    BASE_EXCLUDE_FIELDS = {PARAM_METADATA}
+    BASE_EXCLUDE_FIELDS = {PARAM_METADATA, PARAM_TOOL_HANDLER, PARAM_LOOP_PROGRESS}
 
     """
     Implementation of the Llm Protocol - intended be subclassed for Provider
@@ -106,10 +116,10 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         instruction: str | None = None,
         name: str | None = None,
         request_params: RequestParams | None = None,
-        context: Optional["Context"] = None,
-        model: Optional[str] = None,
-        api_key: Optional[str] = None,
-        **kwargs: dict[str, Any],
+        context: Union["Context", None] = None,
+        model: str | None = None,
+        api_key: str | None = None,
+        **kwargs: Any,
     ) -> None:
         """
 
@@ -133,9 +143,6 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         # memory contains provider specific API types.
         self.history: Memory[MessageParamT] = SimpleMemory[MessageParamT]()
 
-        self._message_history: List[PromptMessageExtended] = []
-        self._template_messages: List[PromptMessageExtended] = []
-
         # Initialize the display component
         from fast_agent.ui.console_display import ConsoleDisplay
 
@@ -154,7 +161,7 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
             )
 
         # Cache effective model name for type-safe access
-        self._model_name: Optional[str] = getattr(self.default_request_params, "model", None)
+        self._model_name: str | None = self.default_request_params.model
 
         self.verb = kwargs.get("verb")
 
@@ -162,36 +169,144 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
         # Initialize usage tracking
         self._usage_accumulator = UsageAccumulator()
-        self._stream_listeners: set[Callable[[str], None]] = set()
-        self._tool_stream_listeners: set[Callable[[str, Dict[str, Any] | None], None]] = set()
+        self._stream_listeners: set[Callable[[StreamChunk], None]] = set()
+        self._tool_stream_listeners: set[Callable[[str, dict[str, Any] | None], None]] = set()
+        self.retry_count = self._resolve_retry_count()
+        self.retry_backoff_seconds: float = 10.0
 
-    def _initialize_default_params(self, kwargs: dict) -> RequestParams:
+    def _initialize_default_params(self, kwargs: dict[str, Any]) -> RequestParams:
         """Initialize default parameters for the LLM.
         Should be overridden by provider implementations to set provider-specific defaults."""
         # Get model-aware default max tokens
         model = kwargs.get("model")
-        max_tokens = ModelDatabase.get_default_max_tokens(model)
+        max_tokens = ModelDatabase.get_default_max_tokens(model) if model else 16384
 
         return RequestParams(
             model=model,
             maxTokens=max_tokens,
             systemPrompt=self.instruction,
             parallel_tool_calls=True,
-            max_iterations=20,
+            max_iterations=DEFAULT_MAX_ITERATIONS,
             use_history=True,
         )
 
+    async def _execute_with_retry(
+        self,
+        func: Callable[..., Awaitable[Any]],
+        *args: Any,
+        on_final_error: Callable[[Exception], Awaitable[Any] | Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """
+        Executes a function with robust retry logic for transient API errors.
+        """
+        retries = max(0, int(self.retry_count))
+
+        def _is_fatal_error(e: Exception) -> bool:
+            if isinstance(e, (KeyboardInterrupt, AgentConfigError, ServerConfigError)):
+                return True
+            if isinstance(e, ProviderKeyError):
+                msg = str(e).lower()
+                # Retry on Rate Limits (429, Quota, Overloaded)
+                keywords = [
+                    "429",
+                    "503",
+                    "quota",
+                    "exhausted",
+                    "overloaded",
+                    "unavailable",
+                    "timeout",
+                ]
+                if any(k in msg for k in keywords):
+                    return False
+                return True
+            return False
+
+        last_error = None
+
+        for attempt in range(retries + 1):
+            try:
+                # Await the async function
+                return await func(*args, **kwargs)
+            except Exception as e:
+                if _is_fatal_error(e):
+                    raise e
+
+                last_error = e
+                if attempt < retries:
+                    wait_time = self.retry_backoff_seconds * (attempt + 1)
+
+                    # Try to import progress_display safely
+                    try:
+                        from fast_agent.ui.progress_display import progress_display
+
+                        with progress_display.paused():
+                            rich_print(f"\n[yellow]⚠ Provider Error: {str(e)[:300]}...[/yellow]")
+                            rich_print(
+                                f"[dim]⟳ Retrying in {wait_time}s... (Attempt {attempt + 1}/{retries})[/dim]"
+                            )
+                    except ImportError:
+                        print(f"⚠ Provider Error: {str(e)[:300]}...")
+                        print(f"⟳ Retrying in {wait_time}s... (Attempt {attempt + 1}/{retries})")
+
+                    await asyncio.sleep(wait_time)
+
+        if last_error:
+            handler = on_final_error or getattr(self, "_handle_retry_failure", None)
+            if handler:
+                handled = handler(last_error)
+                if inspect.isawaitable(handled):
+                    handled = await handled
+                if handled is not None:
+                    return handled
+
+            raise last_error
+
+        # This line satisfies Pylance that we never implicitly return None
+        raise RuntimeError("Retry loop finished without success or exception")
+
+    def _handle_retry_failure(self, error: Exception) -> Any | None:
+        """
+        Optional hook for providers to convert an exhausted retry into a user-facing response.
+
+        Return a non-None value to short-circuit raising the final exception.
+        """
+        return None
+
+    def _resolve_retry_count(self) -> int:
+        """Resolve retries from config first, then env, defaulting to 0."""
+        config_retries = None
+        try:
+            config_retries = getattr(self.context.config, "llm_retries", None)
+        except Exception:
+            config_retries = None
+
+        if config_retries is not None:
+            try:
+                return int(config_retries)
+            except (TypeError, ValueError):
+                pass
+
+        env_retries = os.getenv("FAST_AGENT_RETRIES")
+        if env_retries is not None:
+            try:
+                return int(env_retries)
+            except (TypeError, ValueError):
+                pass
+
+        return 0
+
     async def generate(
         self,
-        messages: List[PromptMessageExtended],
+        messages: list[PromptMessageExtended],
         request_params: RequestParams | None = None,
-        tools: List[Tool] | None = None,
+        tools: list[Tool] | None = None,
     ) -> PromptMessageExtended:
         """
         Generate a completion using normalized message lists.
 
         This is the primary LLM interface that works directly with
-        List[PromptMessageExtended] for efficient internal usage.
+        list[PromptMessageExtended] for efficient internal usage.
 
         Args:
             messages: List of PromptMessageExtended objects
@@ -200,57 +315,62 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
         Returns:
             A PromptMessageExtended containing the Assistant response
+
+        Raises:
+            asyncio.CancelledError: If the operation is cancelled via task.cancel()
         """
         # TODO -- create a "fast-agent" control role rather than magic strings
 
-        if messages[-1].first_text().startswith("***SAVE_HISTORY"):
+        if messages[-1].first_text().startswith(CONTROL_MESSAGE_SAVE_HISTORY):
             parts: list[str] = messages[-1].first_text().split(" ", 1)
-            filename: str = (
-                parts[1].strip() if len(parts) > 1 else f"{self.name or 'assistant'}.json"
-            )
-            await self._save_history(filename)
-            return Prompt.assistant(f"History saved to {filename}")
+            if len(parts) > 1:
+                filename: str = parts[1].strip()
+            else:
+                from datetime import datetime
 
-        self._precall(messages)
+                timestamp = datetime.now().strftime("%y_%m_%d_%H_%M")
+                filename = f"{timestamp}-conversation.json"
+            await self._save_history(filename, messages)
+            return Prompt.assistant(f"History saved to {filename}")
 
         # Store MCP metadata in context variable
         final_request_params = self.get_request_params(request_params)
         if final_request_params.mcp_metadata:
             _mcp_metadata_var.set(final_request_params.mcp_metadata)
 
+        # The caller supplies the full conversation to send
+        full_history = messages
+
         # Track timing for this generation
         start_time = time.perf_counter()
-        assistant_response: PromptMessageExtended = await self._apply_prompt_provider_specific(
-            messages, request_params, tools
+        assistant_response: PromptMessageExtended = await self._execute_with_retry(
+            self._apply_prompt_provider_specific, full_history, request_params, tools
         )
         end_time = time.perf_counter()
         duration_ms = round((end_time - start_time) * 1000, 2)
 
-        # Add timing data to channels
-        timing_data = {
-            "start_time": start_time,
-            "end_time": end_time,
-            "duration_ms": duration_ms,
-        }
+        # Add timing data to channels only if not already present
+        # (preserves original timing when loading saved history)
         channels = dict(assistant_response.channels or {})
-        channels[FAST_AGENT_TIMING] = [
-            TextContent(type="text", text=json.dumps(timing_data))
-        ]
-        assistant_response.channels = channels
+        if FAST_AGENT_TIMING not in channels:
+            timing_data = {
+                "start_time": start_time,
+                "end_time": end_time,
+                "duration_ms": duration_ms,
+            }
+            channels[FAST_AGENT_TIMING] = [TextContent(type="text", text=json.dumps(timing_data))]
+            assistant_response.channels = channels
 
         self.usage_accumulator.count_tools(len(assistant_response.tool_calls or {}))
-
-        # add generic error and termination reason handling/rollback
-        self._message_history.append(assistant_response)
 
         return assistant_response
 
     @abstractmethod
     async def _apply_prompt_provider_specific(
         self,
-        multipart_messages: List["PromptMessageExtended"],
+        multipart_messages: list["PromptMessageExtended"],
         request_params: RequestParams | None = None,
-        tools: List[Tool] | None = None,
+        tools: list[Tool] | None = None,
         is_template: bool = False,
     ) -> PromptMessageExtended:
         """
@@ -261,6 +381,9 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
         Args:
             multipart_messages: List of PromptMessageExtended objects parsed from the prompt template
+            request_params: Optional parameters to configure the LLM request
+            tools: Optional list of tools available to the LLM
+            is_template: Whether this is a template application
 
         Returns:
             String representation of the assistant's response if generated,
@@ -269,15 +392,15 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
     async def structured(
         self,
-        messages: List[PromptMessageExtended],
+        messages: list[PromptMessageExtended],
         model: Type[ModelT],
         request_params: RequestParams | None = None,
-    ) -> Tuple[ModelT | None, PromptMessageExtended]:
+    ) -> tuple[ModelT | None, PromptMessageExtended]:
         """
         Generate a structured response using normalized message lists.
 
         This is the primary LLM interface for structured output that works directly with
-        List[PromptMessageExtended] for efficient internal usage.
+        list[PromptMessageExtended] for efficient internal usage.
 
         Args:
             messages: List of PromptMessageExtended objects
@@ -288,8 +411,6 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
             Tuple of (parsed model instance or None, assistant response message)
         """
 
-        self._precall(messages)
-
         # Store MCP metadata in context variable
         final_request_params = self.get_request_params(request_params)
 
@@ -297,27 +418,36 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         if final_request_params.mcp_metadata:
             _mcp_metadata_var.set(final_request_params.mcp_metadata)
 
+        full_history = messages
+
         # Track timing for this structured generation
         start_time = time.perf_counter()
-        result, assistant_response = await self._apply_prompt_provider_specific_structured(
-            messages, model, request_params
+        result_or_response = await self._execute_with_retry(
+            self._apply_prompt_provider_specific_structured,
+            full_history,
+            model,
+            request_params,
+            on_final_error=self._handle_retry_failure,
         )
+        if isinstance(result_or_response, PromptMessageExtended):
+            result, assistant_response = self._structured_from_multipart(result_or_response, model)
+        else:
+            result, assistant_response = result_or_response
         end_time = time.perf_counter()
         duration_ms = round((end_time - start_time) * 1000, 2)
 
-        # Add timing data to channels
-        timing_data = {
-            "start_time": start_time,
-            "end_time": end_time,
-            "duration_ms": duration_ms,
-        }
+        # Add timing data to channels only if not already present
+        # (preserves original timing when loading saved history)
         channels = dict(assistant_response.channels or {})
-        channels[FAST_AGENT_TIMING] = [
-            TextContent(type="text", text=json.dumps(timing_data))
-        ]
-        assistant_response.channels = channels
+        if FAST_AGENT_TIMING not in channels:
+            timing_data = {
+                "start_time": start_time,
+                "end_time": end_time,
+                "duration_ms": duration_ms,
+            }
+            channels[FAST_AGENT_TIMING] = [TextContent(type="text", text=json.dumps(timing_data))]
+            assistant_response.channels = channels
 
-        self._message_history.append(assistant_response)
         return result, assistant_response
 
     @staticmethod
@@ -361,10 +491,10 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
     async def _apply_prompt_provider_specific_structured(
         self,
-        multipart_messages: List[PromptMessageExtended],
+        multipart_messages: list[PromptMessageExtended],
         model: Type[ModelT],
         request_params: RequestParams | None = None,
-    ) -> Tuple[ModelT | None, PromptMessageExtended]:
+    ) -> tuple[ModelT | None, PromptMessageExtended]:
         """Base class attempts to parse JSON - subclasses can use provider specific functionality"""
 
         request_params = self.get_request_params(request_params)
@@ -381,26 +511,34 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
     def _structured_from_multipart(
         self, message: PromptMessageExtended, model: Type[ModelT]
-    ) -> Tuple[ModelT | None, PromptMessageExtended]:
+    ) -> tuple[ModelT | None, PromptMessageExtended]:
         """Parse the content of a PromptMessage and return the structured model and message itself"""
         try:
             text = get_text(message.content[-1]) or ""
+            text = self._prepare_structured_text(text)
             json_data = from_json(text, allow_partial=True)
             validated_model = model.model_validate(json_data)
-            return cast("ModelT", validated_model), message
+            return validated_model, message
         except ValueError as e:
             logger = get_logger(__name__)
             logger.warning(f"Failed to parse structured response: {str(e)}")
             return None, message
 
-    def _precall(self, multipart_messages: List[PromptMessageExtended]) -> None:
+    def _prepare_structured_text(self, text: str) -> str:
+        """Hook for subclasses to adjust structured output text before parsing."""
+        return text
+
+    def record_templates(self, templates: list[PromptMessageExtended]) -> None:
+        """Hook for providers that need template visibility (e.g., caching)."""
+        return
+
+    def _precall(self, multipart_messages: list[PromptMessageExtended]) -> None:
         """Pre-call hook to modify the message before sending it to the provider."""
-        # Ensure all messages are PromptMessageExtended before extending history
-        self._message_history.extend(multipart_messages)
+        # No-op placeholder; history is managed by the agent
 
     def chat_turn(self) -> int:
         """Return the current chat turn number"""
-        return 1 + sum(1 for message in self._message_history if message.role == "assistant")
+        return 1 + len(self._usage_accumulator.turns)
 
     def prepare_provider_arguments(
         self,
@@ -492,9 +630,7 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         """Set tool call count on TurnUsage and add to accumulator."""
         self._usage_accumulator.add_turn(turn_usage)
 
-    def _log_chat_progress(
-        self, chat_turn: Optional[int] = None, model: Optional[str] = None
-    ) -> None:
+    def _log_chat_progress(self, chat_turn: int | None = None, model: str | None = None) -> None:
         """Log a chat progress event"""
         # Determine action type based on verb
         if hasattr(self, "verb") and self.verb:
@@ -522,8 +658,6 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         Returns:
             Updated estimated token count
         """
-        self._notify_stream_listeners(content)
-
         # Rough estimate: 1 token per 4 characters (OpenAI's typical ratio)
         text_length = len(content)
         additional_tokens = max(1, text_length // 4)
@@ -544,12 +678,12 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
         return new_total
 
-    def add_stream_listener(self, listener: Callable[[str], None]) -> Callable[[], None]:
+    def add_stream_listener(self, listener: Callable[[StreamChunk], None]) -> Callable[[], None]:
         """
         Register a callback invoked with streaming text chunks.
 
         Args:
-            listener: Callable receiving the text chunk emitted by the provider.
+            listener: Callable receiving a StreamChunk emitted by the provider.
 
         Returns:
             A function that removes the listener when called.
@@ -561,9 +695,9 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
         return remove
 
-    def _notify_stream_listeners(self, chunk: str) -> None:
-        """Notify registered listeners with a streaming text chunk."""
-        if not chunk:
+    def _notify_stream_listeners(self, chunk: StreamChunk) -> None:
+        """Notify registered listeners with a streaming chunk."""
+        if not chunk.text:
             return
         for listener in list(self._stream_listeners):
             try:
@@ -572,7 +706,7 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
                 self.logger.exception("Stream listener raised an exception")
 
     def add_tool_stream_listener(
-        self, listener: Callable[[str, Dict[str, Any] | None], None]
+        self, listener: Callable[[str, dict[str, Any] | None], None]
     ) -> Callable[[], None]:
         """Register a callback invoked with tool streaming events.
 
@@ -591,7 +725,7 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         return remove
 
     def _notify_tool_stream_listeners(
-        self, event_type: str, payload: Dict[str, Any] | None = None
+        self, event_type: str, payload: dict[str, Any] | None = None
     ) -> None:
         """Notify listeners about tool streaming lifecycle events."""
 
@@ -602,7 +736,7 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
             except Exception:
                 self.logger.exception("Tool stream listener raised an exception")
 
-    def _log_chat_finished(self, model: Optional[str] = None) -> None:
+    def _log_chat_finished(self, model: str | None = None) -> None:
         """Log a chat finished event"""
         data = {
             "progress_action": ProgressAction.READY,
@@ -611,19 +745,50 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         }
         self.logger.debug("Chat finished", data=data)
 
-    def _convert_prompt_messages(self, prompt_messages: List[PromptMessage]) -> List[MessageParamT]:
+    def _convert_prompt_messages(self, prompt_messages: list[PromptMessage]) -> list[MessageParamT]:
         """
         Convert prompt messages to this LLM's specific message format.
         To be implemented by concrete LLM classes.
         """
         raise NotImplementedError("Must be implemented by subclass")
 
+    def _convert_to_provider_format(
+        self, messages: list[PromptMessageExtended]
+    ) -> list[MessageParamT]:
+        """
+        Convert provided messages to provider-specific format.
+        Called fresh on EVERY API call - no caching.
+
+        Args:
+            messages: List of PromptMessageExtended
+
+        Returns:
+            List of provider-specific message objects
+        """
+        return self._convert_extended_messages_to_provider(messages)
+
+    @abstractmethod
+    def _convert_extended_messages_to_provider(
+        self, messages: list[PromptMessageExtended]
+    ) -> list[MessageParamT]:
+        """
+        Convert PromptMessageExtended list to provider-specific format.
+        Must be implemented by each provider.
+
+        Args:
+            messages: List of PromptMessageExtended objects
+
+        Returns:
+            List of provider-specific message parameter objects
+        """
+        raise NotImplementedError("Must be implemented by subclass")
+
     async def show_prompt_loaded(
         self,
         prompt_name: str,
-        description: Optional[str] = None,
+        description: str | None = None,
         message_count: int = 0,
-        arguments: Optional[dict[str, str]] = None,
+        arguments: dict[str, str] | None = None,
     ) -> None:
         """
         Display information about a loaded prompt template.
@@ -673,20 +838,14 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
             arguments=arguments,
         )
 
-        # Convert to PromptMessageExtended objects
+        # Convert to PromptMessageExtended objects and delegate
         multipart_messages = PromptMessageExtended.parse_get_prompt_result(prompt_result)
-        # Store a local copy of template messages so we can retain them across clears
-        self._template_messages = [msg.model_copy(deep=True) for msg in multipart_messages]
-
-        # Delegate to the provider-specific implementation
         result = await self._apply_prompt_provider_specific(
             multipart_messages, None, is_template=True
         )
-        # Ensure message history always includes the stored template when applied
-        self._message_history = [msg.model_copy(deep=True) for msg in self._template_messages]
         return result.first_text()
 
-    async def _save_history(self, filename: str) -> None:
+    async def _save_history(self, filename: str, messages: list[PromptMessageExtended]) -> None:
         """
         Save the Message History to a file in a format determined by the file extension.
 
@@ -695,11 +854,18 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         """
         from fast_agent.mcp.prompt_serialization import save_messages
 
+        # Drop control messages like ***SAVE_HISTORY before persisting
+        filtered = [
+            msg.model_copy(deep=True)
+            for msg in messages
+            if not msg.first_text().startswith(CONTROL_MESSAGE_SAVE_HISTORY)
+        ]
+
         # Save messages using the unified save function that auto-detects format
-        save_messages(self._message_history, filename)
+        save_messages(filtered, filename)
 
     @property
-    def message_history(self) -> List[PromptMessageExtended]:
+    def message_history(self) -> list[PromptMessageExtended]:
         """
         Return the agent's message history as PromptMessageExtended objects.
 
@@ -709,32 +875,16 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         Returns:
             List of PromptMessageExtended objects representing the conversation history
         """
-        return self._message_history
+        return []
 
     def pop_last_message(self) -> PromptMessageExtended | None:
         """Remove and return the most recent message from the conversation history."""
-        if not self._message_history:
-            return None
-
-        removed = self._message_history.pop()
-        try:
-            self.history.pop()
-        except Exception:
-            # If provider-specific memory isn't available, ignore to avoid crashing UX
-            pass
-        return removed
+        return None
 
     def clear(self, *, clear_prompts: bool = False) -> None:
         """Reset stored message history while optionally retaining prompt templates."""
 
         self.history.clear(clear_prompts=clear_prompts)
-        if clear_prompts:
-            self._template_messages = []
-            self._message_history = []
-            return
-
-        # Restore message history to template messages only; new turns will append as normal
-        self._message_history = [msg.model_copy(deep=True) for msg in self._template_messages]
 
     def _api_key(self):
         if self._init_api_key:
@@ -748,6 +898,10 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
     @property
     def usage_accumulator(self):
         return self._usage_accumulator
+
+    @usage_accumulator.setter
+    def usage_accumulator(self, value):
+        self._usage_accumulator = value
 
     def get_usage_summary(self) -> dict:
         """

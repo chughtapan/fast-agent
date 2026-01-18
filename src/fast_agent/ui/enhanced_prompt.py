@@ -8,9 +8,10 @@ import os
 import shlex
 import subprocess
 import tempfile
+from collections.abc import Callable, Iterable
 from importlib.metadata import version
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, cast
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion, WordCompleter
@@ -22,11 +23,34 @@ from prompt_toolkit.styles import Style
 from rich import print as rich_print
 
 from fast_agent.agents.agent_types import AgentType
+from fast_agent.agents.workflow.parallel_agent import ParallelAgent
+from fast_agent.agents.workflow.router_agent import RouterAgent
 from fast_agent.constants import FAST_AGENT_ERROR_CHANNEL, FAST_AGENT_REMOVED_METADATA_CHANNEL
 from fast_agent.core.exceptions import PromptExitError
 from fast_agent.llm.model_info import ModelInfo
 from fast_agent.mcp.types import McpAgentProtocol
+from fast_agent.ui.command_payloads import (
+    AgentCommand,
+    ClearCommand,
+    CommandPayload,
+    HashAgentCommand,
+    ListToolsCommand,
+    LoadAgentCardCommand,
+    LoadHistoryCommand,
+    ReloadAgentsCommand,
+    SaveHistoryCommand,
+    SelectPromptCommand,
+    ShowHistoryCommand,
+    ShowMarkdownCommand,
+    ShowMcpStatusCommand,
+    ShowSystemCommand,
+    ShowUsageCommand,
+    SkillsCommand,
+    SwitchAgentCommand,
+    is_command_payload,
+)
 from fast_agent.ui.mcp_display import render_mcp_status
+from fast_agent.ui.model_display import format_model_display
 
 if TYPE_CHECKING:
     from fast_agent.core.agent_app import AgentApp
@@ -45,6 +69,86 @@ available_agents = set()
 
 # Keep track of multi-line mode state
 in_multiline_mode = False
+
+
+def _show_system_cmd() -> ShowSystemCommand:
+    return ShowSystemCommand()
+
+
+def _show_usage_cmd() -> ShowUsageCommand:
+    return ShowUsageCommand()
+
+
+def _show_markdown_cmd() -> ShowMarkdownCommand:
+    return ShowMarkdownCommand()
+
+
+def _show_mcp_status_cmd() -> ShowMcpStatusCommand:
+    return ShowMcpStatusCommand()
+
+
+def _list_tools_cmd() -> ListToolsCommand:
+    return ListToolsCommand()
+
+
+def _switch_agent_cmd(agent_name: str) -> SwitchAgentCommand:
+    return SwitchAgentCommand(agent_name=agent_name)
+
+
+def _hash_agent_cmd(agent_name: str, message: str) -> HashAgentCommand:
+    return HashAgentCommand(agent_name=agent_name, message=message)
+
+
+def _show_history_cmd(target_agent: str | None) -> ShowHistoryCommand:
+    return ShowHistoryCommand(agent=target_agent)
+
+
+def _clear_last_cmd(target_agent: str | None) -> ClearCommand:
+    return ClearCommand(kind="clear_last", agent=target_agent)
+
+
+def _clear_history_cmd(target_agent: str | None) -> ClearCommand:
+    return ClearCommand(kind="clear_history", agent=target_agent)
+
+
+def _save_history_cmd(filename: str | None) -> SaveHistoryCommand:
+    return SaveHistoryCommand(filename=filename)
+
+
+def _load_history_cmd(filename: str | None, error: str | None) -> LoadHistoryCommand:
+    return LoadHistoryCommand(filename=filename, error=error)
+
+
+def _load_agent_card_cmd(
+    filename: str | None, add_tool: bool, remove_tool: bool, error: str | None
+) -> LoadAgentCardCommand:
+    return LoadAgentCardCommand(
+        filename=filename, add_tool=add_tool, remove_tool=remove_tool, error=error
+    )
+
+
+def _agent_cmd(
+    agent_name: str | None, add_tool: bool, remove_tool: bool, dump: bool, error: str | None
+) -> AgentCommand:
+    return AgentCommand(
+        agent_name=agent_name,
+        add_tool=add_tool,
+        remove_tool=remove_tool,
+        dump=dump,
+        error=error,
+    )
+
+
+def _reload_agents_cmd() -> ReloadAgentsCommand:
+    return ReloadAgentsCommand()
+
+
+def _select_prompt_cmd(prompt_index: int | None, prompt_name: str | None) -> SelectPromptCommand:
+    return SelectPromptCommand(prompt_index=prompt_index, prompt_name=prompt_name)
+
+
+def _skills_cmd(action: str, argument: str | None) -> SkillsCommand:
+    return SkillsCommand(action=action, argument=argument)
 
 
 def _extract_alert_flags_from_meta(blocks) -> set[str]:
@@ -129,14 +233,15 @@ async def _display_agent_info_helper(agent_name: str, agent_provider: "AgentApp 
                 skill_count = len(list(skill_manifests))
             except TypeError:
                 skill_count = 0
+        tool_children = _collect_tool_children(agent)
 
         # Handle different agent types
-        if agent.agent_type == AgentType.PARALLEL:
+        if isinstance(agent, ParallelAgent):
             # Count child agents for parallel agents
             child_count = 0
-            if hasattr(agent, "fan_out_agents") and agent.fan_out_agents:
+            if agent.fan_out_agents:
                 child_count += len(agent.fan_out_agents)
-            if hasattr(agent, "fan_in_agent") and agent.fan_in_agent:
+            if agent.fan_in_agent:
                 child_count += 1
 
             if child_count > 0:
@@ -144,12 +249,10 @@ async def _display_agent_info_helper(agent_name: str, agent_provider: "AgentApp 
                 rich_print(
                     f"[dim]Agent [/dim][blue]{agent_name}[/blue][dim]:[/dim] {child_count:,}[dim] {child_word}[/dim]"
                 )
-        elif agent.agent_type == AgentType.ROUTER:
+        elif isinstance(agent, RouterAgent):
             # Count child agents for router agents
             child_count = 0
-            if hasattr(agent, "routing_agents") and agent.routing_agents:
-                child_count = len(agent.routing_agents)
-            elif hasattr(agent, "agents") and agent.agents:
+            if agent.agents:
                 child_count = len(agent.agents)
 
             if child_count > 0:
@@ -159,6 +262,11 @@ async def _display_agent_info_helper(agent_name: str, agent_provider: "AgentApp 
                 )
         else:
             content_parts = []
+
+            if tool_children:
+                child_count = len(tool_children)
+                child_word = "child agent" if child_count == 1 else "child agents"
+                content_parts.append(f"{child_count:,}[dim] {child_word}[/dim]")
 
             if server_count > 0:
                 sub_parts = []
@@ -213,37 +321,43 @@ async def _display_agent_info_helper(agent_name: str, agent_provider: "AgentApp 
 
 
 async def _display_all_agents_with_hierarchy(
-    available_agents: List[str], agent_provider: "AgentApp | None"
+    available_agents: Iterable[str], agent_provider: "AgentApp | None"
 ) -> None:
     """Display all agents with tree structure for workflow agents."""
+    agent_list = list(available_agents)
     # Track which agents are children to avoid displaying them twice
     child_agents = set()
 
     # First pass: identify all child agents
-    for agent_name in available_agents:
+    for agent_name in agent_list:
         try:
             if agent_provider is None:
                 continue
             agent = agent_provider._agent(agent_name)
 
-            if agent.agent_type == AgentType.PARALLEL:
-                if hasattr(agent, "fan_out_agents") and agent.fan_out_agents:
+            if isinstance(agent, ParallelAgent):
+                if agent.fan_out_agents:
                     for child_agent in agent.fan_out_agents:
-                        child_agents.add(child_agent.name)
-                if hasattr(agent, "fan_in_agent") and agent.fan_in_agent:
+                        if child_agent.name:
+                            child_agents.add(child_agent.name)
+                if agent.fan_in_agent and agent.fan_in_agent.name:
                     child_agents.add(agent.fan_in_agent.name)
-            elif agent.agent_type == AgentType.ROUTER:
-                if hasattr(agent, "routing_agents") and agent.routing_agents:
-                    for child_agent in agent.routing_agents:
-                        child_agents.add(child_agent.name)
-                elif hasattr(agent, "agents") and agent.agents:
+            elif isinstance(agent, RouterAgent):
+                if agent.agents:
                     for child_agent in agent.agents:
-                        child_agents.add(child_agent.name)
+                        if child_agent.name:
+                            child_agents.add(child_agent.name)
+            else:
+                tool_children = _collect_tool_children(agent)
+                for child_agent in tool_children:
+                    child_name = getattr(child_agent, "name", None)
+                    if child_name:
+                        child_agents.add(child_name)
         except Exception:
             continue
 
     # Second pass: display agents (parents with children, standalone agents without children)
-    for agent_name in sorted(available_agents):
+    for agent_name in sorted(agent_list):
         # Skip if this agent is a child of another agent
         if agent_name in child_agents:
             continue
@@ -261,6 +375,10 @@ async def _display_all_agents_with_hierarchy(
                 await _display_parallel_children(agent, agent_provider)
             elif agent.agent_type == AgentType.ROUTER:
                 await _display_router_children(agent, agent_provider)
+            else:
+                tool_children = _collect_tool_children(agent)
+                if tool_children:
+                    await _display_tool_children(tool_children, agent_provider)
 
         except Exception:
             continue
@@ -271,12 +389,12 @@ async def _display_parallel_children(parallel_agent, agent_provider: "AgentApp |
     children = []
 
     # Collect fan-out agents
-    if hasattr(parallel_agent, "fan_out_agents") and parallel_agent.fan_out_agents:
+    if parallel_agent.fan_out_agents:
         for child_agent in parallel_agent.fan_out_agents:
             children.append(child_agent)
 
     # Collect fan-in agent
-    if hasattr(parallel_agent, "fan_in_agent") and parallel_agent.fan_in_agent:
+    if parallel_agent.fan_in_agent is not None:
         children.append(parallel_agent.fan_in_agent)
 
     # Display children with tree formatting
@@ -291,16 +409,43 @@ async def _display_router_children(router_agent, agent_provider: "AgentApp | Non
     children = []
 
     # Collect routing agents
-    if hasattr(router_agent, "routing_agents") and router_agent.routing_agents:
-        children = router_agent.routing_agents
-    elif hasattr(router_agent, "agents") and router_agent.agents:
-        children = router_agent.agents
+    if router_agent.agents:
+        children = list(router_agent.agents)
 
     # Display children with tree formatting
     for i, child_agent in enumerate(children):
         is_last = i == len(children) - 1
         prefix = "└─" if is_last else "├─"
         await _display_child_agent_info(child_agent, prefix, agent_provider)
+
+
+async def _display_tool_children(tool_children, agent_provider: "AgentApp | None") -> None:
+    """Display tool-exposed child agents in tree format."""
+    for i, child_agent in enumerate(tool_children):
+        is_last = i == len(tool_children) - 1
+        prefix = "└─" if is_last else "├─"
+        await _display_child_agent_info(child_agent, prefix, agent_provider)
+
+
+def _collect_tool_children(agent) -> list[Any]:
+    """Collect child agents exposed as tools."""
+    children: list[Any] = []
+    child_map = getattr(agent, "_child_agents", None)
+    if isinstance(child_map, dict):
+        children.extend(child_map.values())
+    agent_tools = getattr(agent, "_agent_tools", None)
+    if isinstance(agent_tools, dict):
+        children.extend(agent_tools.values())
+
+    seen: set[str] = set()
+    unique_children: list[Any] = []
+    for child in children:
+        name = getattr(child, "name", None)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        unique_children.append(child)
+    return unique_children
 
 
 async def _display_child_agent_info(
@@ -352,18 +497,19 @@ class AgentCompleter(Completer):
 
     def __init__(
         self,
-        agents: List[str],
-        commands: List[str] = None,
-        agent_types: dict = None,
+        agents: list[str],
+        agent_types: dict[str, AgentType] | None = None,
         is_human_input: bool = False,
+        current_agent: str | None = None,
     ) -> None:
         self.agents = agents
+        self.current_agent = current_agent
         # Map commands to their descriptions for better completion hints
         self.commands = {
             "mcp": "Show MCP server status",
             "history": "Show conversation history overview (optionally another agent)",
             "tools": "List available MCP Tools",
-            "skills": "List available Agent Skills",
+            "skills": "Manage skills (/skills, /skills add, /skills remove, /skills registry)",
             "prompt": "List and choose MCP prompts, or apply specific prompt (/prompt <name>)",
             "clear": "Clear history",
             "clear last": "Remove the most recent message from history",
@@ -372,10 +518,13 @@ class AgentCompleter(Completer):
             "usage": "Show current usage statistics",
             "markdown": "Show last assistant message without markdown formatting",
             "save_history": "Save history; .json = MCP JSON, others = Markdown",
+            "load_history": "Load history from a file",
+            "card": "Load an AgentCard (add --tool to attach/remove as tool)",
+            "agent": "Attach/remove an agent as a tool or dump an AgentCard",
+            "reload": "Reload AgentCards from disk",
             "help": "Show commands and shortcuts",
             "EXIT": "Exit fast-agent, terminating any running workflows",
             "STOP": "Stop this prompting session and move to next workflow step",
-            **(commands or {}),  # Allow custom commands to be passed in
         }
         if is_human_input:
             self.commands.pop("agents")
@@ -384,13 +533,164 @@ class AgentCompleter(Completer):
             self.commands.pop("usage", None)  # Remove usage command in human input mode
         self.agent_types = agent_types or {}
 
+    def _complete_history_files(self, partial: str):
+        """Generate completions for history files (.json and .md)."""
+        from pathlib import Path
+
+        # Determine directory and prefix to search
+        if partial:
+            partial_path = Path(partial)
+            if partial.endswith("/") or partial.endswith(os.sep):
+                search_dir = partial_path
+                prefix = ""
+            else:
+                search_dir = (
+                    partial_path.parent if partial_path.parent != partial_path else Path(".")
+                )
+                prefix = partial_path.name
+        else:
+            search_dir = Path(".")
+            prefix = ""
+
+        # Ensure search_dir exists
+        if not search_dir.exists():
+            return
+
+        try:
+            # List directory contents
+            for entry in sorted(search_dir.iterdir()):
+                name = entry.name
+
+                # Skip hidden files
+                if name.startswith("."):
+                    continue
+
+                # Check if name matches prefix
+                if not name.lower().startswith(prefix.lower()):
+                    continue
+
+                # Build the completion text
+                if search_dir == Path("."):
+                    completion_text = name
+                else:
+                    completion_text = str(search_dir / name)
+
+                # Handle directories - add trailing slash
+                if entry.is_dir():
+                    yield Completion(
+                        completion_text + "/",
+                        start_position=-len(partial),
+                        display=name + "/",
+                        display_meta="directory",
+                    )
+                # Handle .json and .md files
+                elif entry.is_file() and (name.endswith(".json") or name.endswith(".md")):
+                    file_type = "JSON history" if name.endswith(".json") else "Markdown"
+                    yield Completion(
+                        completion_text,
+                        start_position=-len(partial),
+                        display=name,
+                        display_meta=file_type,
+                    )
+        except PermissionError:
+            pass  # Skip directories we can't read
+
+    def _complete_agent_card_files(self, partial: str):
+        """Generate completions for AgentCard files (.md/.markdown/.yaml/.yml)."""
+        from pathlib import Path
+
+        if partial:
+            partial_path = Path(partial)
+            if partial.endswith("/") or partial.endswith(os.sep):
+                search_dir = partial_path
+                prefix = ""
+            else:
+                search_dir = (
+                    partial_path.parent if partial_path.parent != partial_path else Path(".")
+                )
+                prefix = partial_path.name
+        else:
+            search_dir = Path(".")
+            prefix = ""
+
+        if not search_dir.exists():
+            return
+
+        card_extensions = {".md", ".markdown", ".yaml", ".yml"}
+        try:
+            for entry in sorted(search_dir.iterdir()):
+                name = entry.name
+                if name.startswith("."):
+                    continue
+                if not name.lower().startswith(prefix.lower()):
+                    continue
+
+                if search_dir == Path("."):
+                    completion_text = name
+                else:
+                    completion_text = str(search_dir / name)
+
+                if entry.is_dir():
+                    yield Completion(
+                        completion_text + "/",
+                        start_position=-len(partial),
+                        display=name + "/",
+                        display_meta="directory",
+                    )
+                elif entry.is_file() and entry.suffix.lower() in card_extensions:
+                    yield Completion(
+                        completion_text,
+                        start_position=-len(partial),
+                        display=name,
+                        display_meta="AgentCard",
+                    )
+        except PermissionError:
+            pass  # Skip directories we can't read
+
     def get_completions(self, document, complete_event):
         """Synchronous completions method - this is what prompt_toolkit expects by default"""
-        text = document.text_before_cursor.lower()
+        text = document.text_before_cursor
+        text_lower = text.lower()
+
+        # Sub-completion for /load_history - show .json and .md files
+        if text_lower.startswith("/load_history ") or text_lower.startswith("/load "):
+            # Extract the partial path after the command
+            if text_lower.startswith("/load_history "):
+                partial = text[len("/load_history ") :]
+            else:
+                partial = text[len("/load ") :]
+
+            yield from self._complete_history_files(partial)
+            return
+
+        if text_lower.startswith("/card "):
+            partial = text[len("/card ") :]
+            yield from self._complete_agent_card_files(partial)
+            return
+
+        # Sub-completion for /agent - show available agent names (excluding current agent)
+        if text_lower.startswith("/agent "):
+            partial = text[len("/agent ") :].lstrip()
+            # Strip leading @ if present
+            if partial.startswith("@"):
+                partial = partial[1:]
+            for agent in self.agents:
+                # Don't suggest attaching current agent to itself
+                if agent == self.current_agent:
+                    continue
+                if agent.lower().startswith(partial.lower()):
+                    agent_type = self.agent_types.get(agent, AgentType.BASIC).value
+                    yield Completion(
+                        agent,
+                        start_position=-len(partial),
+                        display=agent,
+                        display_meta=agent_type,
+                    )
+            return
 
         # Complete commands
-        if text.startswith("/"):
-            cmd = text[1:]
+        if text_lower.startswith("/"):
+            cmd = text_lower[1:]
             # Simple command completion - match beginning of command
             for command, description in self.commands.items():
                 if command.lower().startswith(cmd):
@@ -414,6 +714,24 @@ class AgentCompleter(Completer):
                         display=agent,
                         display_meta=agent_type,
                     )
+
+        # Complete agent names for hash commands (#agent_name message)
+        elif text.startswith("#"):
+            # Only complete if we haven't finished the agent name yet (no space after #agent)
+            rest = text[1:]
+            if " " not in rest:
+                # Still typing agent name
+                agent_name = rest
+                for agent in self.agents:
+                    if agent.lower().startswith(agent_name.lower()):
+                        # Get agent type or default to "Agent"
+                        agent_type = self.agent_types.get(agent, AgentType.BASIC).value
+                        yield Completion(
+                            agent + " ",  # Add space after agent name for message input
+                            start_position=-len(agent_name),
+                            display=agent,
+                            display_meta=f"# {agent_type}",
+                        )
 
 
 # Helper function to open text in an external editor
@@ -495,11 +813,19 @@ def get_text_from_editor(initial_text: str = "") -> str:
     return edited_text.strip()  # Added strip() to remove trailing newlines often added by editors
 
 
+class AgentKeyBindings(KeyBindings):
+    agent_provider: "AgentApp | None" = None
+    current_agent_name: str | None = None
+
+
 def create_keybindings(
-    on_toggle_multiline=None, app=None, agent_provider: "AgentApp | None" = None, agent_name=None
-):
+    on_toggle_multiline: Callable[[bool], None] | None = None,
+    app: Any | None = None,
+    agent_provider: "AgentApp | None" = None,
+    agent_name: str | None = None,
+) -> AgentKeyBindings:
     """Create custom key bindings."""
-    kb = KeyBindings()
+    kb = AgentKeyBindings()
 
     @kb.add("c-m", filter=Condition(lambda: not in_multiline_mode))
     def _(event) -> None:
@@ -602,18 +928,210 @@ def create_keybindings(
     return kb
 
 
+def parse_special_input(text: str) -> str | CommandPayload:
+    stripped = text.lstrip()
+    if stripped.startswith("/"):
+        cmd_line = stripped.splitlines()[0]
+    else:
+        cmd_line = text
+
+    # Command processing
+    if cmd_line and cmd_line.startswith("/"):
+        if cmd_line == "/":
+            return ""
+        cmd_parts = cmd_line[1:].strip().split(maxsplit=1)
+        cmd = cmd_parts[0].lower()
+
+        if cmd == "help":
+            return "HELP"
+        if cmd == "agents":
+            return "LIST_AGENTS"
+        if cmd == "system":
+            return _show_system_cmd()
+        if cmd == "usage":
+            return _show_usage_cmd()
+        if cmd == "history":
+            target_agent = None
+            if len(cmd_parts) > 1:
+                candidate = cmd_parts[1].strip()
+                if candidate:
+                    target_agent = candidate
+            return _show_history_cmd(target_agent)
+        if cmd == "clear":
+            target_agent = None
+            if len(cmd_parts) > 1:
+                remainder = cmd_parts[1].strip()
+                if remainder:
+                    tokens = remainder.split(maxsplit=1)
+                    if tokens and tokens[0].lower() == "last":
+                        if len(tokens) > 1:
+                            candidate = tokens[1].strip()
+                            if candidate:
+                                target_agent = candidate
+                        return _clear_last_cmd(target_agent)
+                    target_agent = remainder
+            return _clear_history_cmd(target_agent)
+        if cmd == "markdown":
+            return _show_markdown_cmd()
+        if cmd in ("save_history", "save"):
+            filename = cmd_parts[1].strip() if len(cmd_parts) > 1 and cmd_parts[1].strip() else None
+            return _save_history_cmd(filename)
+        if cmd in ("load_history", "load"):
+            filename = cmd_parts[1].strip() if len(cmd_parts) > 1 and cmd_parts[1].strip() else None
+            if not filename:
+                return _load_history_cmd(None, "Filename required for load_history")
+            return _load_history_cmd(filename, None)
+        if cmd == "card":
+            remainder = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+            if not remainder:
+                return _load_agent_card_cmd(
+                    None, False, False, "Filename required for /card"
+                )
+            try:
+                tokens = shlex.split(remainder)
+            except ValueError as exc:
+                return _load_agent_card_cmd(None, False, False, f"Invalid arguments: {exc}")
+            add_tool = False
+            remove_tool = False
+            filename = None
+            for token in tokens:
+                if token in {"tool", "--tool", "--as-tool", "-t"}:
+                    add_tool = True
+                    continue
+                if token in {"remove", "--remove", "--rm"}:
+                    remove_tool = True
+                    add_tool = True
+                    continue
+                if filename is None:
+                    filename = token
+            if not filename:
+                return _load_agent_card_cmd(
+                    None, add_tool, remove_tool, "Filename required for /card"
+                )
+            return _load_agent_card_cmd(filename, add_tool, remove_tool, None)
+        if cmd == "agent":
+            remainder = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+            if not remainder:
+                return _agent_cmd(
+                    None,
+                    False,
+                    False,
+                    False,
+                    "Usage: /agent <name> --tool | /agent [name] --dump",
+                )
+            try:
+                tokens = shlex.split(remainder)
+            except ValueError as exc:
+                return _agent_cmd(None, False, False, False, f"Invalid arguments: {exc}")
+            add_tool = False
+            remove_tool = False
+            dump = False
+            agent_name = None
+            unknown: list[str] = []
+            for token in tokens:
+                if token in {"tool", "--tool", "--as-tool", "-t"}:
+                    add_tool = True
+                    continue
+                if token in {"remove", "--remove", "--rm"}:
+                    remove_tool = True
+                    add_tool = True
+                    continue
+                if token in {"dump", "--dump", "-d"}:
+                    dump = True
+                    continue
+                if agent_name is None:
+                    agent_name = token[1:] if token.startswith("@") else token
+                    continue
+                unknown.append(token)
+            if unknown:
+                return _agent_cmd(
+                    agent_name,
+                    add_tool,
+                    remove_tool,
+                    dump,
+                    f"Unexpected arguments: {', '.join(unknown)}",
+                )
+            if add_tool and dump:
+                return _agent_cmd(
+                    agent_name,
+                    add_tool,
+                    remove_tool,
+                    dump,
+                    "Use either --tool or --dump, not both",
+                )
+            if not add_tool and not dump:
+                return _agent_cmd(
+                    agent_name,
+                    add_tool,
+                    remove_tool,
+                    dump,
+                    "Usage: /agent <name> --tool | /agent [name] --dump",
+                )
+            if add_tool and not agent_name:
+                return _agent_cmd(
+                    agent_name,
+                    add_tool,
+                    remove_tool,
+                    dump,
+                    "Agent name is required for /agent --tool",
+                )
+            return _agent_cmd(agent_name, add_tool, remove_tool, dump, None)
+        if cmd == "reload":
+            return _reload_agents_cmd()
+        if cmd in ("mcpstatus", "mcp"):
+            return _show_mcp_status_cmd()
+        if cmd == "prompt":
+            if len(cmd_parts) > 1:
+                prompt_arg = cmd_parts[1].strip()
+                if prompt_arg.isdigit():
+                    return _select_prompt_cmd(int(prompt_arg), None)
+                return _select_prompt_cmd(None, prompt_arg)
+            return _select_prompt_cmd(None, None)
+        if cmd == "tools":
+            return _list_tools_cmd()
+        if cmd == "skills":
+            remainder = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+            if not remainder:
+                return _skills_cmd("list", None)
+            tokens = remainder.split(maxsplit=1)
+            action = tokens[0].lower()
+            argument = tokens[1].strip() if len(tokens) > 1 else None
+            return _skills_cmd(action, argument)
+        if cmd == "exit":
+            return "EXIT"
+        if cmd.lower() == "stop":
+            return "STOP"
+
+    if cmd_line and cmd_line.startswith("@"):
+        return _switch_agent_cmd(cmd_line[1:].strip())
+
+    # Hash command: #agent_name message - send message to agent, return result to buffer
+    if cmd_line and cmd_line.startswith("#"):
+        rest = cmd_line[1:].strip()
+        if " " in rest:
+            # Split into agent name and message
+            agent_name, message = rest.split(" ", 1)
+            return _hash_agent_cmd(agent_name.strip(), message.strip())
+        elif rest:
+            # Just agent name, no message - return empty hash command (user will be prompted)
+            return _hash_agent_cmd(rest.strip(), "")
+
+    return text
+
+
 async def get_enhanced_input(
     agent_name: str,
     default: str = "",
     show_default: bool = False,
     show_stop_hint: bool = False,
     multiline: bool = False,
-    available_agent_names: List[str] = None,
-    agent_types: dict[str, AgentType] = None,
+    available_agent_names: list[str] | None = None,
+    agent_types: dict[str, AgentType] | None = None,
     is_human_input: bool = False,
     toolbar_color: str = "ansiblue",
     agent_provider: "AgentApp | None" = None,
-) -> str:
+    pre_populate_buffer: str = "",
+) -> str | CommandPayload:
     """
     Enhanced input with advanced prompt_toolkit features.
 
@@ -628,9 +1146,10 @@ async def get_enhanced_input(
         is_human_input: Whether this is a human input request (disables agent selection features)
         toolbar_color: Color to use for the agent name in the toolbar (default: "ansiblue")
         agent_provider: Optional AgentApp for displaying agent info
+        pre_populate_buffer: Text to pre-populate in the input buffer for editing (one-off)
 
     Returns:
-        User input string
+        User input string or parsed command payload
     """
     global in_multiline_mode, available_agents, help_message_shown
 
@@ -638,6 +1157,11 @@ async def get_enhanced_input(
     in_multiline_mode = multiline
     if available_agent_names:
         available_agents = set(available_agent_names)
+    if agent_provider:
+        try:
+            available_agents = set(agent_provider.agent_names())
+        except Exception:
+            pass
 
     # Get or create history object for this agent
     if agent_name not in agent_histories:
@@ -676,8 +1200,8 @@ async def get_enhanced_input(
         if agent_provider:
             try:
                 agent = agent_provider._agent(agent_name)
-            except Exception as exc:
-                print(f"[toolbar debug] unable to resolve agent '{agent_name}': {exc}")
+            except Exception:
+                agent = None
 
         if agent:
             for message in agent.message_history:
@@ -702,20 +1226,24 @@ async def get_enhanced_input(
                     )
 
             if not model_name:
-                model_name = getattr(agent.config, "model", None)
-            if not model_name and getattr(agent.config, "default_request_params", None):
-                model_name = getattr(agent.config.default_request_params, "model", None)
+                model_name = agent.config.model
+            if not model_name and agent.config.default_request_params:
+                model_name = agent.config.default_request_params.model
             if not model_name:
-                context = getattr(agent, "context", None) or getattr(
-                    agent_provider, "context", None
-                )
-                config_obj = getattr(context, "config", None) if context else None
-                model_name = getattr(config_obj, "default_model", None)
+                try:
+                    context = agent.context
+                except Exception:
+                    context = None
+                if context and context.config:
+                    model_name = context.config.default_model
 
             if model_name:
+                display_name = format_model_display(model_name) or model_name
                 max_len = 25
                 model_display = (
-                    model_name[: max_len - 1] + "…" if len(model_name) > max_len else model_name
+                    display_name[: max_len - 1] + "…"
+                    if len(display_name) > max_len
+                    else display_name
                 )
             else:
                 print(f"[toolbar debug] no model resolved for agent '{agent_name}'")
@@ -840,6 +1368,7 @@ async def get_enhanced_input(
             agents=list(available_agents) if available_agents else [],
             agent_types=agent_types or {},
             is_human_input=is_human_input,
+            current_agent=agent_name,
         ),
         complete_while_typing=True,
         multiline=Condition(lambda: in_multiline_mode),
@@ -847,6 +1376,7 @@ async def get_enhanced_input(
         mouse_support=False,
         bottom_toolbar=get_toolbar,
         style=custom_style,
+        erase_when_done=True,
     )
 
     # Create key bindings with a reference to the app
@@ -862,6 +1392,7 @@ async def get_enhanced_input(
     shell_enabled = False
     shell_access_modes: tuple[str, ...] = ()
     shell_name: str | None = None
+    shell_runtime = None
     if agent_provider:
         try:
             shell_agent = agent_provider._agent(agent_name)
@@ -869,19 +1400,35 @@ async def get_enhanced_input(
             shell_agent = None
 
     if shell_agent:
-        shell_enabled = bool(getattr(shell_agent, "_shell_runtime_enabled", False))
+        direct_shell_enabled = bool(getattr(shell_agent, "_shell_runtime_enabled", False))
         modes_attr = getattr(shell_agent, "_shell_access_modes", ())
         if isinstance(modes_attr, (list, tuple)):
             shell_access_modes = tuple(str(mode) for mode in modes_attr)
         elif modes_attr:
             shell_access_modes = (str(modes_attr),)
 
-        # Get the detected shell name from the runtime
-        if shell_enabled:
+        sub_agent_shells = [
+            child
+            for child in _collect_tool_children(shell_agent)
+            if getattr(child, "_shell_runtime_enabled", False)
+        ]
+        if sub_agent_shells:
+            if direct_shell_enabled:
+                if "sub-agent" not in shell_access_modes:
+                    shell_access_modes = (*shell_access_modes, "sub-agent")
+            else:
+                shell_access_modes = ("sub-agent",)
+                if len(sub_agent_shells) == 1:
+                    shell_runtime = getattr(sub_agent_shells[0], "_shell_runtime", None)
+
+        shell_enabled = direct_shell_enabled or bool(sub_agent_shells)
+        if direct_shell_enabled:
             shell_runtime = getattr(shell_agent, "_shell_runtime", None)
-            if shell_runtime:
-                runtime_info = shell_runtime.runtime_info()
-                shell_name = runtime_info.get("name")
+
+        # Get the detected shell name from the runtime
+        if shell_enabled and shell_runtime:
+            runtime_info = shell_runtime.runtime_info()
+            shell_name = runtime_info.get("name")
 
     # Create formatted prompt text
     arrow_segment = "<ansibrightyellow>❯</ansibrightyellow>" if shell_enabled else "❯"
@@ -904,7 +1451,7 @@ async def get_enhanced_input(
             rich_print("[dim]Type /help for commands. Ctrl+T toggles multiline mode.[/dim]")
         else:
             rich_print(
-                "[dim]Type '/' for commands, '@' to switch agent. Ctrl+T multiline, CTRL+E external editor.[/dim]\n"
+                "[dim]Type '/' for commands, '@' to switch agent, '#' to query agent. \nCtrl+T multiline, CTRL+Y copy last assistant message, CTRL+E external editor.[/dim]\n"
             )
 
             # Display agent info right after help text if agent_provider is available
@@ -920,8 +1467,12 @@ async def get_enhanced_input(
                     active_agent = shell_agent
                     if active_agent is None:
                         active_agent = agent_provider._agent(agent_name)
-                    agent_context = active_agent._context or active_agent.context
-                    logger_settings = agent_context.config.logger
+                    try:
+                        agent_context = active_agent.context
+                    except Exception:
+                        agent_context = None
+                    if agent_context and agent_context.config:
+                        logger_settings = agent_context.config.logger
                 except Exception:
                     # If we can't get the agent or its context, logger_settings stays None
                     pass
@@ -954,12 +1505,32 @@ async def get_enhanced_input(
                                     f"[dim]Experimental: Streaming Enabled - {streaming_mode} mode[/dim]"
                                 )
 
+                        # Show model source if configured via env var or config file
+                        model_source = (
+                            getattr(agent_context.config, "model_source", None)
+                            if agent_context and agent_context.config
+                            else None
+                        )
+                        if model_source:
+                            rich_print(f"[dim]Model selected via {model_source}[/dim]")
+
+                        # Show HuggingFace model and provider info if applicable
+                        try:
+                            if active_agent and active_agent.llm:
+                                get_hf_info = getattr(active_agent.llm, "get_hf_display_info", None)
+                                if get_hf_info:
+                                    hf_info = get_hf_info()
+                                    model = hf_info.get("model", "unknown")
+                                    provider = hf_info.get("provider", "auto-routing")
+                                    rich_print(f"[dim]HuggingFace: {model} via {provider}[/dim]")
+                        except Exception:
+                            pass
+
         if shell_enabled:
             modes_display = ", ".join(shell_access_modes or ("direct",))
             shell_display = f"{modes_display}, {shell_name}" if shell_name else modes_display
 
             # Add working directory info
-            shell_runtime = getattr(shell_agent, "_shell_runtime", None)
             if shell_runtime:
                 working_dir = shell_runtime.working_directory()
                 try:
@@ -986,89 +1557,19 @@ async def get_enhanced_input(
 
     # Process special commands
 
-    def pre_process_input(text):
-        # Command processing
-        if text and text.startswith("/"):
-            if text == "/":
-                return ""
-            cmd_parts = text[1:].strip().split(maxsplit=1)
-            cmd = cmd_parts[0].lower()
-
-            if cmd == "help":
-                return "HELP"
-            elif cmd == "agents":
-                return "LIST_AGENTS"
-            elif cmd == "system":
-                return "SHOW_SYSTEM"
-            elif cmd == "usage":
-                return "SHOW_USAGE"
-            elif cmd == "history":
-                target_agent = None
-                if len(cmd_parts) > 1:
-                    candidate = cmd_parts[1].strip()
-                    if candidate:
-                        target_agent = candidate
-                return {"show_history": {"agent": target_agent}}
-            elif cmd == "clear":
-                target_agent = None
-                if len(cmd_parts) > 1:
-                    remainder = cmd_parts[1].strip()
-                    if remainder:
-                        tokens = remainder.split(maxsplit=1)
-                        if tokens and tokens[0].lower() == "last":
-                            if len(tokens) > 1:
-                                candidate = tokens[1].strip()
-                                if candidate:
-                                    target_agent = candidate
-                            return {"clear_last": {"agent": target_agent}}
-                        target_agent = remainder
-                return {"clear_history": {"agent": target_agent}}
-            elif cmd == "markdown":
-                return "MARKDOWN"
-            elif cmd in ("save_history", "save"):
-                # Return a structured action for the interactive loop to handle
-                # Prefer programmatic saving via HistoryExporter; fall back to magic-string there if needed
-                filename = (
-                    cmd_parts[1].strip() if len(cmd_parts) > 1 and cmd_parts[1].strip() else None
-                )
-                return {"save_history": True, "filename": filename}
-            elif cmd in ("mcpstatus", "mcp"):
-                return {"show_mcp_status": True}
-            elif cmd == "prompt":
-                # Handle /prompt with no arguments as interactive mode
-                if len(cmd_parts) > 1:
-                    # Direct prompt selection with name or number
-                    prompt_arg = cmd_parts[1].strip()
-                    # Check if it's a number (use as index) or a name (use directly)
-                    if prompt_arg.isdigit():
-                        return {"select_prompt": True, "prompt_index": int(prompt_arg)}
-                    else:
-                        return f"SELECT_PROMPT:{prompt_arg}"
-                else:
-                    # If /prompt is used without arguments, show interactive selection
-                    return {"select_prompt": True, "prompt_name": None}
-            elif cmd == "tools":
-                # Return a dictionary with list_tools action
-                return {"list_tools": True}
-            elif cmd == "skills":
-                return {"list_skills": True}
-            elif cmd == "exit":
-                return "EXIT"
-            elif cmd.lower() == "stop":
-                return "STOP"
-
-        # Agent switching
-        if text and text.startswith("@"):
-            return f"SWITCH:{text[1:].strip()}"
-
-        # Remove the # command handling completely
-
-        return text
+    # Determine what to use as the buffer's initial content:
+    # - pre_populate_buffer takes priority (one-off, for # command results)
+    # - otherwise use the default parameter
+    buffer_default = pre_populate_buffer if pre_populate_buffer else default
 
     # Get the input - using async version
     try:
-        result = await session.prompt_async(HTML(prompt_text), default=default)
-        return pre_process_input(result)
+        result = await session.prompt_async(HTML(prompt_text), default=buffer_default)
+        # Echo slash command input since erase_when_done clears it
+        stripped = result.lstrip()
+        if stripped.startswith("/"):
+            rich_print(f"[dim]{agent_name} ❯ {stripped.splitlines()[0]}[/dim]")
+        return parse_special_input(result)
     except KeyboardInterrupt:
         # Handle Ctrl+C gracefully
         return "STOP"
@@ -1088,11 +1589,11 @@ async def get_enhanced_input(
 
 async def get_selection_input(
     prompt_text: str,
-    options: List[str] = None,
-    default: str = None,
+    options: list[str] | None = None,
+    default: str | None = None,
     allow_cancel: bool = True,
     complete_options: bool = True,
-) -> Optional[str]:
+) -> str | None:
     """
     Display a selection prompt and return the user's selection.
 
@@ -1135,9 +1636,9 @@ async def get_selection_input(
 
 async def get_argument_input(
     arg_name: str,
-    description: str = None,
+    description: str | None = None,
     required: bool = True,
-) -> Optional[str]:
+) -> str | None:
     """
     Prompt for an argument value with formatting and help text.
 
@@ -1184,8 +1685,8 @@ async def get_argument_input(
 
 
 async def handle_special_commands(
-    command: Any, agent_app: "AgentApp | None" = None
-) -> bool | Dict[str, Any]:
+    command: str | CommandPayload | None, agent_app: "AgentApp | bool | None" = None
+) -> bool | CommandPayload:
     """
     Handle special input commands.
 
@@ -1200,12 +1701,11 @@ async def handle_special_commands(
     if not command:
         return False
 
-    # If command is already a dictionary, it has been pre-processed
-    # Just return it directly (like when /prompts converts to select_prompt dict)
-    if isinstance(command, dict):
-        return command
+    # If command is already a command payload, it has been pre-processed.
+    if is_command_payload(command):
+        return cast("CommandPayload", command)
 
-    global agent_histories
+    global agent_histories, available_agents
 
     # Check for special string commands
     if command == "HELP":
@@ -1215,17 +1715,30 @@ async def handle_special_commands(
         rich_print("  /system        - Show the current system prompt")
         rich_print("  /prompt <name> - Apply a specific prompt by name")
         rich_print("  /usage         - Show current usage statistics")
-        rich_print("  /skills        - List local skills for the active agent")
+        rich_print("  /skills        - List local skills for the manager directory")
+        rich_print("  /skills add    - Install a skill from the marketplace")
+        rich_print("  /skills remove - Remove a skill from the manager directory")
         rich_print("  /history [agent_name] - Show chat history overview")
         rich_print("  /clear [agent_name]   - Clear conversation history (keeps templates)")
         rich_print("  /clear last [agent_name] - Remove the most recent message from history")
         rich_print("  /markdown      - Show last assistant message without markdown formatting")
         rich_print("  /mcpstatus     - Show MCP server status summary for the active agent")
-        rich_print("  /save_history <filename> - Save current chat history to a file")
+        rich_print("  /save_history [filename] - Save current chat history to a file")
         rich_print(
             "      [dim]Tip: Use a .json extension for MCP-compatible JSON; any other extension saves Markdown.[/dim]"
         )
+        rich_print(
+            "      [dim]Default: Timestamped filename (e.g., 25_01_15_14_30-conversation.json)[/dim]"
+        )
+        rich_print("  /load_history <filename> - Load chat history from a file")
+        rich_print(
+            "  /card <filename> [--tool [remove]] - Load an AgentCard (attach/remove as tool)"
+        )
+        rich_print("  /agent <name> --tool [remove] - Attach/remove an agent as a tool")
+        rich_print("  /agent [name] --dump - Print an AgentCard to screen")
+        rich_print("  /reload        - Reload AgentCards from disk")
         rich_print("  @agent_name    - Switch to agent")
+        rich_print("  #agent_name <msg> - Send message to agent, return result to input buffer")
         rich_print("  STOP           - Return control back to the workflow")
         rich_print("  EXIT           - Exit fast-agent, terminating any running workflows")
         rich_print("\n[bold]Keyboard Shortcuts:[/bold]")
@@ -1243,6 +1756,12 @@ async def handle_special_commands(
         raise PromptExitError("User requested to exit fast-agent session")
 
     elif command == "LIST_AGENTS":
+        if agent_app and agent_app is not True:
+            try:
+                await agent_app.refresh_if_needed()
+                available_agents = set(agent_app.agent_names())
+            except Exception:
+                pass
         if available_agents:
             rich_print("\n[bold]Available Agents:[/bold]")
             for agent in sorted(available_agents):
@@ -1252,16 +1771,13 @@ async def handle_special_commands(
         return True
 
     elif command == "SHOW_USAGE":
-        # Return a dictionary to signal that usage should be shown
-        return {"show_usage": True}
+        return _show_usage_cmd()
 
     elif command == "SHOW_SYSTEM":
-        # Return a dictionary to signal that system prompt should be shown
-        return {"show_system": True}
+        return _show_system_cmd()
 
     elif command == "MARKDOWN":
-        # Return a dictionary to signal that markdown display should be shown
-        return {"show_markdown": True}
+        return _show_markdown_cmd()
 
     elif command == "SELECT_PROMPT" or (
         isinstance(command, str) and command.startswith("SELECT_PROMPT:")
@@ -1274,7 +1790,7 @@ async def handle_special_commands(
                 prompt_name = command.split(":", 1)[1].strip()
 
             # Return a dictionary with a select_prompt action to be handled by the caller
-            return {"select_prompt": True, "prompt_name": prompt_name}
+            return _select_prompt_cmd(None, prompt_name)
         else:
             rich_print(
                 "[yellow]Prompt selection is not available outside of an agent context[/yellow]"
@@ -1286,7 +1802,7 @@ async def handle_special_commands(
         if agent_name in available_agents:
             if agent_app:
                 # The parameter can be the actual agent_app or just True to enable switching
-                return {"switch_agent": agent_name}
+                return _switch_agent_cmd(agent_name)
             else:
                 rich_print("[yellow]Agent switching not available in this context[/yellow]")
         else:

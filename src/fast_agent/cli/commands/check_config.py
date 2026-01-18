@@ -4,13 +4,14 @@ import platform
 import sys
 from importlib.metadata import version
 from pathlib import Path
-from typing import Optional
 
 import typer
 import yaml
 from rich.table import Table
 from rich.text import Text
 
+from fast_agent.cli.commands.go import DEFAULT_AGENT_CARDS_DIR, DEFAULT_TOOL_CARDS_DIR
+from fast_agent.core.agent_card_validation import scan_agent_card_directory
 from fast_agent.llm.provider_key_manager import API_KEY_HINT_TEXT, ProviderKeyManager
 from fast_agent.llm.provider_types import Provider
 from fast_agent.skills import SkillRegistry
@@ -22,7 +23,7 @@ app = typer.Typer(
 )
 
 
-def find_config_files(start_path: Path) -> dict[str, Optional[Path]]:
+def find_config_files(start_path: Path) -> dict[str, Path | None]:
     """Find FastAgent configuration files, preferring secrets file next to config file."""
     from fast_agent.config import find_fastagent_config_files
 
@@ -43,7 +44,7 @@ def get_system_info() -> dict:
     }
 
 
-def get_secrets_summary(secrets_path: Optional[Path]) -> dict:
+def get_secrets_summary(secrets_path: Path | None) -> dict:
     """Extract information from the secrets file."""
     result = {
         "status": "not_found",  # Default status: not found
@@ -83,7 +84,7 @@ def check_api_keys(secrets_summary: dict, config_summary: dict) -> dict:
     import os
 
     results = {
-        provider.value: {"env": "", "config": ""}
+        provider.config_name: {"env": "", "config": ""}
         for provider in Provider
         if provider != Provider.FAST_AGENT
     }
@@ -98,18 +99,18 @@ def check_api_keys(secrets_summary: dict, config_summary: dict) -> dict:
     if config and "azure" in config.get("config", {}):
         config_azure = config["config"]["azure"]
 
-    for provider in results:
+    for provider_name in results:
         # Always check environment variables first
-        env_key_name = ProviderKeyManager.get_env_key_name(provider)
+        env_key_name = ProviderKeyManager.get_env_key_name(provider_name)
         env_key_value = os.environ.get(env_key_name)
         if env_key_value:
             if len(env_key_value) > 5:
-                results[provider]["env"] = f"...{env_key_value[-5:]}"
+                results[provider_name]["env"] = f"...{env_key_value[-5:]}"
             else:
-                results[provider]["env"] = "...***"
+                results[provider_name]["env"] = "...***"
 
         # Special handling for Azure: support api_key and DefaultAzureCredential
-        if provider == "azure":
+        if provider_name == "azure":
             # Prefer secrets if present, else fallback to config
             azure_cfg = {}
             if secrets_status == "parsed" and "azure" in secrets:
@@ -120,17 +121,17 @@ def check_api_keys(secrets_summary: dict, config_summary: dict) -> dict:
             use_default_cred = azure_cfg.get("use_default_azure_credential", False)
             base_url = azure_cfg.get("base_url")
             if use_default_cred and base_url:
-                results[provider]["config"] = "DefaultAzureCredential"
+                results[provider_name]["config"] = "DefaultAzureCredential"
                 continue
 
         # Check secrets file if it was parsed successfully
         if secrets_status == "parsed":
-            config_key = ProviderKeyManager.get_config_file_key(provider, secrets)
+            config_key = ProviderKeyManager.get_config_file_key(provider_name, secrets)
             if config_key and config_key != API_KEY_HINT_TEXT:
                 if len(config_key) > 5:
-                    results[provider]["config"] = f"...{config_key[-5:]}"
+                    results[provider_name]["config"] = f"...{config_key[-5:]}"
                 else:
-                    results[provider]["config"] = "...***"
+                    results[provider_name]["config"] = "...***"
 
     return results
 
@@ -143,7 +144,7 @@ def get_fastagent_version() -> str:
         return "unknown"
 
 
-def get_config_summary(config_path: Optional[Path]) -> dict:
+def get_config_summary(config_path: Path | None) -> dict:
     """Extract key information from the configuration file."""
     from fast_agent.config import MCPTimelineSettings, Settings
 
@@ -170,7 +171,7 @@ def get_config_summary(config_path: Optional[Path]) -> dict:
             "step_seconds": default_settings.mcp_timeline.step_seconds,
         },
         "mcp_servers": [],
-        "skills_directory": None,
+        "skills_directories": None,
     }
 
     if not config_path:
@@ -278,14 +279,18 @@ def get_config_summary(config_path: Optional[Path]) -> dict:
                 if server_info["url"] and len(server_info["url"]) > 60:
                     server_info["url"] = server_info["url"][:57] + "..."
 
-                result["mcp_servers"].append(server_info)
+                mcp_servers = result["mcp_servers"]
+                assert isinstance(mcp_servers, list)
+                mcp_servers.append(server_info)
 
         # Skills directory override
         skills_cfg = config.get("skills") if isinstance(config, dict) else None
         if isinstance(skills_cfg, dict):
-            directory_value = skills_cfg.get("directory")
-            if isinstance(directory_value, str) and directory_value.strip():
-                result["skills_directory"] = directory_value.strip()
+            directory_value = skills_cfg.get("directories")
+            if isinstance(directory_value, list):
+                cleaned = [str(value).strip() for value in directory_value if str(value).strip()]
+                if cleaned:
+                    result["skills_directories"] = cleaned
 
     except Exception as e:
         # File exists but has parse errors
@@ -403,10 +408,19 @@ def show_check_summary() -> None:
         except ValueError:
             return str(path)
 
-    skills_override = config_summary.get("skills_directory")
-    override_directory = Path(skills_override).expanduser() if skills_override else None
-    skills_registry = SkillRegistry(base_dir=cwd, override_directory=override_directory)
-    skills_dir = skills_registry.directory
+    def _truncate(text: str, length: int = 70) -> str:
+        if len(text) <= length:
+            return text
+        return text[: length - 3] + "..."
+
+    skills_override = config_summary.get("skills_directories")
+    override_directories = (
+        [Path(entry).expanduser() for entry in skills_override]
+        if isinstance(skills_override, list)
+        else None
+    )
+    skills_registry = SkillRegistry(base_dir=cwd, directories=override_directories)
+    skills_dirs = skills_registry.directories
     skills_manifests, skill_errors = skills_registry.load_manifests_with_errors()
 
     # Logger Settings panel with two-column layout
@@ -635,8 +649,13 @@ def show_check_summary() -> None:
             console.print(servers_table)
 
     _print_section_header("Agent Skills", color="blue")
-    if skills_dir:
-        console.print(f"Directory: [green]{_relative_path(skills_dir)}[/green]")
+    if skills_dirs:
+        if len(skills_dirs) == 1:
+            console.print(f"Directory: [green]{_relative_path(skills_dirs[0])}[/green]")
+        else:
+            console.print("Directories:")
+            for directory in skills_dirs:
+                console.print(f"- [green]{_relative_path(directory)}[/green]")
 
         if skills_manifests or skill_errors:
             skills_table = Table(show_header=True, box=None)
@@ -645,17 +664,8 @@ def show_check_summary() -> None:
             skills_table.add_column("Source", style="dim", header_style="bold bright_white")
             skills_table.add_column("Status", style="green", header_style="bold bright_white")
 
-            def _truncate(text: str, length: int = 70) -> str:
-                if len(text) <= length:
-                    return text
-                return text[: length - 3] + "..."
-
             for manifest in skills_manifests:
-                try:
-                    relative_source = manifest.path.parent.relative_to(skills_dir)
-                    source_display = str(relative_source) if relative_source != Path(".") else "."
-                except ValueError:
-                    source_display = _relative_path(manifest.path.parent)
+                source_display = _relative_path(manifest.path.parent)
 
                 skills_table.add_row(
                     manifest.name,
@@ -669,11 +679,7 @@ def show_check_summary() -> None:
                 source_display = "[dim]n/a[/dim]"
                 if error_path_str:
                     error_path = Path(error_path_str)
-                    try:
-                        relative_error = error_path.parent.relative_to(skills_dir)
-                        source_display = str(relative_error) if relative_error != Path(".") else "."
-                    except ValueError:
-                        source_display = _relative_path(error_path.parent)
+                    source_display = _relative_path(error_path.parent)
                 message = error.get("error", "Failed to parse skill manifest")
                 skills_table.add_row(
                     "[red]—[/red]",
@@ -684,19 +690,70 @@ def show_check_summary() -> None:
 
             console.print(skills_table)
         else:
-            console.print("[yellow]No skills found in the directory[/yellow]")
+            console.print("[yellow]No skills found in the configured directories[/yellow]")
     else:
-        if skills_registry.override_failed and override_directory:
-            console.print(
-                f"[red]Override directory not found:[/red] {_relative_path(override_directory)}"
+        console.print(
+            "[dim]Agent Skills not configured. Go to https://fast-agent.ai/agents/skills/[/dim]"
+        )
+
+    server_names: set[str] | None = None
+    if config_summary.get("status") == "parsed":
+        mcp_servers = config_summary.get("mcp_servers", [])
+        if isinstance(mcp_servers, list):
+            server_names = {
+                server.get("name", "")
+                for server in mcp_servers
+                if isinstance(server, dict) and server.get("name")
+            }
+
+    _print_section_header("Agent Cards", color="blue")
+    card_directories = [
+        ("Agent Cards", DEFAULT_AGENT_CARDS_DIR),
+        ("Tool Cards", DEFAULT_TOOL_CARDS_DIR),
+    ]
+    found_card_dir = False
+    for label, directory in card_directories:
+        if not directory.is_dir():
+            continue
+        found_card_dir = True
+        console.print(f"{label} Directory: [green]{_relative_path(directory)}[/green]")
+
+        entries = scan_agent_card_directory(directory, server_names=server_names)
+        if not entries:
+            console.print("[yellow]No AgentCards found in this directory[/yellow]")
+            continue
+
+        cards_table = Table(show_header=True, box=None)
+        cards_table.add_column("Name", style="cyan", header_style="bold bright_white")
+        cards_table.add_column("Type", style="white", header_style="bold bright_white")
+        cards_table.add_column("Source", style="dim", header_style="bold bright_white")
+        cards_table.add_column("Status", style="green", header_style="bold bright_white")
+
+        for entry in entries:
+            error_messages = entry.errors
+            if entry.ignored_reason:
+                status = f"[dim]ignored - {entry.ignored_reason}[/dim]"
+            elif error_messages:
+                error_text = _truncate(error_messages[0], 60)
+                if len(error_messages) > 1:
+                    error_text = f"{error_text} (+{len(error_messages) - 1} more)"
+                status = f"[red]{error_text}[/red]"
+            else:
+                status = "[green]ok[/green]"
+
+            cards_table.add_row(
+                entry.name,
+                entry.type,
+                _relative_path(entry.path),
+                status,
             )
-            console.print(
-                "[yellow]Default folders were not loaded because the override failed[/yellow]"
-            )
-        else:
-            console.print(
-                "[dim]Agent Skills not configured. Go to https://fast-agent.ai/agents/skills/[/dim]"
-            )
+
+        console.print(cards_table)
+
+    if not found_card_dir:
+        console.print(
+            "[dim]No local AgentCard directories found (.fast-agent/agent-cards or .fast-agent/tool-cards).[/dim]"
+        )
 
     # Show help tips
     if config_status == "not_found" or secrets_status == "not_found":
@@ -717,7 +774,7 @@ def show_check_summary() -> None:
         console.print("1. Add keys to fastagent.secrets.yaml")
         env_vars = ", ".join(
             [
-                ProviderKeyManager.get_env_key_name(p.value)
+                ProviderKeyManager.get_env_key_name(p.config_name)
                 for p in Provider
                 if p != Provider.FAST_AGENT
             ]
@@ -727,7 +784,7 @@ def show_check_summary() -> None:
 
 @app.command()
 def show(
-    path: Optional[str] = typer.Argument(None, help="Path to configuration file to display"),
+    path: str | None = typer.Argument(None, help="Path to configuration file to display"),
     secrets: bool = typer.Option(
         False, "--secrets", "-s", help="Show secrets file instead of config"
     ),

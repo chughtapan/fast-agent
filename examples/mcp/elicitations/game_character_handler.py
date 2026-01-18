@@ -8,7 +8,7 @@ visual gauges, and animated effects.
 
 import asyncio
 import random
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any
 
 from mcp.shared.context import RequestContext
 from mcp.types import ElicitRequestParams, ElicitResult
@@ -33,9 +33,10 @@ async def game_character_elicitation_handler(
     """Custom handler that creates an interactive character creation experience."""
     logger.info(f"Game character elicitation handler called: {params.message}")
 
-    if params.requestedSchema:
-        properties = params.requestedSchema.get("properties", {})
-        content: Dict[str, Any] = {}
+    requested_schema = getattr(params, "requestedSchema", None)
+    if requested_schema:
+        properties = requested_schema.get("properties", {})
+        content: dict[str, Any] = {}
 
         console.print("\n[bold magenta]🎮 Character Creation Studio 🎮[/bold magenta]\n")
 

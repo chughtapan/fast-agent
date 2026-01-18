@@ -5,16 +5,15 @@ import logging
 import shlex
 import sys
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 
 import typer
 
-from fast_agent import FastAgent
-from fast_agent.agents.llm_agent import LlmAgent
 from fast_agent.cli.commands.server_helpers import add_servers_to_config, generate_server_name
 from fast_agent.cli.commands.url_parser import generate_server_configs, parse_server_urls
 from fast_agent.constants import DEFAULT_AGENT_INSTRUCTION
-from fast_agent.ui.console_display import ConsoleDisplay
+from fast_agent.core.exceptions import AgentConfigError
+from fast_agent.utils.async_utils import configure_uvloop, create_event_loop, ensure_event_loop
 
 app = typer.Typer(
     help="Run an interactive agent directly from the command line without creating an agent.py file",
@@ -22,6 +21,33 @@ app = typer.Typer(
 )
 
 default_instruction = DEFAULT_AGENT_INSTRUCTION
+
+CARD_EXTENSIONS = {".md", ".markdown", ".yaml", ".yml"}
+DEFAULT_AGENT_CARDS_DIR = Path(".fast-agent/agent-cards")
+DEFAULT_TOOL_CARDS_DIR = Path(".fast-agent/tool-cards")
+
+
+def _merge_card_sources(
+    sources: list[str] | None,
+    default_dir: Path,
+) -> list[str] | None:
+    merged: list[str] = []
+    seen: set[str] = set()
+    if sources:
+        for entry in sources:
+            if entry not in seen:
+                merged.append(entry)
+                seen.add(entry)
+    if default_dir.is_dir():
+        has_cards = any(
+            entry.is_file() and entry.suffix.lower() in CARD_EXTENSIONS
+            for entry in default_dir.iterdir()
+        )
+        if has_cards:
+            default_entry = str(default_dir)
+            if default_entry not in seen:
+                merged.append(default_entry)
+    return merged or None
 
 
 def resolve_instruction_option(instruction: str | None) -> tuple[str, str]:
@@ -109,11 +135,13 @@ async def _run_agent(
     instruction: str = default_instruction,
     config_path: str | None = None,
     server_list: list[str] | None = None,
+    agent_cards: list[str] | None = None,
+    card_tools: list[str] | None = None,
     model: str | None = None,
     message: str | None = None,
     prompt_file: str | None = None,
-    url_servers: dict[str, dict[str, str]] | None = None,
-    stdio_servers: dict[str, dict[str, str]] | None = None,
+    url_servers: dict[str, dict[str, Any]] | None = None,
+    stdio_servers: dict[str, dict[str, Any]] | None = None,
     agent_name: str | None = "agent",
     skills_directory: Path | None = None,
     shell_runtime: bool = False,
@@ -123,35 +151,130 @@ async def _run_agent(
     port: int = 8000,
     tool_description: str | None = None,
     instance_scope: str = "shared",
+    permissions_enabled: bool = True,
+    reload: bool = False,
+    watch: bool = False,
 ) -> None:
     """Async implementation to run an interactive agent."""
+    if mode == "serve" and transport in ["stdio", "acp"]:
+        from fast_agent.ui.console import configure_console_stream
+
+        configure_console_stream("stderr")
+
+    from fast_agent import FastAgent
+    from fast_agent.agents.llm_agent import LlmAgent
     from fast_agent.mcp.prompts.prompt_load import load_prompt
+    from fast_agent.ui.console_display import ConsoleDisplay
 
     # Create the FastAgent instance
 
-    fast_kwargs = {
-        "name": name,
-        "config_path": config_path,
-        "ignore_unknown_args": True,
-        "parse_cli_args": False,  # Don't parse CLI args, we're handling it ourselves
-    }
-    if mode == "serve":
-        fast_kwargs["quiet"] = True
-    if skills_directory is not None:
-        fast_kwargs["skills_directory"] = skills_directory
+    fast = FastAgent(
+        name=name,
+        config_path=config_path,
+        ignore_unknown_args=True,
+        parse_cli_args=False,  # Don't parse CLI args, we're handling it ourselves
+        quiet=mode == "serve",
+        skills_directory=skills_directory,
+    )
 
-    fast = FastAgent(**fast_kwargs)
+    # Set model on args so model source detection works correctly
+    if model:
+        fast.args.model = model
+    fast.args.reload = reload
+    fast.args.watch = watch
+    fast.args.agent = agent_name or "agent"
 
     if shell_runtime:
         await fast.app.initialize()
         setattr(fast.app.context, "shell_runtime", True)
 
     # Add all dynamic servers to the configuration
-    await add_servers_to_config(fast, url_servers)
-    await add_servers_to_config(fast, stdio_servers)
+    if url_servers:
+        await add_servers_to_config(fast, cast("dict[str, dict[str, Any]]", url_servers))
+    if stdio_servers:
+        await add_servers_to_config(fast, cast("dict[str, dict[str, Any]]", stdio_servers))
 
+    if agent_cards or card_tools:
+        try:
+            if agent_cards:
+                for card_source in agent_cards:
+                    if card_source.startswith(("http://", "https://")):
+                        fast.load_agents_from_url(card_source)
+                    else:
+                        fast.load_agents(card_source)
+
+            # Check if any loaded agent card has default: true
+            has_explicit_default = False
+            for agent_data in fast.agents.values():
+                config = agent_data.get("config")
+                if config and getattr(config, "default", False):
+                    has_explicit_default = True
+                    break
+
+            # If no explicit default, create a fallback "agent" as the default
+            # This must happen BEFORE loading card_tools so "agent" exists for attachment
+            if not has_explicit_default:
+
+                @fast.agent(
+                    name="agent",
+                    instruction=instruction,
+                    servers=server_list or [],
+                    model=model,
+                    default=True,
+                )
+                async def default_fallback_agent():
+                    pass
+
+            tool_loaded_names: list[str] = []
+            if card_tools:
+                for card_source in card_tools:
+                    if card_source.startswith(("http://", "https://")):
+                        tool_loaded_names.extend(fast.load_agents_from_url(card_source))
+                    else:
+                        tool_loaded_names.extend(fast.load_agents(card_source))
+
+            if tool_loaded_names:
+                target_name = agent_name or "agent"
+                if target_name not in fast.agents:
+                    target_name = next(iter(fast.agents.keys()), None)
+                if target_name:
+                    fast.attach_agent_tools(target_name, tool_loaded_names)
+        except AgentConfigError as exc:
+            fast._handle_error(exc)
+            raise typer.Exit(1) from exc
+
+        # Add CLI servers (--url, --servers, etc.) to the default agent
+        if server_list:
+            default_agent_data = None
+            for agent_data in fast.agents.values():
+                config = agent_data.get("config")
+                if config and getattr(config, "default", False):
+                    default_agent_data = agent_data
+                    break
+            # If no explicit default, use the first agent
+            if default_agent_data is None and fast.agents:
+                default_agent_data = next(iter(fast.agents.values()))
+            if default_agent_data:
+                config = default_agent_data.get("config")
+                if config:
+                    existing = list(config.servers) if config.servers else []
+                    config.servers = existing + [s for s in server_list if s not in existing]
+
+        async def cli_agent():
+            async with fast.run() as agent:
+                if message:
+                    response = await agent.send(message)
+                    print(response)
+                elif prompt_file:
+                    prompt = load_prompt(Path(prompt_file))
+                    agent_obj = agent._agent(None)
+                    await agent_obj.generate(prompt)
+                    print(f"\nLoaded {len(prompt)} messages from prompt file '{prompt_file}'")
+                    await agent.interactive()
+                else:
+                    await agent.interactive()
     # Check if we have multiple models (comma-delimited)
-    if model and "," in model:
+    elif model and "," in model:
         # Parse multiple models
         models = [m.strip() for m in model.split(",") if m.strip()]
 
@@ -161,12 +284,12 @@ async def _run_agent(
             agent_name = f"{model_name}"
 
             # Define the agent with specified parameters
-            agent_kwargs = {"instruction": instruction, "name": agent_name}
-            if server_list:
-                agent_kwargs["servers"] = server_list
-            agent_kwargs["model"] = model_name
-
-            @fast.agent(**agent_kwargs)
+            @fast.agent(
+                name=agent_name,
+                instruction=instruction,
+                servers=server_list or [],
+                model=model_name,
+            )
             async def model_agent():
                 pass
 
@@ -195,6 +318,7 @@ async def _run_agent(
             fan_out=fan_out_agents,
             fan_in="aggregate",
             include_request=True,
+            default=True,
         )
         async def cli_agent():
             async with fast.run() as agent:
@@ -208,19 +332,17 @@ async def _run_agent(
                     display = ConsoleDisplay(config=None)
                     display.show_parallel_results(agent.parallel)
                 else:
-                    await agent.interactive(agent_name="parallel", pretty_print_parallel=True)
+                    await agent.interactive(pretty_print_parallel=True)
     else:
         # Single model - use original behavior
         # Define the agent with specified parameters
-        agent_kwargs = {"instruction": instruction}
-        if agent_name:
-            agent_kwargs["name"] = agent_name
-        if server_list:
-            agent_kwargs["servers"] = server_list
-        if model:
-            agent_kwargs["model"] = model
-
-        @fast.agent(**agent_kwargs)
+        @fast.agent(
+            name=agent_name or "agent",
+            instruction=instruction,
+            servers=server_list or [],
+            model=model,
+            default=True,
+        )
         async def cli_agent():
             async with fast.run() as agent:
                 if message:
@@ -243,6 +365,7 @@ async def _run_agent(
             port=port,
             tool_description=tool_description,
             instance_scope=instance_scope,
+            permissions_enabled=permissions_enabled,
         )
     else:
         await cli_agent()
@@ -255,6 +378,8 @@ def run_async_agent(
     servers: str | None = None,
     urls: str | None = None,
     auth: str | None = None,
+    agent_cards: list[str] | None = None,
+    card_tools: list[str] | None = None,
     model: str | None = None,
     message: str | None = None,
     prompt_file: str | None = None,
@@ -268,8 +393,12 @@ def run_async_agent(
     port: int = 8000,
     tool_description: str | None = None,
     instance_scope: str = "shared",
+    permissions_enabled: bool = True,
+    reload: bool = False,
+    watch: bool = False,
 ):
     """Run the async agent function with proper loop handling."""
+    configure_uvloop()
     server_list = servers.split(",") if servers else None
 
     # Parse URLs and generate server configurations if provided
@@ -285,8 +414,8 @@ def run_async_agent(
                 # Merge both lists
                 server_list.extend(list(url_servers.keys()))
         except ValueError as e:
-            print(f"Error parsing URLs: {e}")
-            return
+            print(f"Error parsing URLs: {e}", file=sys.stderr)
+            sys.exit(1)
 
     # Generate STDIO server configurations if provided
     stdio_servers = None
@@ -298,7 +427,7 @@ def run_async_agent(
             try:
                 parsed_command = shlex.split(stdio_cmd)
                 if not parsed_command:
-                    print(f"Error: Empty stdio command: {stdio_cmd}")
+                    print(f"Error: Empty stdio command: {stdio_cmd}", file=sys.stderr)
                     continue
 
                 command = parsed_command[0]
@@ -339,24 +468,21 @@ def run_async_agent(
                     server_list.append(server_name)
 
             except ValueError as e:
-                print(f"Error parsing stdio command '{stdio_cmd}': {e}")
+                print(f"Error parsing stdio command '{stdio_cmd}': {e}", file=sys.stderr)
                 continue
 
-    # Check if we're already in an event loop
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # We're inside a running event loop, so we can't use asyncio.run
-            # Instead, create a new loop
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        _set_asyncio_exception_handler(loop)
-    except RuntimeError:
-        # No event loop exists, so we'll create one
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        _set_asyncio_exception_handler(loop)
+    agent_cards = _merge_card_sources(agent_cards, DEFAULT_AGENT_CARDS_DIR)
+    card_tools = _merge_card_sources(card_tools, DEFAULT_TOOL_CARDS_DIR)
 
+    # Check if we're already in an event loop
+    loop = ensure_event_loop()
+    if loop.is_running():
+        # We're inside a running event loop, so we can't use asyncio.run
+        # Instead, create a new loop
+        loop = create_event_loop()
+    _set_asyncio_exception_handler(loop)
+
+    exit_code: int | None = None
     try:
         loop.run_until_complete(
             _run_agent(
@@ -364,6 +490,8 @@ def run_async_agent(
                 instruction=instruction,
                 config_path=config_path,
                 server_list=server_list,
+                agent_cards=agent_cards,
+                card_tools=card_tools,
                 model=model,
                 message=message,
                 prompt_file=prompt_file,
@@ -378,8 +506,13 @@ def run_async_agent(
                 port=port,
                 tool_description=tool_description,
                 instance_scope=instance_scope,
+                permissions_enabled=permissions_enabled,
+                reload=reload,
+                watch=watch,
             )
         )
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else None
     finally:
         try:
             # Clean up the loop
@@ -395,6 +528,9 @@ def run_async_agent(
         except Exception:
             pass
 
+    if exit_code not in (None, 0):
+        raise SystemExit(exit_code)
+
 
 @app.callback(invoke_without_command=True, no_args_is_help=False)
 def go(
@@ -406,6 +542,17 @@ def go(
     config_path: str | None = typer.Option(None, "--config-path", "-c", help="Path to config file"),
     servers: str | None = typer.Option(
         None, "--servers", help="Comma-separated list of server names to enable from config"
+    ),
+    agent_cards: list[str] | None = typer.Option(
+        None,
+        "--agent-cards",
+        "--card",
+        help="Path or URL to an AgentCard file or directory (repeatable)",
+    ),
+    card_tools: list[str] | None = typer.Option(
+        None,
+        "--card-tool",
+        help="Path or URL to an AgentCard file or directory to load as tools (repeatable)",
     ),
     urls: str | None = typer.Option(
         None, "--url", help="Comma-separated list of HTTP/SSE URLs to connect to"
@@ -443,6 +590,8 @@ def go(
         "-x",
         help="Enable a local shell runtime and expose the execute tool (bash or pwsh).",
     ),
+    reload: bool = typer.Option(False, "--reload", help="Enable manual AgentCard reloads (/reload)"),
+    watch: bool = typer.Option(False, "--watch", help="Watch AgentCard paths and reload"),
 ) -> None:
     """
     Run an interactive agent directly from the command line.
@@ -452,6 +601,7 @@ def go(
         fast-agent go --instruction=https://raw.githubusercontent.com/user/repo/prompt.md
         fast-agent go --message="What is the weather today?" --model=haiku
         fast-agent go --prompt-file=my-prompt.txt --model=haiku
+        fast-agent go --agent-cards ./agents --watch
         fast-agent go --url=http://localhost:8001/mcp,http://api.example.com/sse
         fast-agent go --url=https://api.example.com/mcp --auth=YOUR_API_TOKEN
         fast-agent go --npx "@modelcontextprotocol/server-filesystem /path/to/data"
@@ -472,11 +622,15 @@ def go(
         --auth                Bearer token for authorization with URL-based servers
         --message, -m         Send a single message and exit
         --prompt-file, -p     Use a prompt file instead of interactive mode
+        --agent-cards         Load AgentCards from a file or directory
+        --card-tool           Load AgentCards and attach them as tools to the default agent
         --skills              Override the default skills folder
         --shell, -x           Enable local shell runtime
         --npx                 NPX package and args to run as MCP server (quoted)
         --uvx                 UVX package and args to run as MCP server (quoted)
         --stdio               Command to run as STDIO MCP server (quoted)
+        --reload              Enable manual AgentCard reloads (/reload)
+        --watch               Watch AgentCard paths and reload
     """
     # Collect all stdio commands from convenience options
     stdio_commands = collect_stdio_commands(npx, uvx, stdio)
@@ -492,6 +646,8 @@ def go(
         instruction=resolved_instruction,
         config_path=config_path,
         servers=servers,
+        agent_cards=agent_cards,
+        card_tools=card_tools,
         urls=urls,
         auth=auth,
         model=model,
@@ -502,4 +658,6 @@ def go(
         skills_directory=skills_dir,
         shell_enabled=shell_enabled,
         instance_scope="shared",
+        reload=reload,
+        watch=watch,
     )

@@ -16,23 +16,33 @@ from fast_agent.constants import (
     FAST_AGENT_ERROR_CHANNEL,
     FAST_AGENT_REMOVED_METADATA_CHANNEL,
 )
+from fast_agent.interfaces import FastAgentLLMProtocol
 from fast_agent.llm.provider_types import Provider
 from fast_agent.types import PromptMessageExtended, text_content
 
 
-class RecordingStubLLM:
+class RecordingStubLLM(FastAgentLLMProtocol):
     """Minimal FastAgentLLMProtocol implementation for testing."""
 
     def __init__(self, model_name: str = "passthrough") -> None:
-        self.model_name = model_name
-        self.provider = Provider.FAST_AGENT
+        self._model_name = model_name
+        self._provider = Provider.FAST_AGENT
         self.generated_messages: list[PromptMessageExtended] | None = None
         self._message_history: list[PromptMessageExtended] = []
-        self.usage_accumulator = None
+
+    #        self.usage_accumulator = None
+
+    @property
+    def model_name(self) -> str | None:
+        return self._model_name
+
+    @property
+    def provider(self) -> Provider:
+        return self._provider
 
     async def generate(self, messages, request_params=None, tools=None):
         self.generated_messages = messages
-        self._message_history.extend(messages)
+        self._message_history = messages
         return PromptMessageExtended(
             role="assistant",
             content=[TextContent(type="text", text="ok")],
@@ -56,7 +66,10 @@ class RecordingStubLLM:
     def model_info(self):
         from fast_agent.llm.model_info import ModelInfo
 
-        return ModelInfo.from_name(self.model_name, self.provider)
+        model_name = self.model_name
+        if model_name is None:
+            return None
+        return ModelInfo.from_name(model_name, self.provider)
 
 
 def make_decorator(model_name: str = "passthrough") -> tuple[LlmDecorator, RecordingStubLLM]:
@@ -102,9 +115,12 @@ async def test_sanitizes_image_content_for_text_only_model():
 
     assert stub.generated_messages is not None
     sent_message = stub.generated_messages[0]
+    # Only original text block remains - no placeholder since some content was kept
     assert len(sent_message.content) == 1
     assert isinstance(sent_message.content[0], TextContent)
+    assert sent_message.content[0].text == "Hello"
 
+    # Removed content should be in error channel
     channels = sent_message.channels or {}
     assert FAST_AGENT_ERROR_CHANNEL in channels
     error_entries = channels[FAST_AGENT_ERROR_CHANNEL]
@@ -140,9 +156,15 @@ async def test_removes_unsupported_tool_result_content():
 
     assert stub.generated_messages is not None
     sent_message = stub.generated_messages[0]
+    assert sent_message.tool_results is not None
     sanitized_result = sent_message.tool_results["tool1"]
-    assert sanitized_result.content == []
+    # Should have placeholder text since all content was removed
+    assert len(sanitized_result.content) == 1
+    assert isinstance(sanitized_result.content[0], TextContent)
+    assert "document" in sanitized_result.content[0].text.lower()
+    assert "removed" in sanitized_result.content[0].text.lower()
 
+    # Detailed info (including mime type) is in the error channel
     channels = sent_message.channels or {}
     error_entries = channels[FAST_AGENT_ERROR_CHANNEL]
     assert isinstance(error_entries[0], TextContent)
@@ -166,9 +188,7 @@ async def test_metadata_clears_when_supported_content_only():
     channels = (stub.generated_messages or [])[0].channels or {}
     assert FAST_AGENT_REMOVED_METADATA_CHANNEL in channels
 
-    second_message = PromptMessageExtended(
-        role="user", content=[text_content("Next turn")]
-    )
+    second_message = PromptMessageExtended(role="user", content=[text_content("Next turn")])
     await decorator.generate_impl([second_message])
 
     assert stub.generated_messages is not None

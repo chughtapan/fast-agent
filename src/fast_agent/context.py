@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-import asyncio
-import concurrent.futures
 import logging
 import uuid
+from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
 # from opentelemetry.instrumentation.anthropic import AnthropicInstrumentor
-# from opentelemetry.instrumentation.mcp import McpInstrumentor
 from opentelemetry.propagate import set_global_textmap
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -27,12 +25,15 @@ from fast_agent.core.logging.logger import LoggingConfig, get_logger
 from fast_agent.core.logging.transport import create_transport
 from fast_agent.mcp_server_registry import ServerRegistry
 from fast_agent.skills import SkillRegistry
+from fast_agent.utils.async_utils import run_sync
 
 if TYPE_CHECKING:
+    from fast_agent.acp.acp_context import ACPContext
     from fast_agent.core.executor.workflow_signal import SignalWaitCallback
     from fast_agent.mcp.mcp_connection_manager import MCPConnectionManager
 else:
     # Runtime placeholders for the types
+    ACPContext = Any
     SignalWaitCallback = Any
     MCPConnectionManager = Any
 
@@ -49,18 +50,22 @@ class Context(BaseModel):
     This is a global context that is shared across the application.
     """
 
-    config: Optional[Settings] = None
-    executor: Optional[Executor] = None
-    human_input_handler: Optional[Any] = None
-    signal_notification: Optional[SignalWaitCallback] = None
+    config: Settings | None = None
+    executor: Executor | None = None
+    human_input_handler: Any | None = None
+    signal_notification: SignalWaitCallback | None = None
 
     # Registries
-    server_registry: Optional[ServerRegistry] = None
-    task_registry: Optional[ActivityRegistry] = None
-    skill_registry: Optional[SkillRegistry] = None
+    server_registry: ServerRegistry | None = None
+    task_registry: ActivityRegistry | None = None
+    skill_registry: SkillRegistry | None = None
 
     tracer: trace.Tracer | None = None
     _connection_manager: "MCPConnectionManager | None" = None
+
+    # ACP context - set when running in ACP mode
+    # Provides agents access to ACP capabilities (mode switching, commands, etc.)
+    acp: "ACPContext | None" = None
 
     model_config = ConfigDict(
         extra="allow",
@@ -132,7 +137,7 @@ async def configure_otel(config: "Settings") -> None:
         pass
 
 
-#    McpInstrumentor().instrument()
+#   McpInstrumentor().instrument()
 
 
 async def configure_logger(config: "Settings") -> None:
@@ -176,14 +181,6 @@ async def configure_logger(config: "Settings") -> None:
     )
 
 
-async def configure_usage_telemetry(_config: "Settings") -> None:
-    """
-    Configure usage telemetry based on the application config.
-    TODO: saqadri - implement usage tracking
-    """
-    pass
-
-
 async def configure_executor(config: "Settings"):
     """
     Configure the executor based on the application config.
@@ -192,33 +189,35 @@ async def configure_executor(config: "Settings"):
 
 
 async def initialize_context(
-    config: Optional[Union["Settings", str]] = None, store_globally: bool = False
+    config: Settings | str | PathLike[str] | None = None, store_globally: bool = False
 ):
     """
     Initialize the global application context.
     """
     if config is None:
         config = get_settings()
-    elif isinstance(config, str):
-        config = get_settings(config_path=config)
+    elif isinstance(config, (str, PathLike)):
+        # Accept pathlib.Path and other path-like objects for convenience in tests
+        config = get_settings(config_path=str(config))
 
     context = Context()
     context.config = config
     context.server_registry = ServerRegistry(config=config)
 
     skills_settings = getattr(config, "skills", None)
-    override_directory = None
-    if skills_settings and getattr(skills_settings, "directory", None):
-        override_directory = Path(skills_settings.directory).expanduser()
+    override_directories = None
+    if skills_settings and getattr(skills_settings, "directories", None):
+        override_directories = [
+            Path(entry).expanduser() for entry in skills_settings.directories
+        ]
     context.skill_registry = SkillRegistry(
         base_dir=Path.cwd(),
-        override_directory=override_directory,
+        directories=override_directories,
     )
 
     # Configure logging and telemetry
     await configure_otel(config)
     await configure_logger(config)
-    await configure_usage_telemetry(config)
 
     # Configure the executor
     context.executor = await configure_executor(config)
@@ -253,22 +252,10 @@ def get_current_context() -> Context:
     """
     global _global_context
     if _global_context is None:
-        try:
-            # Try to get the current event loop
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Create a new loop in a separate thread
-                def run_async():
-                    new_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(new_loop)
-                    return new_loop.run_until_complete(initialize_context())
-
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    _global_context = pool.submit(run_async).result()
-            else:
-                _global_context = loop.run_until_complete(initialize_context())
-        except RuntimeError:
-            _global_context = asyncio.run(initialize_context())
+        result = run_sync(initialize_context)
+        if result is None:
+            raise RuntimeError("Failed to initialize global context")
+        _global_context = result
     return _global_context
 
 

@@ -6,7 +6,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Iterable, Set
+from typing import Any, Iterable
 from uuid import UUID
 
 import httpx
@@ -37,7 +37,7 @@ class JSONSerializer:
 
     def __init__(self) -> None:
         # Set of already processed objects to prevent infinite recursion
-        self._processed_objects: Set[int] = set()
+        self._processed_objects: set[int] = set()
         # Check if secrets should be logged in full
         self._log_secrets = os.getenv("LOG_SECRETS", "").upper() == "TRUE"
 
@@ -111,6 +111,9 @@ class JSONSerializer:
 
             # Handle Pydantic models
             if hasattr(obj, "model_dump"):  # Pydantic v2
+                module = getattr(obj, "__module__", "")
+                if module.startswith("openai.types.responses"):
+                    return self._serialize_object(obj.model_dump(warnings="none"))
                 return self._serialize_object(obj.model_dump())
             if hasattr(obj, "dict"):  # Pydantic v1
                 return self._serialize_object(obj.dict())
@@ -126,7 +129,7 @@ class JSONSerializer:
                 return self._serialize_object(obj.to_dict())
 
             # Handle dictionaries with sensitive data redaction
-            if isinstance(obj, Dict):
+            if isinstance(obj, dict):
                 return {
                     str(key): self._redact_sensitive_value(value)
                     if self._is_sensitive_key(key)

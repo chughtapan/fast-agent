@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Dict, Optional, Type, Union
+from typing import Type, Union
 
 from pydantic import BaseModel
 
@@ -60,15 +60,19 @@ class ModelFactory:
         "gpt-4.1": Provider.OPENAI,
         "gpt-4.1-mini": Provider.OPENAI,
         "gpt-4.1-nano": Provider.OPENAI,
-        "gpt-5": Provider.OPENAI,
-        "gpt-5-mini": Provider.OPENAI,
-        "gpt-5-nano": Provider.OPENAI,
-        "o1-mini": Provider.OPENAI,
-        "o1": Provider.OPENAI,
-        "o1-preview": Provider.OPENAI,
-        "o3": Provider.OPENAI,
-        "o3-mini": Provider.OPENAI,
-        "o4-mini": Provider.OPENAI,
+        "gpt-5": Provider.RESPONSES,
+        "gpt-5.1": Provider.RESPONSES,
+        "gpt-5-mini": Provider.RESPONSES,
+        "gpt-5-nano": Provider.RESPONSES,
+        "gpt-5.2": Provider.RESPONSES,
+        "gpt-5.1-codex": Provider.RESPONSES,
+        "gpt-5.2-codex": Provider.RESPONSES,
+        "o1-mini": Provider.RESPONSES,
+        "o1": Provider.RESPONSES,
+        "o1-preview": Provider.RESPONSES,
+        "o3": Provider.RESPONSES,
+        "o3-mini": Provider.RESPONSES,
+        "o4-mini": Provider.RESPONSES,
         "claude-3-haiku-20240307": Provider.ANTHROPIC,
         "claude-3-5-haiku-20241022": Provider.ANTHROPIC,
         "claude-3-5-haiku-latest": Provider.ANTHROPIC,
@@ -81,6 +85,7 @@ class ModelFactory:
         "claude-3-opus-latest": Provider.ANTHROPIC,
         "claude-opus-4-0": Provider.ANTHROPIC,
         "claude-opus-4-1": Provider.ANTHROPIC,
+        "claude-opus-4-5": Provider.ANTHROPIC,
         "claude-opus-4-20250514": Provider.ANTHROPIC,
         "claude-sonnet-4-20250514": Provider.ANTHROPIC,
         "claude-sonnet-4-0": Provider.ANTHROPIC,
@@ -93,6 +98,8 @@ class ModelFactory:
         "gemini-2.5-flash-preview-09-2025": Provider.GOOGLE,
         "gemini-2.5-pro-preview-05-06": Provider.GOOGLE,
         "gemini-2.5-pro": Provider.GOOGLE,
+        "gemini-3-pro-preview": Provider.GOOGLE,
+        "gemini-3-flash-preview": Provider.GOOGLE,
         "grok-4": Provider.XAI,
         "grok-4-0709": Provider.XAI,
         "grok-3": Provider.XAI,
@@ -106,32 +113,43 @@ class ModelFactory:
     }
 
     MODEL_ALIASES = {
+        "gpt51": "responses.gpt-5.1",
+        "gpt52": "responses.gpt-5.2",
+        "codex": "responses.gpt-5.2-codex",
         "sonnet": "claude-sonnet-4-5",
         "sonnet4": "claude-sonnet-4-0",
         "sonnet45": "claude-sonnet-4-5",
         "sonnet35": "claude-3-5-sonnet-latest",
         "sonnet37": "claude-3-7-sonnet-latest",
-        "claude": "claude-sonnet-4-0",
+        "claude": "claude-sonnet-4-5",
         "haiku": "claude-haiku-4-5",
         "haiku3": "claude-3-haiku-20240307",
         "haiku35": "claude-3-5-haiku-latest",
-        "hauku45": "claude-haiku-4-5",
-        "opus": "claude-opus-4-1",
+        "haiku45": "claude-haiku-4-5",
+        "opus": "claude-opus-4-5",
         "opus4": "claude-opus-4-1",
+        "opus45": "claude-opus-4-5",
         "opus3": "claude-3-opus-latest",
         "deepseekv3": "deepseek-chat",
+        "deepseek3": "deepseek-chat",
         "deepseek": "deepseek-chat",
         "gemini2": "gemini-2.0-flash",
         "gemini25": "gemini-2.5-flash-preview-09-2025",
         "gemini25pro": "gemini-2.5-pro",
+        "gemini3": "gemini-3-pro-preview",
+        "gemini3flash": "gemini-3-flash-preview",
         "grok-4-fast": "xai.grok-4-fast-non-reasoning",
         "grok-4-fast-reasoning": "xai.grok-4-fast-reasoning",
         "kimigroq": "groq.moonshotai/kimi-k2-instruct-0905",
-        "minimax": "hf.MiniMaxAI/MiniMax-M2:fireworks-ai",
-        "kimi": "hf.moonshotai/Kimi-K2-Instruct-0905",
-        "gpt-oss": "hf.openai/gpt-oss-120b",
+        "minimax": "hf.MiniMaxAI/MiniMax-M2.1:novita",
+        "kimi": "hf.moonshotai/Kimi-K2-Instruct-0905:groq",
+        "gpt-oss": "hf.openai/gpt-oss-120b:groq",
         "gpt-oss-20b": "hf.openai/gpt-oss-20b",
-        "glm": "hf.zai-org/GLM-4.6",
+        "glm": "hf.zai-org/GLM-4.7:zai-org:cerebras",
+        "qwen3": "hf.Qwen/Qwen3-Next-80B-A3B-Instruct:together",
+        "deepseek31": "hf.deepseek-ai/DeepSeek-V3.1",
+        "kimithink": "hf.moonshotai/Kimi-K2-Thinking:nebius",
+        "deepseek32": "hf.deepseek-ai/DeepSeek-V3.2:novita",
     }
 
     @staticmethod
@@ -148,24 +166,52 @@ class ModelFactory:
             return False
 
     # Mapping of providers to their LLM classes
-    PROVIDER_CLASSES: Dict[Provider, LLMClass] = {}
+    PROVIDER_CLASSES: dict[Provider, LLMClass] = {}
 
     # Mapping of special model names to their specific LLM classes
     # This overrides the provider-based class selection
-    MODEL_SPECIFIC_CLASSES: Dict[str, LLMClass] = {
+    MODEL_SPECIFIC_CLASSES: dict[str, LLMClass] = {
         "playback": PlaybackLLM,
         "silent": SilentLLM,
         "slow": SlowLLM,
     }
 
     @classmethod
-    def parse_model_string(cls, model_string: str) -> ModelConfig:
-        """Parse a model string into a ModelConfig object"""
-        model_string = cls.MODEL_ALIASES.get(model_string, model_string)
+    def parse_model_string(
+        cls, model_string: str, aliases: dict[str, str] | None = None
+    ) -> ModelConfig:
+        """Parse a model string into a ModelConfig object
+
+        Args:
+            model_string: The model specification string (e.g. "gpt-4.1", "kimi:groq")
+            aliases: Optional custom aliases map. Defaults to MODEL_ALIASES.
+        """
+        if aliases is None:
+            aliases = cls.MODEL_ALIASES
+
+        suffix: str | None = None
+        if ":" in model_string:
+            base, suffix = model_string.rsplit(":", 1)
+            if base:
+                model_string = base
+
+        model_string = aliases.get(model_string, model_string)
+
+        # If user provided a suffix (e.g., kimi:groq), strip any existing suffix
+        # from the resolved alias (e.g., hf.model:cerebras -> hf.model)
+        if suffix and ":" in model_string:
+            model_string = model_string.rsplit(":", 1)[0]
+        provider_override: Provider | None = None
+        if "/" in model_string:
+            prefix, rest = model_string.split("/", 1)
+            if prefix and rest and any(p.value == prefix for p in Provider):
+                provider_override = Provider(prefix)
+                model_string = rest
+
         parts = model_string.split(".")
 
         model_name_str = model_string  # Default full string as model name initially
-        provider = None
+        provider: Provider | None = provider_override
         reasoning_effort = None
         parts_for_provider_model = []
 
@@ -180,7 +226,7 @@ class ModelFactory:
         # Try to match longest possible provider string
         identified_provider_parts = 0  # How many parts belong to the provider string
 
-        if len(parts_for_provider_model) >= 2:
+        if provider is None and len(parts_for_provider_model) >= 2:
             potential_provider_str = f"{parts_for_provider_model[0]}.{parts_for_provider_model[1]}"
             if any(p.value == potential_provider_str for p in Provider):
                 provider = Provider(potential_provider_str)
@@ -218,22 +264,28 @@ class ModelFactory:
                 f"(e.g., tensorzero.my-function), got: {model_string}"
             )
 
+        if suffix:
+            model_name_str = f"{model_name_str}:{suffix}"
+
         return ModelConfig(
             provider=provider, model_name=model_name_str, reasoning_effort=reasoning_effort
         )
 
     @classmethod
-    def create_factory(cls, model_string: str) -> LLMFactoryProtocol:
+    def create_factory(
+        cls, model_string: str, aliases: dict[str, str] | None = None
+    ) -> LLMFactoryProtocol:
         """
         Creates a factory function that follows the attach_llm protocol.
 
         Args:
             model_string: The model specification string (e.g. "gpt-4.1")
+            aliases: Optional custom aliases map. Defaults to MODEL_ALIASES.
 
         Returns:
             A callable that takes an agent parameter and returns an LLM instance
         """
-        config = cls.parse_model_string(model_string)
+        config = cls.parse_model_string(model_string, aliases=aliases)
 
         # Ensure provider is valid before trying to access PROVIDER_CLASSES with it
         # Lazily ensure provider class map is populated and supports this provider
@@ -248,7 +300,7 @@ class ModelFactory:
             llm_class = cls.PROVIDER_CLASSES[config.provider]
 
         def factory(
-            agent: AgentProtocol, request_params: Optional[RequestParams] = None, **kwargs
+            agent: AgentProtocol, request_params: RequestParams | None = None, **kwargs
         ) -> FastAgentLLMProtocol:
             base_params = RequestParams()
             base_params.model = config.model_name
@@ -257,8 +309,8 @@ class ModelFactory:
             llm_args = {
                 "model": config.model_name,
                 "request_params": request_params,
-                "name": agent.name,
-                "instructions": agent.instruction,
+                "name": getattr(agent, "name", "fast-agent"),
+                "instructions": getattr(agent, "instruction", None),
                 **kwargs,
             }
             llm: FastAgentLLMProtocol = llm_class(**llm_args)
@@ -333,6 +385,10 @@ class ModelFactory:
                 from fast_agent.llm.provider.openai.responses import ResponsesLLM
 
                 return ResponsesLLM
+            if provider == Provider.OPENRESPONSES:
+                from fast_agent.llm.provider.openai.openresponses import OpenResponsesLLM
+
+                return OpenResponsesLLM
 
         except Exception as e:
             raise ModelConfigError(

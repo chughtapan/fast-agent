@@ -7,7 +7,7 @@ to add UI resource handling without modifying the base agent implementation.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Sequence
 
 from mcp.types import CallToolResult, ContentBlock, EmbeddedResource
 
@@ -17,7 +17,7 @@ from fast_agent.ui.mcp_ui_utils import open_links_in_browser, ui_links_from_chan
 if TYPE_CHECKING:
     from rich.text import Text
 
-    from fast_agent.types import PromptMessageExtended
+    from fast_agent.types import PromptMessageExtended, RequestParams
 
 
 class McpUIMixin:
@@ -39,7 +39,7 @@ class McpUIMixin:
         """Initialize the mixin with UI mode configuration."""
         super().__init__(*args, **kwargs)
         self._ui_mode: str = ui_mode
-        self._pending_ui_resources: List[ContentBlock] = []
+        self._pending_ui_resources: list[ContentBlock] = []
 
     def set_ui_mode(self, mode: str) -> None:
         """
@@ -52,7 +52,11 @@ class McpUIMixin:
             mode = "auto"
         self._ui_mode = mode
 
-    async def run_tools(self, request: "PromptMessageExtended") -> "PromptMessageExtended":
+    async def run_tools(
+        self,
+        request: "PromptMessageExtended",
+        request_params: "RequestParams | None" = None,
+    ) -> "PromptMessageExtended":
         """
         Override run_tools to extract and handle UI resources.
 
@@ -61,10 +65,10 @@ class McpUIMixin:
         """
         # If UI is disabled, just pass through to parent
         if self._ui_mode == "disabled":
-            return await super().run_tools(request)  # type: ignore
+            return await super().run_tools(request, request_params=request_params)  # type: ignore
 
         # Run the tools normally via parent implementation
-        result = await super().run_tools(request)  # type: ignore
+        result = await super().run_tools(request, request_params=request_params)  # type: ignore
 
         # Extract UI resources from tool results
         if result and result.tool_results:
@@ -89,12 +93,13 @@ class McpUIMixin:
     async def show_assistant_message(
         self,
         message: "PromptMessageExtended",
-        bottom_items: List[str] | None = None,
-        highlight_items: str | List[str] | None = None,
+        bottom_items: list[str] | None = None,
+        highlight_items: str | list[str] | None = None,
         max_item_length: int | None = None,
         name: str | None = None,
         model: str | None = None,
-        additional_message: Optional["Text"] = None,
+        additional_message: "Text" | None = None,
+        render_markdown: bool | None = None,
     ) -> None:
         """Override to display UI resources after showing assistant message."""
         # Show the assistant message normally via parent
@@ -106,6 +111,7 @@ class McpUIMixin:
             name=name,
             model=model,
             additional_message=additional_message,
+            render_markdown=render_markdown,
         )
 
         # Handle any pending UI resources from the previous user message
@@ -150,8 +156,8 @@ class McpUIMixin:
 
     def _extract_ui_from_tool_results(
         self,
-        tool_results: Dict[str, CallToolResult],
-    ) -> Tuple[Dict[str, CallToolResult], List[ContentBlock]]:
+        tool_results: dict[str, CallToolResult],
+    ) -> tuple[dict[str, CallToolResult], list[ContentBlock]]:
         """
         Extract UI resources from tool results.
 
@@ -160,8 +166,8 @@ class McpUIMixin:
         if not tool_results:
             return tool_results, []
 
-        extracted_ui: List[ContentBlock] = []
-        new_results: Dict[str, CallToolResult] = {}
+        extracted_ui: list[ContentBlock] = []
+        new_results: dict[str, CallToolResult] = {}
 
         for key, result in tool_results.items():
             try:
@@ -178,15 +184,15 @@ class McpUIMixin:
         return new_results, extracted_ui
 
     def _split_ui_blocks(
-        self, blocks: List[ContentBlock]
-    ) -> Tuple[List[ContentBlock], List[ContentBlock]]:
+        self, blocks: list[ContentBlock]
+    ) -> tuple[list[ContentBlock], list[ContentBlock]]:
         """
         Split content blocks into UI and non-UI blocks.
 
         Returns tuple of (ui_blocks, other_blocks).
         """
-        ui_blocks: List[ContentBlock] = []
-        other_blocks: List[ContentBlock] = []
+        ui_blocks: list[ContentBlock] = []
+        other_blocks: list[ContentBlock] = []
 
         for block in blocks or []:
             if self._is_ui_embedded_resource(block):

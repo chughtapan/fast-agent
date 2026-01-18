@@ -5,8 +5,6 @@ Shows keyring backend, per-server OAuth token status, and provides a way to clea
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
-
 import typer
 from rich.table import Table
 
@@ -18,8 +16,14 @@ from fast_agent.mcp.oauth_client import (
     list_keyring_tokens,
 )
 from fast_agent.ui.console import console
+from fast_agent.utils.async_utils import run_sync
 
-app = typer.Typer(help="Manage OAuth authentication state for MCP servers")
+app = typer.Typer(
+    help=(
+        "Manage OAuth tokens stored in the OS keyring for MCP HTTP/SSE servers "
+        "(identity = base URL)."
+    )
+)
 
 
 def _get_keyring_status() -> tuple[str, bool]:
@@ -99,9 +103,9 @@ def _server_rows_from_settings(settings: Settings):
     return rows
 
 
-def _servers_by_identity(settings: Settings) -> Dict[str, List[str]]:
+def _servers_by_identity(settings: Settings) -> dict[str, list[str]]:
     """Group configured server names by derived identity (base URL)."""
-    mapping: Dict[str, List[str]] = {}
+    mapping: dict[str, list[str]] = {}
     mcp = getattr(settings, "mcp", None)
     servers = getattr(mcp, "servers", {}) if mcp else {}
     for name, cfg in servers.items():
@@ -115,10 +119,10 @@ def _servers_by_identity(settings: Settings) -> Dict[str, List[str]]:
 
 @app.command()
 def status(
-    target: Optional[str] = typer.Argument(None, help="Identity (base URL) or server name"),
-    config_path: Optional[str] = typer.Option(None, "--config-path", "-c"),
+    target: str | None = typer.Argument(None, help="Identity (base URL) or server name"),
+    config_path: str | None = typer.Option(None, "--config-path", "-c"),
 ) -> None:
-    """Show keyring backend and token status for configured MCP servers."""
+    """Show keyring backend and token status for configured MCP servers (identity = base URL)."""
     settings = get_settings(config_path)
     backend, backend_usable = _get_keyring_status()
 
@@ -240,14 +244,14 @@ def status(
 
 @app.command()
 def clear(
-    server: Optional[str] = typer.Argument(None, help="Server name to clear (from config)"),
-    identity: Optional[str] = typer.Option(
+    server: str | None = typer.Argument(None, help="Server name to clear (from config)"),
+    identity: str | None = typer.Option(
         None, "--identity", help="Token identity (base URL) to clear"
     ),
     all: bool = typer.Option(False, "--all", help="Clear tokens for all identities in keyring"),
-    config_path: Optional[str] = typer.Option(None, "--config-path", "-c"),
+    config_path: str | None = typer.Option(None, "--config-path", "-c"),
 ) -> None:
-    """Clear stored OAuth tokens from the keyring."""
+    """Clear stored OAuth tokens from the keyring by server name or identity (base URL)."""
     targets_identities: list[str] = []
     if all:
         targets_identities = list_keyring_tokens()
@@ -281,7 +285,7 @@ def clear(
 
 @app.callback(invoke_without_command=True)
 def main(
-    ctx: typer.Context, config_path: Optional[str] = typer.Option(None, "--config-path", "-c")
+    ctx: typer.Context, config_path: str | None = typer.Option(None, "--config-path", "-c")
 ) -> None:
     """Default to showing status if no subcommand is provided."""
     if ctx.invoked_subcommand is None:
@@ -293,15 +297,15 @@ def main(
 
 @app.command()
 def login(
-    target: Optional[str] = typer.Argument(
+    target: str | None = typer.Argument(
         None, help="Server name (from config) or identity (base URL)"
     ),
-    transport: Optional[str] = typer.Option(
+    transport: str | None = typer.Option(
         None, "--transport", help="Transport for identity mode: http or sse"
     ),
-    config_path: Optional[str] = typer.Option(None, "--config-path", "-c"),
+    config_path: str | None = typer.Option(None, "--config-path", "-c"),
 ) -> None:
-    """Start OAuth flow and store tokens for a server.
+    """Start OAuth flow and store tokens in the keyring for a server.
 
     Accepts either a configured server name or an identity (base URL).
     For identity mode, default transport is 'http' (uses <identity>/mcp).
@@ -335,9 +339,12 @@ def login(
             typer.echo("--transport must be 'http' or 'sse'")
             raise typer.Exit(1)
         endpoint = base + ("/mcp" if resolved_transport == "http" else "/sse")
+        # Cast transport after validation
+        from typing import Literal, cast
+        transport_type = cast("Literal['stdio', 'sse', 'http']", resolved_transport)
         cfg = MCPServerSettings(
             name=base,
-            transport=resolved_transport,
+            transport=transport_type,
             url=endpoint,
             auth=MCPServerAuthSettings(),
         )
@@ -394,9 +401,7 @@ def login(
             typer.echo(f"Login failed: {e}")
             return False
 
-    import asyncio
-
-    ok = asyncio.run(_run_login())
+    ok = bool(run_sync(_run_login))
     if ok:
         from fast_agent.mcp.oauth_client import compute_server_identity
 

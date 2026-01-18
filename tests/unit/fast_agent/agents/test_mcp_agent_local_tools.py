@@ -1,6 +1,7 @@
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any
 
 import pytest
+from mcp.types import TextContent
 
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.mcp_agent import McpAgent
@@ -16,7 +17,7 @@ def _make_agent_config() -> AgentConfig:
 
 @pytest.mark.asyncio
 async def test_local_tools_listed_and_callable() -> None:
-    calls: List[Dict[str, Any]] = []
+    calls: list[dict[str, Any]] = []
 
     def sample_tool(video_id: str) -> str:
         calls.append({"video_id": video_id})
@@ -42,6 +43,10 @@ async def test_local_tools_listed_and_callable() -> None:
     result: CallToolResult = await agent.call_tool("sample_tool", {"video_id": "1234"})
     assert not result.isError
     assert calls == [{"video_id": "1234"}]
-    assert [block.text for block in result.content or []] == ["transcript for 1234"]
+    assert result.content is not None
+    assert len(result.content) == 1
+    assert result.content[0].type == "text"
+    assert isinstance(result.content[0], TextContent)
+    assert result.content[0].text == "transcript for 1234"
 
     await agent._aggregator.close()

@@ -4,17 +4,23 @@ Centralizes API key handling logic to make provider implementations more generic
 """
 
 import os
-from typing import Any, Dict
+from typing import Any
 
 from pydantic import BaseModel
 
 from fast_agent.core.exceptions import ProviderKeyError
 
-PROVIDER_ENVIRONMENT_MAP: Dict[str, str] = {
+PROVIDER_ENVIRONMENT_MAP: dict[str, str] = {
     # default behaviour in _get_env_key_name is to capitalize the
     # provider name and suffix "_API_KEY" - so no specific mapping needed unless overriding
     "hf": "HF_TOKEN",
     "responses": "OPENAI_API_KEY",  # Temporary workaround
+}
+PROVIDER_CONFIG_KEY_ALIASES: dict[str, tuple[str, ...]] = {
+    # HuggingFace historically used "huggingface" (full name) in config files,
+    # while the provider id is "hf". Support both spellings.
+    "hf": ("hf", "huggingface"),
+    "huggingface": ("huggingface", "hf"),
 }
 API_KEY_HINT_TEXT = "<your-api-key-here>"
 
@@ -39,13 +45,27 @@ class ProviderKeyManager:
         api_key = None
         if isinstance(config, BaseModel):
             config = config.model_dump()
-        provider_settings = config.get(provider_name)
-        if provider_settings:
+        provider_name = provider_name.lower()
+        provider_keys = ProviderKeyManager._get_provider_config_keys(provider_name)
+        for key in provider_keys:
+            provider_settings = config.get(key)
+            if not provider_settings:
+                continue
             api_key = provider_settings.get("api_key", API_KEY_HINT_TEXT)
             if api_key == API_KEY_HINT_TEXT:
                 api_key = None
+            break
 
         return api_key
+
+    @staticmethod
+    def _get_provider_config_keys(provider_name: str) -> list[str]:
+        """Return config key candidates for a provider (provider id + aliases)."""
+        keys = [provider_name]
+        for alias in PROVIDER_CONFIG_KEY_ALIASES.get(provider_name, ()):
+            if alias not in keys:
+                keys.append(alias)
+        return keys
 
     @staticmethod
     def get_api_key(provider_name: str, config: Any) -> str:
@@ -71,9 +91,39 @@ class ProviderKeyManager:
         if provider_name == "fast-agent":
             return ""
 
+        # Check for request-scoped token first (token passthrough from MCP server)
+        # This allows clients to pass their own HF token via Authorization header
+        if provider_name in {"hf", "huggingface"}:
+            from fast_agent.mcp.auth.context import request_bearer_token
+
+            ctx_token = request_bearer_token.get()
+            if ctx_token:
+                return ctx_token
+
+        # Google Vertex AI uses ADC/IAM and does not require an API key.
+        if provider_name == "google":
+            try:
+                cfg = config.model_dump() if isinstance(config, BaseModel) else config
+                if isinstance(cfg, dict) and bool(
+                    (cfg.get("google") or {}).get("vertex_ai", {}).get("enabled")
+                ):
+                    return ""
+            except Exception:
+                pass
+
         api_key = ProviderKeyManager.get_config_file_key(provider_name, config)
         if not api_key:
             api_key = ProviderKeyManager.get_env_var(provider_name)
+
+        # HuggingFace: also support tokens managed by huggingface_hub (e.g. `hf auth login`)
+        # even when HF_TOKEN isn't explicitly set in the environment or config.
+        if not api_key and provider_name in {"hf", "huggingface"}:
+            try:
+                from huggingface_hub import get_token  # type: ignore
+
+                api_key = get_token()
+            except Exception:
+                pass
 
         if not api_key and provider_name == "generic":
             api_key = "ollama"  # Default for generic provider

@@ -1,15 +1,23 @@
 """
 This simplified implementation directly converts between MCP types and PromptMessageExtended.
+Supports "sampling with tools" as per MCP specification.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from mcp import ClientSession
-from mcp.types import CreateMessageRequestParams, CreateMessageResult, TextContent
+from mcp.shared.context import RequestContext
+from mcp.types import (
+    CreateMessageRequestParams,
+    CreateMessageResult,
+    CreateMessageResultWithTools,
+    TextContent,
+)
 
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.llm_agent import LlmAgent
 from fast_agent.core.logging.logger import get_logger
+from fast_agent.core.model_resolution import HARDCODED_DEFAULT_MODEL, resolve_model_spec
 from fast_agent.interfaces import FastAgentLLMProtocol
 from fast_agent.llm.sampling_converter import SamplingConverter
 from fast_agent.mcp.helpers.server_config_helpers import get_server_config
@@ -60,31 +68,38 @@ def create_sampling_llm(
     return llm
 
 
-async def sample(mcp_ctx: ClientSession, params: CreateMessageRequestParams) -> CreateMessageResult:
+async def sample(
+    context: RequestContext[ClientSession, Any], params: CreateMessageRequestParams
+) -> CreateMessageResult | CreateMessageResultWithTools:
     """
     Handle sampling requests from the MCP protocol using SamplingConverter.
 
     This function:
     1. Extracts the model from the request
     2. Uses SamplingConverter to convert types
-    3. Calls the LLM's generate_prompt method
-    4. Returns the result as a CreateMessageResult
+    3. Calls the LLM's generate method (with tools if provided)
+    4. Returns the result as CreateMessageResult or CreateMessageResultWithTools
+
+    Supports "sampling with tools" per MCP specification. When tools are provided
+    and the LLM wants to use them, returns CreateMessageResultWithTools with
+    stopReason="toolUse". The MCP server is responsible for executing tools
+    and sending follow-up requests with tool results.
 
     Args:
-        mcp_ctx: The MCP ClientSession
-        params: The sampling request parameters
+        context: The MCP RequestContext containing the ClientSession
+        params: The sampling request parameters (may include tools and toolChoice)
 
     Returns:
-        A CreateMessageResult containing the LLM's response
+        CreateMessageResult for final answers, or
+        CreateMessageResultWithTools when the LLM wants to use tools
     """
     # Get server name for notification tracking
-    server_name = "unknown"
-    if hasattr(mcp_ctx, "session") and hasattr(mcp_ctx.session, "session_server_name"):
-        server_name = mcp_ctx.session.session_server_name or "unknown"
+    server_name: str = getattr(context.session, "session_server_name", None) or "unknown"
 
     # Start tracking sampling operation
     try:
         from fast_agent.ui import notification_tracker
+
         notification_tracker.start_sampling(server_name)
     except Exception:
         # Don't let notification tracking break sampling
@@ -92,12 +107,13 @@ async def sample(mcp_ctx: ClientSession, params: CreateMessageRequestParams) -> 
 
     model: str | None = None
     api_key: str | None = None
+    app_context: Any | None = None
     try:
         # Extract model from server config using type-safe helper
-        server_config = get_server_config(mcp_ctx)
+        server_config = get_server_config(context)
 
         # First priority: explicitly configured sampling model
-        if server_config and hasattr(server_config, "sampling") and server_config.sampling:
+        if server_config and server_config.sampling:
             model = server_config.sampling.model
 
         # Second priority: auto_sampling fallback (if enabled at application level)
@@ -119,24 +135,31 @@ async def sample(mcp_ctx: ClientSession, params: CreateMessageRequestParams) -> 
                 from fast_agent.mcp.mcp_agent_client_session import MCPAgentClientSession
 
                 # Try agent's model first (from the session)
-                if hasattr(mcp_ctx, "session") and isinstance(
-                    mcp_ctx.session, MCPAgentClientSession
-                ):
-                    if mcp_ctx.session.agent_model:
-                        model = mcp_ctx.session.agent_model
+                if isinstance(context.session, MCPAgentClientSession):
+                    if context.session.agent_model:
+                        model = context.session.agent_model
                         logger.debug(f"Using agent's model for sampling: {model}")
-                    if mcp_ctx.session.api_key:
-                        api_key = mcp_ctx.session.api_key
-                        logger.debug(f"Using agent's API KEY for sampling: {api_key}")
+                    if context.session.api_key:
+                        api_key = context.session.api_key
+                        logger.debug("Using agent's API key override for sampling")
 
                 # Fall back to system default model
                 if model is None:
                     try:
-                        if app_context and app_context.config and app_context.config.default_model:
-                            model = app_context.config.default_model
-                            logger.debug(f"Using system default model for sampling: {model}")
+                        cli_model_override = None
+                        if app_context and app_context.config:
+                            cli_model_override = getattr(
+                                app_context.config, "cli_model_override", None
+                            )
+                        model, model_source = resolve_model_spec(
+                            app_context,
+                            cli_model=cli_model_override,
+                            hardcoded_default=HARDCODED_DEFAULT_MODEL,
+                        )
+                        if model:
+                            logger.debug(f"Using {model_source} model for sampling: {model}")
                     except Exception as e:
-                        logger.debug(f"Could not get system default model: {e}")
+                        logger.debug(f"Could not resolve default model for sampling: {e}")
 
         if model is None:
             raise ValueError(
@@ -156,9 +179,32 @@ async def sample(mcp_ctx: ClientSession, params: CreateMessageRequestParams) -> 
         # Extract request parameters using our converter
         request_params = SamplingConverter.extract_request_params(params)
 
-        llm_response: PromptMessageExtended = await llm.generate(conversation, request_params)
-        logger.info(f"Complete sampling request : {llm_response.first_text()[:50]}...")
+        # Check if tools are provided in the request
+        tools = params.tools if params.tools else None
+        has_tools = tools is not None and len(tools) > 0
 
+        # Call LLM with tools if provided
+        llm_response: PromptMessageExtended = await llm.generate(
+            conversation, request_params, tools=tools
+        )
+
+        # Log response (truncate for brevity)
+        response_text = llm_response.first_text()
+        log_text = response_text[:50] if response_text else "<no text>"
+        logger.info(f"Complete sampling request: {log_text}...")
+
+        # Check if this is a tool use response
+        if has_tools and llm_response.stop_reason == LlmStopReason.TOOL_USE:
+            # Return tool use response - MCP server will execute tools and continue
+            content_blocks = SamplingConverter.llm_response_to_sampling_content(llm_response)
+            return CreateMessageResultWithTools(
+                role=llm_response.role,
+                content=content_blocks,
+                model=model,
+                stopReason="toolUse",
+            )
+
+        # Return standard text response
         return CreateMessageResult(
             role=llm_response.role,
             content=TextContent(type="text", text=llm_response.first_text()),
@@ -174,6 +220,7 @@ async def sample(mcp_ctx: ClientSession, params: CreateMessageRequestParams) -> 
         # End tracking sampling operation
         try:
             from fast_agent.ui import notification_tracker
+
             notification_tracker.end_sampling(server_name)
         except Exception:
             # Don't let notification tracking break sampling

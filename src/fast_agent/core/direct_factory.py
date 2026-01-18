@@ -4,7 +4,8 @@ Implements type-safe factories with improved error handling.
 """
 
 from functools import partial
-from typing import Any, Dict, List, Optional, Protocol, TypeVar
+from pathlib import Path
+from typing import Any, Protocol, TypeVar, cast
 
 from fast_agent.agents import McpAgent
 from fast_agent.agents.agent_types import AgentConfig, AgentType
@@ -17,8 +18,9 @@ from fast_agent.agents.workflow.iterative_planner import IterativePlanner
 from fast_agent.agents.workflow.parallel_agent import ParallelAgent
 from fast_agent.agents.workflow.router_agent import RouterAgent
 from fast_agent.core import Core
-from fast_agent.core.exceptions import AgentConfigError
+from fast_agent.core.exceptions import AgentConfigError, ModelConfigError
 from fast_agent.core.logging.logger import get_logger
+from fast_agent.core.model_resolution import HARDCODED_DEFAULT_MODEL, resolve_model_spec
 from fast_agent.core.validation import get_dependencies_groups
 from fast_agent.event_progress import ProgressAction
 from fast_agent.interfaces import (
@@ -28,11 +30,12 @@ from fast_agent.interfaces import (
 )
 from fast_agent.llm.model_factory import ModelFactory
 from fast_agent.mcp.ui_agent import McpAgentWithUI
+from fast_agent.tools.function_tool_loader import load_function_tools
 from fast_agent.types import RequestParams
 
 # Type aliases for improved readability and IDE support
-AgentDict = Dict[str, AgentProtocol]
-AgentConfigDict = Dict[str, Dict[str, Any]]
+AgentDict = dict[str, AgentProtocol]
+AgentConfigDict = dict[str, dict[str, Any]]
 T = TypeVar("T")  # For generic types
 
 
@@ -43,6 +46,7 @@ def _create_agent_with_ui_if_needed(
     agent_class: type,
     config: Any,
     context: Any,
+    **kwargs: Any,
 ) -> Any:
     """
     Create an agent with UI support if MCP UI mode is enabled.
@@ -51,6 +55,7 @@ def _create_agent_with_ui_if_needed(
         agent_class: The agent class to potentially enhance with UI
         config: Agent configuration
         context: Application context
+        **kwargs: Additional arguments passed to agent constructor (e.g., tools)
 
     Returns:
         Either a UI-enhanced agent instance or the original agent instance
@@ -61,10 +66,10 @@ def _create_agent_with_ui_if_needed(
 
     if ui_mode != "disabled" and agent_class == McpAgent:
         # Use the UI-enhanced agent class instead of the base class
-        return McpAgentWithUI(config=config, context=context, ui_mode=ui_mode)
+        return McpAgentWithUI(config=config, context=context, ui_mode=ui_mode, **kwargs)
     else:
         # Create the original agent instance
-        return agent_class(config=config, context=context)
+        return agent_class(config=config, context=context, **kwargs)
 
 
 class AgentCreatorProtocol(Protocol):
@@ -75,22 +80,30 @@ class AgentCreatorProtocol(Protocol):
         app_instance: Core,
         agents_dict: AgentConfigDict,
         agent_type: AgentType,
-        active_agents: Optional[AgentDict] = None,
-        model_factory_func: Optional[ModelFactoryFunctionProtocol] = None,
+        active_agents: AgentDict | None = None,
+        model_factory_func: ModelFactoryFunctionProtocol | None = None,
         **kwargs: Any,
     ) -> AgentDict: ...
 
 
+
 def get_model_factory(
     context,
-    model: Optional[str] = None,
-    request_params: Optional[RequestParams] = None,
-    default_model: Optional[str] = None,
-    cli_model: Optional[str] = None,
+    model: str | None = None,
+    request_params: RequestParams | None = None,
+    default_model: str | None = None,
+    cli_model: str | None = None,
 ) -> LLMFactoryProtocol:
     """
     Get model factory using specified or default model.
     Model string is parsed by ModelFactory to determine provider and reasoning effort.
+
+    Precedence (lowest to highest):
+        1. Hardcoded default (gpt-5-mini.low)
+        2. FAST_AGENT_MODEL environment variable
+        3. Config file default_model
+        4. CLI --model argument
+        5. Decorator model parameter
 
     Args:
         context: Application context
@@ -102,16 +115,23 @@ def get_model_factory(
     Returns:
         ModelFactory instance for the specified or default model
     """
-    # Config has lowest precedence
-    model_spec = default_model or context.config.default_model
-
-    # Command line override has next precedence
-    if cli_model:
-        model_spec = cli_model
-
-    # Model from decorator has highest precedence
-    if model:
-        model_spec = model
+    model_spec, source = resolve_model_spec(
+        context,
+        model=model,
+        default_model=default_model,
+        cli_model=cli_model,
+        hardcoded_default=HARDCODED_DEFAULT_MODEL,
+    )
+    if model_spec is None:
+        raise ModelConfigError(
+            "No model configured",
+            "Set --model, FAST_AGENT_MODEL, or default_model in config.",
+        )
+    logger.info(
+        f"Resolved model '{model_spec}' via {source}",
+        model=model_spec,
+        source=source,
+    )
 
     # Update or create request_params with the final model choice
     if request_params:
@@ -123,12 +143,42 @@ def get_model_factory(
     return ModelFactory.create_factory(model_spec)
 
 
+def get_default_model_source(
+    config_default_model: str | None = None,
+    cli_model: str | None = None,
+) -> str | None:
+    """
+    Determine the source of the default model selection.
+    Returns "environment variable", "config file", or None (if CLI or hardcoded default).
+
+    This is used to display informational messages about where the model
+    configuration is coming from. Only shows a message for env var or config file,
+    not for explicit CLI usage or the hardcoded system default.
+    """
+    # CLI model is explicit - no message needed
+    if cli_model:
+        return None
+
+    _, source = resolve_model_spec(
+        context=None,
+        default_model=config_default_model,
+        cli_model=None,
+        fallback_to_hardcoded=False,
+    )
+    if source == "config file":
+        return "config file"
+    if source and source.startswith("environment variable"):
+        return "environment variable"
+
+    return None
+
+
 async def create_agents_by_type(
     app_instance: Core,
     agents_dict: AgentConfigDict,
     agent_type: AgentType,
     model_factory_func: ModelFactoryFunctionProtocol,
-    active_agents: Optional[AgentDict] = None,
+    active_agents: AgentDict | None = None,
     **kwargs: Any,
 ) -> AgentDict:
     """
@@ -161,33 +211,140 @@ async def create_agents_by_type(
             # Type-specific initialization based on the Enum type
             # Note: Above we compared string values from config, here we compare Enum objects directly
             if agent_type == AgentType.BASIC:
-                # Create agent with UI support if needed
-                agent = _create_agent_with_ui_if_needed(
-                    McpAgent,
-                    config,
-                    app_instance.context,
-                )
+                # If BASIC agent declares child_agents, build an Agents-as-Tools wrapper
+                child_names = agent_data.get("child_agents", []) or []
+                if child_names:
+                    function_tools = []
+                    tools_config = config.function_tools
+                    if tools_config is None:
+                        tools_config = agent_data.get("function_tools")
+                    if tools_config:
+                        source_path = agent_data.get("source_path")
+                        base_path = Path(source_path).parent if source_path else None
+                        function_tools = load_function_tools(
+                            tools_config, base_path
+                        )
 
-                await agent.initialize()
+                    # Ensure child agents are already created
+                    child_agents: list[AgentProtocol] = []
+                    for agent_name in child_names:
+                        if agent_name not in active_agents:
+                            logger.warning(
+                                "Skipping missing child agent",
+                                data={"agent_name": agent_name, "parent": name},
+                            )
+                            continue
+                        child_agents.append(active_agents[agent_name])
 
-                # Attach LLM to the agent
-                llm_factory = model_factory_func(model=config.model)
-                await agent.attach_llm(
-                    llm_factory,
-                    request_params=config.default_request_params,
-                    api_key=config.api_key,
-                )
-                result_agents[name] = agent
+                    # Import here to avoid circulars at module import time
+                    from fast_agent.agents.workflow.agents_as_tools_agent import (
+                        AgentsAsToolsAgent,
+                        AgentsAsToolsOptions,
+                        HistoryMergeTarget,
+                        HistorySource,
+                    )
+                    raw_opts = agent_data.get("agents_as_tools_options") or {}
+                    opt_kwargs = {k: v for k, v in raw_opts.items() if v is not None}
+                    options = AgentsAsToolsOptions(**opt_kwargs)
+                    child_message_files: dict[str, list[Path]] = {}
+                    if (
+                        options.history_source == HistorySource.MESSAGES
+                        or options.history_merge_target == HistoryMergeTarget.MESSAGES
+                    ):
+                        missing_messages: list[str] = []
+                        for agent_name in child_names:
+                            child_data = agents_dict.get(agent_name)
+                            message_files = (
+                                child_data.get("message_files") if child_data else None
+                            )
+                            if not message_files:
+                                missing_messages.append(agent_name)
+                            else:
+                                child_message_files[agent_name] = list(message_files)
+                        if missing_messages:
+                            missing_list = ", ".join(sorted(set(missing_messages)))
+                            raise AgentConfigError(
+                                "history_source/history_merge_target=messages requires child agents with messages",
+                                f"Missing messages for: {missing_list}",
+                            )
+                    else:
+                        for agent_name in child_names:
+                            child_data = agents_dict.get(agent_name, {})
+                            message_files = child_data.get("message_files")
+                            if message_files:
+                                child_message_files[agent_name] = list(message_files)
 
-                # Log successful agent creation
-                logger.info(
-                    f"Loaded {name}",
-                    data={
-                        "progress_action": ProgressAction.LOADED,
-                        "agent_name": name,
-                        "target": name,
-                    },
-                )
+                    agent = AgentsAsToolsAgent(
+                        config=config,
+                        context=app_instance.context,
+                        agents=cast("list[LlmAgent]", child_agents),  # expose children as tools
+                        options=options,
+                        tools=function_tools,
+                        child_message_files=child_message_files,
+                    )
+
+                    await agent.initialize()
+
+                    # Attach LLM to the agent
+                    llm_factory = model_factory_func(model=config.model)
+                    await agent.attach_llm(
+                        llm_factory,
+                        request_params=config.default_request_params,
+                        api_key=config.api_key,
+                    )
+                    result_agents[name] = agent
+
+                    # Log successful agent creation
+                    logger.info(
+                        f"Loaded {name}",
+                        data={
+                            "progress_action": ProgressAction.LOADED,
+                            "agent_name": name,
+                            "target": name,
+                        },
+                    )
+                else:
+                    # Load function tools if configured
+                    function_tools = []
+                    tools_config = config.function_tools
+                    if tools_config is None:
+                        tools_config = agent_data.get("function_tools")
+                    if tools_config:
+                        # Use source_path from agent card for relative path resolution
+                        source_path = agent_data.get("source_path")
+                        base_path = Path(source_path).parent if source_path else None
+                        function_tools = load_function_tools(
+                            tools_config, base_path
+                        )
+
+                    # Create agent with UI support if needed
+                    agent = _create_agent_with_ui_if_needed(
+                        McpAgent,
+                        config,
+                        app_instance.context,
+                        tools=function_tools,
+                    )
+
+                    await agent.initialize()
+
+                    # Attach LLM to the agent
+                    llm_factory = model_factory_func(model=config.model)
+                    await agent.attach_llm(
+                        llm_factory,
+                        request_params=config.default_request_params,
+                        api_key=config.api_key,
+                    )
+                    result_agents[name] = agent
+
+                    # Log successful agent creation
+                    logger.info(
+                        f"Loaded {name}",
+                        data={
+                            "progress_action": ProgressAction.LOADED,
+                            "agent_name": name,
+                            "target": name,
+                        },
+                    )
 
             elif agent_type == AgentType.CUSTOM:
                 # Get the class to instantiate (support legacy 'agent_class' and new 'cls')
@@ -380,11 +537,41 @@ async def create_agents_by_type(
                     evaluator_agent=evaluator_agent,
                     min_rating=min_rating,
                     max_refinements=max_refinements,
+                    refinement_instruction=agent_data.get("refinement_instruction"),
                 )
 
                 # Initialize the agent
                 await evaluator_optimizer.initialize()
                 result_agents[name] = evaluator_optimizer
+
+            elif agent_type == AgentType.MAKER:
+                # MAKER: Massively decomposed Agentic processes with K-voting Error Reduction
+                from fast_agent.agents.workflow.maker_agent import MakerAgent, MatchStrategy
+
+                worker_name = agent_data["worker"]
+                if worker_name not in active_agents:
+                    raise AgentConfigError(f"Worker agent {worker_name} not found")
+
+                worker_agent = active_agents[worker_name]
+
+                # Parse match strategy
+                match_strategy_str = agent_data.get("match_strategy", "exact")
+                match_strategy = MatchStrategy(match_strategy_str)
+
+                # Create the MAKER agent
+                maker_agent = MakerAgent(
+                    config=config,
+                    context=app_instance.context,
+                    worker_agent=worker_agent,
+                    k=agent_data.get("k", 3),
+                    max_samples=agent_data.get("max_samples", 50),
+                    match_strategy=match_strategy,
+                    red_flag_max_length=agent_data.get("red_flag_max_length"),
+                )
+
+                # Initialize the agent
+                await maker_agent.initialize()
+                result_agents[name] = maker_agent
 
             else:
                 raise ValueError(f"Unknown agent type: {agent_type}")
@@ -396,7 +583,7 @@ async def active_agents_in_dependency_group(
     app_instance: Core,
     agents_dict: AgentConfigDict,
     model_factory_func: ModelFactoryFunctionProtocol,
-    group: List[str],
+    group: list[str],
     active_agents: AgentDict,
 ):
     """

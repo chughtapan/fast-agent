@@ -5,7 +5,7 @@ This module provides a centralized lookup for model parameters including
 context windows, max output tokens, and supported tokenization types.
 """
 
-from typing import Dict, List, Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -19,7 +19,7 @@ class ModelParameters(BaseModel):
     max_output_tokens: int
     """Maximum output tokens the model can generate"""
 
-    tokenizes: List[str]
+    tokenizes: list[str]
     """List of supported content types for tokenization"""
 
     json_mode: None | str = "schema"
@@ -30,6 +30,12 @@ class ModelParameters(BaseModel):
 
     stream_mode: Literal["openai", "manual"] = "openai"
     """Determines how streaming deltas should be processed."""
+
+    system_role: None | str = "system"
+    """Role to use for the System Prompt"""
+
+    cache_ttl_minutes: int | None = None
+    """Cache time-to-live in minutes. None if provider doesn't support caching."""
 
 
 class ModelDatabase:
@@ -50,10 +56,23 @@ class ModelDatabase:
         "image/jpeg",
         "image/png",
         "image/webp",
+        "image/gif",
         "application/pdf",
+        # Audio formats
         "audio/wav",
-        "audio/mp3",
+        "audio/mpeg",  # Official MP3 MIME type
+        "audio/mp3",  # Common alias
+        "audio/aac",
+        "audio/ogg",
+        "audio/flac",
+        "audio/webm",
+        # Video formats (MP4, AVI, FLV, MOV, MPEG, MPG, WebM)
         "video/mp4",
+        "video/x-msvideo",  # AVI
+        "video/x-flv",  # FLV
+        "video/quicktime",  # MOV
+        "video/mpeg",  # MPEG, MPG
+        "video/webm",
     ]
     QWEN_MULTIMODAL = ["text/plain", "image/jpeg", "image/png", "image/webp"]
     XAI_VISION = ["text/plain", "image/jpeg", "image/png", "image/webp"]
@@ -76,24 +95,25 @@ class ModelDatabase:
     )
 
     ANTHROPIC_LEGACY = ModelParameters(
-        context_window=200000, max_output_tokens=4096, tokenizes=ANTHROPIC_MULTIMODAL
+        context_window=200000,
+        max_output_tokens=4096,
+        tokenizes=ANTHROPIC_MULTIMODAL,
+        cache_ttl_minutes=5,
     )
 
     ANTHROPIC_35_SERIES = ModelParameters(
-        context_window=200000, max_output_tokens=8192, tokenizes=ANTHROPIC_MULTIMODAL
+        context_window=200000,
+        max_output_tokens=8192,
+        tokenizes=ANTHROPIC_MULTIMODAL,
+        cache_ttl_minutes=5,
     )
 
     # TODO--- TO USE 64,000 NEED TO SUPPORT STREAMING
     ANTHROPIC_37_SERIES = ModelParameters(
-        context_window=200000, max_output_tokens=16384, tokenizes=ANTHROPIC_MULTIMODAL
-    )
-
-    GEMINI_FLASH = ModelParameters(
-        context_window=1048576, max_output_tokens=8192, tokenizes=GOOGLE_MULTIMODAL
-    )
-
-    GEMINI_PRO = ModelParameters(
-        context_window=1_048_576, max_output_tokens=65_536, tokenizes=GOOGLE_MULTIMODAL
+        context_window=200000,
+        max_output_tokens=16384,
+        tokenizes=ANTHROPIC_MULTIMODAL,
+        cache_ttl_minutes=5,
     )
 
     QWEN_STANDARD = ModelParameters(
@@ -119,7 +139,7 @@ class ModelDatabase:
     )
 
     OPENAI_4O_SERIES = ModelParameters(
-        context_window=128000, max_output_tokens=16384, tokenizes=OPENAI_VISION
+        context_window=128000, max_output_tokens=16384, tokenizes=OPENAI_MULTIMODAL
     )
 
     OPENAI_O3_SERIES = ModelParameters(
@@ -136,7 +156,11 @@ class ModelDatabase:
         reasoning="openai",
     )
     OPENAI_GPT_OSS_SERIES = ModelParameters(
-        context_window=131072, max_output_tokens=32766, tokenizes=TEXT_ONLY, json_mode="object"
+        context_window=131072,
+        max_output_tokens=32766,
+        tokenizes=TEXT_ONLY,
+        json_mode="object",
+        reasoning="gpt_oss",
     )
     OPENAI_GPT_5 = ModelParameters(
         context_window=400000,
@@ -146,10 +170,26 @@ class ModelDatabase:
     )
 
     ANTHROPIC_OPUS_4_VERSIONED = ModelParameters(
-        context_window=200000, max_output_tokens=32000, tokenizes=ANTHROPIC_MULTIMODAL
+        context_window=200000,
+        max_output_tokens=32000,
+        tokenizes=ANTHROPIC_MULTIMODAL,
+        reasoning="anthropic_thinking",
+        cache_ttl_minutes=5,
     )
     ANTHROPIC_SONNET_4_VERSIONED = ModelParameters(
-        context_window=200000, max_output_tokens=64000, tokenizes=ANTHROPIC_MULTIMODAL
+        context_window=200000,
+        max_output_tokens=64000,
+        tokenizes=ANTHROPIC_MULTIMODAL,
+        reasoning="anthropic_thinking",
+        cache_ttl_minutes=5,
+    )
+    # Claude 3.7 Sonnet supports extended thinking (deprecated but still available)
+    ANTHROPIC_37_SERIES_THINKING = ModelParameters(
+        context_window=200000,
+        max_output_tokens=16384,
+        tokenizes=ANTHROPIC_MULTIMODAL,
+        reasoning="anthropic_thinking",
+        cache_ttl_minutes=5,
     )
 
     DEEPSEEK_CHAT_STANDARD = ModelParameters(
@@ -160,6 +200,15 @@ class ModelDatabase:
         context_window=65536, max_output_tokens=32768, tokenizes=TEXT_ONLY
     )
 
+    DEEPSEEK_V_32 = ModelParameters(
+        context_window=65536,
+        max_output_tokens=32768,
+        tokenizes=TEXT_ONLY,
+        json_mode="object",
+        reasoning="gpt-oss",
+        system_role="developer",
+    )
+
     DEEPSEEK_DISTILL = ModelParameters(
         context_window=131072,
         max_output_tokens=131072,
@@ -167,13 +216,28 @@ class ModelDatabase:
         json_mode="object",
         reasoning="tags",
     )
-    GEMINI_2_5_PRO = ModelParameters(
-        context_window=2097152, max_output_tokens=8192, tokenizes=GOOGLE_MULTIMODAL
+
+    GEMINI_STANDARD = ModelParameters(
+        context_window=1_048_576, max_output_tokens=65_536, tokenizes=GOOGLE_MULTIMODAL
+    )
+
+    GEMINI_2_FLASH = ModelParameters(
+        context_window=1_048_576, max_output_tokens=8192, tokenizes=GOOGLE_MULTIMODAL
     )
 
     # 31/08/25 switched to object mode (even though groq says schema supported and used to work..)
     KIMI_MOONSHOT = ModelParameters(
-        context_window=262144, max_output_tokens=16384, tokenizes=TEXT_ONLY, json_mode="object"
+        context_window=262144,
+        max_output_tokens=16384,
+        tokenizes=TEXT_ONLY,
+        json_mode="object",
+    )
+    KIMI_MOONSHOT_THINKING = ModelParameters(
+        context_window=262144,
+        max_output_tokens=16384,
+        tokenizes=TEXT_ONLY,
+        json_mode="object",
+        reasoning="reasoning_content",
     )
 
     # FIXME: xAI has not documented the max output tokens for Grok 4. Using Grok 3 as a placeholder. Will need to update when available (if ever)
@@ -190,16 +254,49 @@ class ModelDatabase:
     # H U G G I N G F A C E - max output tokens are not documented, using 16k as a reasonable default
     GLM_46 = ModelParameters(
         context_window=202752,
-        max_output_tokens=2048,
+        max_output_tokens=8192,
         tokenizes=TEXT_ONLY,
         json_mode="object",
-        reasoning="tags",
+        reasoning="reasoning_content",
         stream_mode="manual",
+    )
+
+    GLM_47 = ModelParameters(
+        context_window=202752,
+        max_output_tokens=65536,  # default from https://docs.z.ai/guides/overview/concept-param#token-usage-calculation - max is 131072
+        tokenizes=TEXT_ONLY,
+        json_mode="object",
+        reasoning="reasoning_content",
+        stream_mode="manual",
+    )
+
+    MINIMAX_21 = ModelParameters(
+        context_window=202752,
+        max_output_tokens=131072,
+        tokenizes=TEXT_ONLY,
+        json_mode="object",
+        reasoning="reasoning_content",
+        stream_mode="manual",
+    )
+
+    HF_PROVIDER_DEEPSEEK31 = ModelParameters(
+        context_window=163_800, max_output_tokens=8192, tokenizes=TEXT_ONLY
+    )
+
+    HF_PROVIDER_DEEPSEEK32 = ModelParameters(
+        context_window=163_800,
+        max_output_tokens=8192,
+        tokenizes=TEXT_ONLY,
+        reasoning="gpt_oss",
+    )
+
+    HF_PROVIDER_QWEN3_NEXT = ModelParameters(
+        context_window=262_000, max_output_tokens=8192, tokenizes=TEXT_ONLY
     )
 
     # Model configuration database
     # KEEP ALL LOWER CASE KEYS
-    MODELS: Dict[str, ModelParameters] = {
+    MODELS: dict[str, ModelParameters] = {
         # internal models
         "passthrough": FAST_AGENT_STANDARD,
         "silent": FAST_AGENT_STANDARD,
@@ -236,6 +333,10 @@ class ModelDatabase:
         "gpt-5": OPENAI_GPT_5,
         "gpt-5-mini": OPENAI_GPT_5,
         "gpt-5-nano": OPENAI_GPT_5,
+        "gpt-5.1": OPENAI_GPT_5,
+        "gpt-5.1-codex": OPENAI_GPT_5,
+        "gpt-5.2-codex": OPENAI_GPT_5,
+        "gpt-5.2": OPENAI_GPT_5,
         # Anthropic Models
         "claude-3-haiku": ANTHROPIC_35_SERIES,
         "claude-3-haiku-20240307": ANTHROPIC_LEGACY,
@@ -251,29 +352,32 @@ class ModelDatabase:
         "claude-3-5-sonnet-20240620": ANTHROPIC_35_SERIES,
         "claude-3-5-sonnet-20241022": ANTHROPIC_35_SERIES,
         "claude-3-5-sonnet-latest": ANTHROPIC_35_SERIES,
-        "claude-3-7-sonnet": ANTHROPIC_37_SERIES,
-        "claude-3-7-sonnet-20250219": ANTHROPIC_37_SERIES,
-        "claude-3-7-sonnet-latest": ANTHROPIC_37_SERIES,
+        "claude-3-7-sonnet": ANTHROPIC_37_SERIES_THINKING,
+        "claude-3-7-sonnet-20250219": ANTHROPIC_37_SERIES_THINKING,
+        "claude-3-7-sonnet-latest": ANTHROPIC_37_SERIES_THINKING,
         "claude-sonnet-4-0": ANTHROPIC_SONNET_4_VERSIONED,
         "claude-sonnet-4-20250514": ANTHROPIC_SONNET_4_VERSIONED,
         "claude-sonnet-4-5": ANTHROPIC_SONNET_4_VERSIONED,
         "claude-sonnet-4-5-20250929": ANTHROPIC_SONNET_4_VERSIONED,
         "claude-opus-4-0": ANTHROPIC_OPUS_4_VERSIONED,
         "claude-opus-4-1": ANTHROPIC_OPUS_4_VERSIONED,
+        "claude-opus-4-5": ANTHROPIC_OPUS_4_VERSIONED,
         "claude-opus-4-20250514": ANTHROPIC_OPUS_4_VERSIONED,
         "claude-haiku-4-5-20251001": ANTHROPIC_SONNET_4_VERSIONED,
         "claude-haiku-4-5": ANTHROPIC_SONNET_4_VERSIONED,
         # DeepSeek Models
         "deepseek-chat": DEEPSEEK_CHAT_STANDARD,
         # Google Gemini Models (vanilla aliases and versioned)
-        "gemini-2.0-flash": GEMINI_FLASH,
-        "gemini-2.5-flash-preview": GEMINI_FLASH,
-        "gemini-2.5-pro-preview": GEMINI_2_5_PRO,
-        "gemini-2.5-flash-preview-05-20": GEMINI_FLASH,
-        "gemini-2.5-pro-preview-05-06": GEMINI_PRO,
-        "gemini-2.5-pro": GEMINI_PRO,
-        "gemini-2.5-flash-preview-09-2025": GEMINI_FLASH,
-        "gemini-2.5-flash": GEMINI_FLASH,
+        "gemini-2.0-flash": GEMINI_2_FLASH,
+        "gemini-2.5-flash-preview": GEMINI_STANDARD,
+        "gemini-2.5-pro-preview": GEMINI_STANDARD,
+        "gemini-2.5-flash-preview-05-20": GEMINI_STANDARD,
+        "gemini-2.5-pro-preview-05-06": GEMINI_STANDARD,
+        "gemini-2.5-pro": GEMINI_STANDARD,
+        "gemini-2.5-flash-preview-09-2025": GEMINI_STANDARD,
+        "gemini-2.5-flash": GEMINI_STANDARD,
+        "gemini-3-pro-preview": GEMINI_STANDARD,
+        "gemini-3-flash-preview": GEMINI_STANDARD,
         # xAI Grok Models
         "grok-4-fast-reasoning": GROK_4_VLM,
         "grok-4-fast-non-reasoning": GROK_4_VLM,
@@ -283,34 +387,97 @@ class ModelDatabase:
         "grok-3-mini": GROK_3,
         "grok-3-fast": GROK_3,
         "grok-3-mini-fast": GROK_3,
+        "moonshotai/kimi-k2": KIMI_MOONSHOT,
         "moonshotai/kimi-k2-instruct-0905": KIMI_MOONSHOT,
+        "moonshotai/kimi-k2-thinking": KIMI_MOONSHOT_THINKING,
+        "moonshotai/kimi-k2-thinking-0905": KIMI_MOONSHOT_THINKING,
         "qwen/qwen3-32b": QWEN3_REASONER,
         "deepseek-r1-distill-llama-70b": DEEPSEEK_DISTILL,
-        "openai/gpt-oss-120b": OPENAI_GPT_OSS_SERIES,
-        "openai/gpt-oss-20b": OPENAI_GPT_OSS_SERIES,
+        "openai/gpt-oss-120b": OPENAI_GPT_OSS_SERIES,  # https://cookbook.openai.com/articles/openai-harmony
+        "openai/gpt-oss-20b": OPENAI_GPT_OSS_SERIES,  # tool/reasoning interleave guidance
         "zai-org/glm-4.6": GLM_46,
+        "zai-org/glm-4.7": GLM_47,
         "minimaxai/minimax-m2": GLM_46,
+        "minimaxai/minimax-m2.1": MINIMAX_21,
+        "qwen/qwen3-next-80b-a3b-instruct": HF_PROVIDER_QWEN3_NEXT,
+        "deepseek-ai/deepseek-v3.1": HF_PROVIDER_DEEPSEEK31,
+        "deepseek-ai/deepseek-v3.2": HF_PROVIDER_DEEPSEEK32,
     }
 
     @classmethod
-    def get_model_params(cls, model: str) -> Optional[ModelParameters]:
+    def get_model_params(cls, model: str) -> ModelParameters | None:
         """Get model parameters for a given model name"""
-        return cls.MODELS.get(model.lower())
+        if not model:
+            return None
+
+        normalized = cls.normalize_model_name(model)
+        return cls.MODELS.get(normalized)
 
     @classmethod
-    def get_context_window(cls, model: str) -> Optional[int]:
+    def normalize_model_name(cls, model: str) -> str:
+        """Normalize model specs (provider/effort/aliases) to a ModelDatabase key.
+
+        This intentionally delegates to ModelFactory parsing where possible rather than
+        re-implementing model string semantics in the database layer.
+        """
+        from fast_agent.core.exceptions import ModelConfigError
+        from fast_agent.llm.model_factory import ModelFactory
+        from fast_agent.llm.provider_types import Provider
+
+        model_spec = (model or "").strip()
+        if not model_spec:
+            return ""
+
+        # If it's already a known key, keep it as-is (after casing/whitespace normalization).
+        direct_key = model_spec.lower()
+        if direct_key in cls.MODELS:
+            return direct_key
+
+        # Apply aliases first (case-insensitive).
+        aliased = ModelFactory.MODEL_ALIASES.get(model_spec)
+        if not aliased:
+            aliased = ModelFactory.MODEL_ALIASES.get(model_spec.lower())
+        if aliased:
+            model_spec = aliased
+            direct_key = model_spec.strip().lower()
+            if direct_key in cls.MODELS:
+                return direct_key
+
+        # Parse known spec formats to strip provider prefixes and reasoning effort.
+        try:
+            parsed = ModelFactory.parse_model_string(model_spec)
+            model_spec = parsed.model_name
+
+            # HF uses `model:provider` for routing; the suffix is not part of the model id.
+            if parsed.provider == Provider.HUGGINGFACE and ":" in model_spec:
+                model_spec = model_spec.rsplit(":", 1)[0]
+        except ModelConfigError:
+            # Best-effort fallback: keep original spec if it can't be parsed.
+            pass
+
+        # If parsing failed, still support common "model:route" forms by stripping the suffix
+        # only when the base resolves to a known database key.
+        if ":" in model_spec:
+            base = model_spec.rsplit(":", 1)[0].strip().lower()
+            if base in cls.MODELS:
+                return base
+
+        return model_spec.strip().lower()
+
+    @classmethod
+    def get_context_window(cls, model: str) -> int | None:
         """Get context window size for a model"""
         params = cls.get_model_params(model)
         return params.context_window if params else None
 
     @classmethod
-    def get_max_output_tokens(cls, model: str) -> Optional[int]:
+    def get_max_output_tokens(cls, model: str) -> int | None:
         """Get maximum output tokens for a model"""
         params = cls.get_model_params(model)
         return params.max_output_tokens if params else None
 
     @classmethod
-    def get_tokenizes(cls, model: str) -> Optional[List[str]]:
+    def get_tokenizes(cls, model: str) -> list[str] | None:
         """Get supported tokenization types for a model"""
         params = cls.get_model_params(model)
         return params.tokenizes if params else None
@@ -343,7 +510,7 @@ class ModelDatabase:
         return normalized.lower() in normalized_supported
 
     @classmethod
-    def supports_any_mime(cls, model: str, mime_types: List[str]) -> bool:
+    def supports_any_mime(cls, model: str, mime_types: list[str]) -> bool:
         """Return True if the model supports any of the provided MIME types."""
         return any(cls.supports_mime(model, m) for m in mime_types)
 
@@ -380,6 +547,12 @@ class ModelDatabase:
         return 2048  # Fallback for unknown models
 
     @classmethod
-    def list_models(cls) -> List[str]:
+    def get_cache_ttl(cls, model: str) -> int | None:
+        """Get cache TTL in minutes for a model, or None if not supported"""
+        params = cls.get_model_params(model)
+        return params.cache_ttl_minutes if params else None
+
+    @classmethod
+    def list_models(cls) -> list[str]:
         """List all available model names"""
         return list(cls.MODELS.keys())

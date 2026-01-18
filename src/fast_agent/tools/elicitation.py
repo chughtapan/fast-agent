@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, Awaitable, Callable, List, Literal, Optional, Union
+from typing import Any, Awaitable, Callable, Literal, Union
 
 from mcp.server.fastmcp.tools import Tool as FastMCPTool
 from mcp.types import Tool as McpTool
@@ -28,21 +28,21 @@ This module lives in fast_agent to avoid circular imports and provides:
 
 class OptionItem(BaseModel):
     value: Union[str, int, float, bool]
-    label: Optional[str] = None
+    label: str | None = None
 
 
 class FormField(BaseModel):
     name: str
     type: Literal["text", "textarea", "number", "checkbox", "radio"]
-    label: Optional[str] = None
-    help: Optional[str] = None
-    default: Optional[Union[str, int, float, bool]] = None
-    required: Optional[bool] = None
+    label: str | None = None
+    help: str | None = None
+    default: Union[str, int, float, bool] | None = None
+    required: bool | None = None
     # number constraints
-    min: Optional[float] = None
-    max: Optional[float] = None
+    min: float | None = None
+    max: float | None = None
     # select options (for radio)
-    options: Optional[List[OptionItem]] = None
+    options: list[OptionItem] | None = None
 
 
 class HumanFormArgs(BaseModel):
@@ -51,10 +51,10 @@ class HumanFormArgs(BaseModel):
     Preferred shape for LLMs.
     """
 
-    title: Optional[str] = None
-    description: Optional[str] = None
-    message: Optional[str] = None
-    fields: List[FormField] = Field(default_factory=list, max_length=7)
+    title: str | None = None
+    description: str | None = None
+    message: str | None = None
+    fields: list[FormField] = Field(default_factory=list, max_length=7)
 
 
 # -----------------------
@@ -136,7 +136,7 @@ def get_elicitation_tool() -> McpTool:
 # Elicitation input callback registry
 # -----------------------
 
-ElicitationCallback = Callable[[dict, Optional[str], Optional[str], Optional[dict]], Awaitable[str]]
+ElicitationCallback = Callable[[dict, str | None, str | None, dict | None], Awaitable[str]]
 
 _elicitation_input_callback: ElicitationCallback | None = None
 
@@ -198,8 +198,9 @@ async def run_elicitation_form(arguments: dict | str, agent_name: str | None = N
     title: str | None = None
     description: str | None = None
 
-    if isinstance(arguments.get("fields"), list):
-        fields = arguments.get("fields")
+    fields_value = arguments.get("fields")
+    if isinstance(fields_value, list):
+        fields = fields_value
         if len(fields) > 7:
             raise ValueError(
                 f"Error: form requests {len(fields)} fields; the maximum allowed is 7."
@@ -289,17 +290,20 @@ async def run_elicitation_form(arguments: dict | str, agent_name: str | None = N
                 schema = parsed
             else:
                 raise ValueError("Missing or invalid schema. Provide a JSON Schema object.")
+        if not isinstance(schema, dict):
+            raise ValueError("Missing or invalid schema. Provide a JSON Schema object.")
+        schema_dict: dict[str, Any] = schema
         msg = arguments.get("message")
         if isinstance(msg, str):
             message = msg
-        if isinstance(arguments.get("title"), str) and "title" not in schema:
-            schema["title"] = arguments.get("title")
-        if isinstance(arguments.get("description"), str) and "description" not in schema:
-            schema["description"] = arguments.get("description")
-        if isinstance(arguments.get("required"), list) and "required" not in schema:
-            schema["required"] = arguments.get("required")
-        if isinstance(arguments.get("properties"), dict) and "properties" not in schema:
-            schema["properties"] = arguments.get("properties")
+        if isinstance(arguments.get("title"), str) and "title" not in schema_dict:
+            schema_dict["title"] = arguments.get("title")
+        if isinstance(arguments.get("description"), str) and "description" not in schema_dict:
+            schema_dict["description"] = arguments.get("description")
+        if isinstance(arguments.get("required"), list) and "required" not in schema_dict:
+            schema_dict["required"] = arguments.get("required")
+        if isinstance(arguments.get("properties"), dict) and "properties" not in schema_dict:
+            schema_dict["properties"] = arguments.get("properties")
 
     elif ("type" in arguments and "properties" in arguments) or (
         "$schema" in arguments and "properties" in arguments
@@ -309,17 +313,25 @@ async def run_elicitation_form(arguments: dict | str, agent_name: str | None = N
     else:
         raise ValueError("Missing or invalid schema or fields in arguments.")
 
-    props = schema.get("properties", {}) if isinstance(schema.get("properties"), dict) else {}
+    if not isinstance(schema, dict):
+        raise ValueError("Missing or invalid schema or fields in arguments.")
+
+    schema_dict: dict[str, Any] = schema
+    props = (
+        schema_dict.get("properties", {})
+        if isinstance(schema_dict.get("properties"), dict)
+        else {}
+    )
     if len(props) > 7:
         raise ValueError(f"Error: schema requests {len(props)} fields; the maximum allowed is 7.")
 
     request_payload: dict[str, Any] = {
-        "prompt": message or schema.get("title") or "Please complete this form:",
-        "description": schema.get("description"),
+        "prompt": message or schema_dict.get("title") or "Please complete this form:",
+        "description": schema_dict.get("description"),
         "request_id": f"__human_input__{uuid.uuid4()}",
         "metadata": {
             "agent_name": agent_name or "Unknown Agent",
-            "requested_schema": schema,
+            "requested_schema": schema_dict,
         },
     }
 
@@ -344,10 +356,10 @@ async def run_elicitation_form(arguments: dict | str, agent_name: str | None = N
 
 def get_elicitation_fastmcp_tool() -> FastMCPTool:
     async def elicit(
-        title: Optional[str] = None,
-        description: Optional[str] = None,
-        message: Optional[str] = None,
-        fields: List[FormField] = Field(default_factory=list, max_length=7),
+        title: str | None = None,
+        description: str | None = None,
+        message: str | None = None,
+        fields: list[FormField] = Field(default_factory=list, max_length=7),
     ) -> str:
         args = {
             "title": title,

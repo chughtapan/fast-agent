@@ -45,6 +45,7 @@ def get_test_models():
         return [test_model]
     else:
         return [
+            "gemini3flash",
             "gpt-4.1-mini",
             #            "sonnet",
             "haiku",
@@ -54,10 +55,13 @@ def get_test_models():
             "gpt-oss",
             "minimax",
             "kimigroq",
+            "kimithink",
             "kimi",
             "glm",
-            #            "responses.gpt-5-mini",
-            #     "generic.qwen3:8b",
+            "qwen3:together",
+            "deepseek31",
+            # "responses.gpt-5-mini",
+            "generic.qwen3:8b",
         ]
 
         # "minimax": "hf.MiniMaxAI/MiniMax-M2",
@@ -77,7 +81,7 @@ async def llm_agent_setup(model_name):
     test_config = AgentConfig("test")
 
     # Pass the config file path from the test directory
-    config_path = os.path.join(os.path.dirname(__file__), "fastagent.config.yaml")
+    config_path = Path(__file__).parent / "fastagent.config.yaml"
 
     # Initialize Core and agent
     core = Core(settings=config_path)
@@ -226,7 +230,7 @@ async def test_tool_const_schema(llm_agent_setup, model_name):
     """Ensure providers accept tool schemas that include const constraints."""
     agent = llm_agent_setup
     # should really refer to model db and extend all reasoning models :)
-    max_tokens = 500 if ("minimax" in model_name or "glm" in model_name) else 100
+    max_tokens = 500 if ("minimax" in model_name or "glm" in model_name) else 200
     result = await agent.generate(
         "call the const_mode tool so I can confirm the mode you must use.",
         tools=[_const_tool],

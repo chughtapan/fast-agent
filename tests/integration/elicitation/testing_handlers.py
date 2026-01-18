@@ -5,7 +5,7 @@ These handlers are designed specifically for testing scenarios
 where you need predictable, automated responses.
 """
 
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any
 
 from mcp.shared.context import RequestContext
 from mcp.types import ElicitRequestParams, ElicitResult
@@ -29,9 +29,10 @@ async def auto_accept_test_handler(
     """
     logger.info(f"Auto-accept test handler called: {params.message}")
 
-    if params.requestedSchema:
+    requested_schema = getattr(params, "requestedSchema", None)
+    if requested_schema:
         # Generate realistic test data based on schema
-        content = _generate_test_response(params.requestedSchema)
+        content = _generate_test_response(requested_schema)
         return ElicitResult(action="accept", content=content)
     else:
         return ElicitResult(action="accept", content={"response": "auto-test-response"})
@@ -55,7 +56,7 @@ async def auto_cancel_test_handler(
     return ElicitResult(action="cancel")
 
 
-def _generate_test_response(schema: Dict[str, Any]) -> Dict[str, Any]:
+def _generate_test_response(schema: dict[str, Any]) -> dict[str, Any]:
     """Generate realistic test data based on JSON schema."""
     if not schema or "properties" not in schema:
         return {"response": "default-test"}

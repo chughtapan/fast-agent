@@ -1,0 +1,7 @@
+(undo-tree-save-format-version . 1)
+"6be25f91fe7e33c6d6cf04ef56173db37f8783f8"
+[nil nil nil nil (26766 31958 802703 0) 0 nil]
+([nil nil ((#(", Generic[_T]" 0 9 (fontified t) 9 10 (face (rainbow-delimiters-depth-2-face) fontified t) 10 12 (fontified t) 12 13 (face (rainbow-delimiters-depth-2-face) fontified t)) . -336) (undo-tree-id1 . -6) (undo-tree-id2 . -13) (undo-tree-id3 . -6) (undo-tree-id4 . -6) (undo-tree-id5 . -6) (undo-tree-id6 . -6) (undo-tree-id7 . -6) (undo-tree-id8 . -6) (undo-tree-id9 . -6) (undo-tree-id10 . -6) (undo-tree-id11 . -9) (undo-tree-id12 . -9) (undo-tree-id13 . -9) (undo-tree-id14 . -13) (undo-tree-id15 . -13) (undo-tree-id16 . -13) (undo-tree-id17 . -13) 345 (t 26766 31668 702343 54000)) nil (26766 31958 802702 0) 0 nil])
+([nil nil ((#("Generic" 0 7 (fontified t)) . -71) (undo-tree-id0 . -7) 78) nil (26766 31958 802693 0) 0 nil])
+([nil current ((#(" " 0 1 (ws-butler-chg delete fontified t)) . 71) (#("," 0 1 (ws-butler-chg delete fontified t)) . 71)) nil (26766 31958 802659 0) 0 nil])
+nil

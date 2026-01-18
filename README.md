@@ -63,8 +63,11 @@ fast-agent go --model=generic.qwen2.5  # use ollama qwen 2.5
 fast-agent setup                       # create an example agent and config files
 uv run agent.py                        # run your first agent
 uv run agent.py --model=o3-mini.low    # specify a model
+uv run agent.py --transport http --port 8001  # expose as MCP server (server mode implied)
 fast-agent quickstart workflow  # create "building effective agents" examples
 ```
+
+`--server` remains available for backward compatibility but is deprecated; `--transport` now automatically switches an agent into server mode.
 
 Other quickstart examples include a Researcher Agent (with Evaluator-Optimizer workflow) and Data Analysis Agent (similar to the ChatGPT experience), demonstrating MCP Roots support.
 
@@ -159,6 +162,74 @@ uv run workflow/chaining.py --agent post_writer --message "<url>"
 
 Add the `--quiet` switch to disable progress and message display and return only the final response - useful for simple automations.
 
+### MAKER
+
+MAKER (“Massively decomposed Agentic processes with K-voting Error Reduction”) wraps a worker agent and samples it repeatedly until a response achieves a k-vote margin over all alternatives (“first-to-ahead-by-k” voting). This is useful for long chains of simple steps where rare errors would otherwise compound.
+
+- Reference: [Solving a Million-Step LLM Task with Zero Errors](https://arxiv.org/abs/2511.09030)
+- Credit: Lucid Programmer (PR author)
+
+```python
+@fast.agent(
+  name="classifier",
+  instruction="Reply with only: A, B, or C.",
+)
+@fast.maker(
+  name="reliable_classifier",
+  worker="classifier",
+  k=3,
+  max_samples=25,
+  match_strategy="normalized",
+  red_flag_max_length=16,
+)
+async def main():
+  async with fast.run() as agent:
+    await agent.reliable_classifier.send("Classify: ...")
+```
+
+### Agents As Tools
+
+The Agents As Tools workflow takes a complex task, breaks it into subtasks, and calls other agents as tools based on the main agent instruction.
+
+This pattern is inspired by the OpenAI Agents SDK [Agents as tools](https://openai.github.io/openai-agents-python/tools/#agents-as-tools) feature.
+
+With child agents exposed as tools, you can implement routing, parallelization, and orchestrator-workers [decomposition](https://www.anthropic.com/engineering/building-effective-agents) directly in the instruction (and combine them). Multiple tool calls per turn are supported and executed in parallel.
+
+Common usage patterns may combine:
+
+- Routing: choose the right specialist tool(s) based on the user prompt.
+- Parallelization: fan out over independent items/projects, then aggregate.
+- Orchestrator-workers: break a task into scoped subtasks (often via a simple JSON plan), then coordinate execution.
+
+```python
+@fast.agent(
+    name="NY-Project-Manager",
+    instruction="Return NY time + timezone, plus a one-line project status.",
+    servers=["time"],
+)
+@fast.agent(
+    name="London-Project-Manager",
+    instruction="Return London time + timezone, plus a one-line news update.",
+    servers=["time"],
+)
+@fast.agent(
+    name="PMO-orchestrator",
+    instruction=(
+        "Get reports. Always use one tool call per project/news. "  # parallelization
+        "Responsibilities: NY projects: [OpenAI, Fast-Agent, Anthropic]. London news: [Economics, Art, Culture]. "  # routing
+        "Aggregate results and add a one-line PMO summary."
+    ),
+    default=True,
+    agents=["NY-Project-Manager", "London-Project-Manager"],  # orchestrator-workers
+)
+async def main() -> None:
+    async with fast.run() as agent:
+        await agent("Get PMO report. Projects: all. News: Art, Culture")
+```
+
+Extended example and all params sample is available in the repository as
+[`examples/workflows/agents_as_tools_extended.py`](examples/workflows/agents_as_tools_extended.py).
+
 ## MCP OAuth (v2.1)
 
 For SSE and HTTP MCP servers, OAuth is enabled by default with minimal configuration. A local callback server is used to capture the authorization code, with a paste-URL fallback if the port is unavailable.
@@ -194,6 +265,20 @@ mcp:
 ```
 
 - To disable OAuth for a specific server , set `auth.oauth: false` for that server.
+
+## MCP Ping (optional)
+
+The MCP ping utility can be enabled by either peer (client or server). See the [Ping overview](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/ping#overview).
+
+Client-side pinging is configured per server (default: 30s interval, 3 missed pings):
+
+```yaml
+mcp:
+  servers:
+    myserver:
+      ping_interval_seconds: 30 # optional; <=0 disables
+      max_missed_pings: 3 # optional; consecutive timeouts before marking failed
+```
 
 ## Workflows
 
@@ -297,7 +382,7 @@ Look at the `router.py` workflow for an example.
 
 ### Orchestrator
 
-Given a complex task, the Orchestrator uses an LLM to generate a plan to divide the task amongst the available Agents. The planning and aggregation prompts are generated by the Orchestrator, which benefits from using more capable models. Plans can either be built once at the beginning (`plantype="full"`) or iteratively (`plantype="iterative"`).
+Given a complex task, the Orchestrator uses an LLM to generate a plan to divide the task amongst the available Agents. The planning and aggregation prompts are generated by the Orchestrator, which benefits from using more capable models. Plans can either be built once at the beginning (`plan_type="full"`) or iteratively (`plan_type="iterative"`).
 
 ```python
 @fast.orchestrator(
@@ -409,6 +494,33 @@ agent["greeter"].send("Good Evening!")          # Dictionary access is supported
 )
 ```
 
+#### MAKER
+
+```python
+@fast.maker(
+  name="maker",                           # name of the workflow
+  worker="worker_agent",                  # worker agent name
+  k=3,                                    # voting margin (first-to-ahead-by-k)
+  max_samples=50,                         # maximum number of samples
+  match_strategy="exact",                 # exact|normalized|structured
+  red_flag_max_length=256,                # flag unusually long outputs
+  instruction="instruction",              # optional instruction override
+)
+```
+
+#### Agents As Tools
+
+```python
+@fast.agent(
+  name="orchestrator",                    # orchestrator agent name
+  instruction="instruction",              # orchestrator instruction (routing/decomposition/aggregation)
+  agents=["agent1", "agent2"],            # exposed as tools: agent__agent1, agent__agent2
+  max_parallel=128,                       # cap parallel child tool calls (OpenAI limit is 128)
+  child_timeout_sec=600,                  # per-child timeout (seconds)
+  max_display_instances=20,               # collapse progress display after top-N instances
+)
+```
+
 ### Multimodal Support
 
 Add Resources to prompts using either the inbuilt `prompt-server` or MCP Types directly. Convenience class are made available to do so simply, for example:
@@ -427,6 +539,8 @@ LLM APIs have restrictions on the content types that can be returned as Tool Cal
 
 - OpenAI supports Text
 - Anthropic supports Text and Image
+- Google supports Text, Image, PDF, and Video (e.g., `video/mp4`).
+  > **Note**: Inline video data is limited to 20MB. For larger files, use the File API. YouTube URLs are supported directly.
 
 For MCP Tool Results, `ImageResources` and `EmbeddedResources` are converted to User Messages and added to the conversation.
 

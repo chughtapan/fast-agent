@@ -16,6 +16,7 @@ class ServeTransport(str, Enum):
     HTTP = "http"
     SSE = "sse"
     STDIO = "stdio"
+    ACP = "acp"
 
 
 class InstanceScope(str, Enum):
@@ -40,6 +41,17 @@ def serve(
     config_path: str | None = typer.Option(None, "--config-path", "-c", help="Path to config file"),
     servers: str | None = typer.Option(
         None, "--servers", help="Comma-separated list of server names to enable from config"
+    ),
+    agent_cards: list[str] | None = typer.Option(
+        None,
+        "--agent-cards",
+        "--card",
+        help="Path or URL to an AgentCard file or directory (repeatable)",
+    ),
+    card_tools: list[str] | None = typer.Option(
+        None,
+        "--card-tool",
+        help="Path or URL to an AgentCard file or directory to load as tools (repeatable)",
     ),
     urls: str | None = typer.Option(
         None, "--url", help="Comma-separated list of HTTP/SSE URLs to connect to"
@@ -74,7 +86,7 @@ def serve(
     transport: ServeTransport = typer.Option(
         ServeTransport.HTTP,
         "--transport",
-        help="Transport protocol to expose (http, sse, stdio)",
+        help="Transport protocol to expose (http, sse, stdio, acp)",
     ),
     host: str = typer.Option(
         "0.0.0.0",
@@ -97,6 +109,13 @@ def serve(
         "--instance-scope",
         help="Control how MCP clients receive isolated agent instances (shared, connection, request)",
     ),
+    no_permissions: bool = typer.Option(
+        False,
+        "--no-permissions",
+        help="Disable tool permission requests (allow all tool executions without asking) - ACP only",
+    ),
+    reload: bool = typer.Option(False, "--reload", help="Enable manual AgentCard reloads"),
+    watch: bool = typer.Option(False, "--watch", help="Watch AgentCard paths and reload"),
 ) -> None:
     """
     Run FastAgent as an MCP server.
@@ -107,6 +126,7 @@ def serve(
         fast-agent serve --stdio "python my_server.py --debug"
         fast-agent serve --npx "@modelcontextprotocol/server-filesystem /path/to/data"
         fast-agent serve --description "Interact with the {agent} assistant"
+        fast-agent serve --agent-cards ./agents --transport=http --port=8000
     """
     stdio_commands = collect_stdio_commands(npx, uvx, stdio)
     shell_enabled = shell
@@ -118,6 +138,8 @@ def serve(
         instruction=resolved_instruction,
         config_path=config_path,
         servers=servers,
+        agent_cards=agent_cards,
+        card_tools=card_tools,
         urls=urls,
         auth=auth,
         model=model,
@@ -133,4 +155,7 @@ def serve(
         port=port,
         tool_description=description,
         instance_scope=instance_scope.value,
+        permissions_enabled=not no_permissions,
+        reload=reload,
+        watch=watch,
     )

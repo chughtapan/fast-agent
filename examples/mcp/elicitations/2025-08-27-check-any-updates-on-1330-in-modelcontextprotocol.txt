@@ -1,0 +1,56 @@
+╭────────────────────────────────────────────────────────────────╮
+│ ✻ Welcome to Claude Code!                                      │
+│                                                                │
+│   /help for help, /status for your current setup               │
+│                                                                │
+│   cwd: /Users/tapanc/dev/fast-agent/examples/mcp/elicitations  │
+╰────────────────────────────────────────────────────────────────╯
+
+> Check any updates on #1330 in modelcontextprotocol
+
+⏺ I'll check for updates on issue #1330 in the modelcontextprotocol repository.
+
+⏺ github - Get issue details (MCP)(owner: "modelcontextprotocol", repo: "servers", issue_number: 1330)
+  ⎿  {                                                                                                                                                                                                                                                                   
+       "id": 2981356143,
+       "number": 1330,
+     … +103 lines (ctrl+r to expand)
+
+⏺ github - Get issue comments (MCP)(owner: "modelcontextprotocol", repo: "servers", issue_number: 1330)
+  ⎿  [                                                                                                                                                                                                                                                                   
+       {
+         "id": 3086383083,
+     … +42 lines (ctrl+r to expand)
+
+⏺ PR #1330 in modelcontextprotocol/servers is closed. It was a documentation PR to add the Scrapeless MCP Server to the README. The PR was closed on July 18, 2025 by @olaservo because changes were requested but not addressed for an extended period. The submitter can
+   reopen if they still want to update and merge the PR.
+
+> Why did you choose the servers repository?
+
+⏺ You're right to question that. I assumed you meant the "servers" repository because it's the most commonly referenced repo in the modelcontextprotocol organization, but I should have checked which repository actually has issue #1330.
+
+  Let me search for the correct repository:
+
+⏺ github - Search issues (MCP)(query: "repo:modelcontextprotocol/modelcontextprotocol number:1330")
+  ⎿  {                                                                                                                                                                                                                                                                   
+       "total_count": 0,
+       "incomplete_results": false
+     }
+
+⏺ github - Get issue details (MCP)(owner: "modelcontextprotocol", repo: "modelcontextprotocol", issue_number: 1330)
+  ⎿  {                                                                                                                                                                                                                                                                   
+       "id": 3311905307,
+       "number": 1330,
+     … +189 lines (ctrl+r to expand)
+
+⏺ You caught that! I initially checked the "servers" repository because that's a common one, but you're asking about issue #1330 in the "modelcontextprotocol" repository itself.
+
+  This issue is open and is a Standards Enhancement Proposal (SEP-1330) about improving enum schema definitions for MCP elicitation. It's currently in review status and proposes:
+
+  1. Deprecating the non-standard enumNames property
+  2. Introducing JSON Schema-compliant patterns using oneOf for single-select and anyOf for multi-select enums
+  3. Supporting both titled and untitled enum varieties
+  4. Extending ElicitResult to support string arrays for multi-select responses
+
+  The proposal is authored by Cliff Hall and yourself (Tapan Chugh), includes reference implementations, and was last updated on August 25, 2025. It's currently assigned to Cliff Hall for review.
+

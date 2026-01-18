@@ -8,7 +8,8 @@ import os
 import signal
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Awaitable, Callable, Set
+from importlib.metadata import version as get_version
+from typing import Any, AsyncContextManager, Awaitable, Callable, Literal, Protocol, cast
 
 from mcp.server.fastmcp import Context as MCPContext
 from mcp.server.fastmcp import FastMCP
@@ -17,8 +18,53 @@ import fast_agent.core
 import fast_agent.core.prompt
 from fast_agent.core.fastagent import AgentInstance
 from fast_agent.core.logging.logger import get_logger
+from fast_agent.mcp.tool_progress import MCPToolProgressManager
+from fast_agent.types import RequestParams
+from fast_agent.utils.async_utils import run_sync
 
 logger = get_logger(__name__)
+
+
+def _get_oauth_config() -> tuple[str | None, list[str], str]:
+    """
+    Read OAuth configuration from environment variables.
+
+    Returns:
+        Tuple of (provider, scopes, resource_url).
+        provider is None if OAuth is not enabled.
+    """
+    oauth_provider = os.environ.get("FAST_AGENT_SERVE_OAUTH", "").lower()
+
+    # Normalize provider aliases
+    if oauth_provider in ("hf", "huggingface"):
+        oauth_provider = "huggingface"
+    elif not oauth_provider:
+        oauth_provider = None
+
+    # Parse scopes from comma-separated string
+    oauth_scopes_str = os.environ.get("FAST_AGENT_OAUTH_SCOPES", "")
+    oauth_scopes = [s.strip() for s in oauth_scopes_str.split(",") if s.strip()] or ["access"]
+
+    # Resource URL defaults to localhost:8000
+    resource_url = os.environ.get("FAST_AGENT_OAUTH_RESOURCE_URL", "http://localhost:8000")
+
+    return oauth_provider, oauth_scopes, resource_url
+
+
+TransportMode = Literal["http", "sse", "stdio"]
+McpTransportMode = Literal["streamable-http", "sse", "stdio"]
+
+
+class _LocalSseTransport(Protocol):
+    connect_sse: Callable[..., AsyncContextManager[Any]]
+    _read_stream_writers: dict[Any, Any]
+
+
+class _FastMCPLocalExtensions(Protocol):
+    _sse_transport: _LocalSseTransport | None
+    _lifespan_state: str
+    _on_shutdown: Callable[[], Awaitable[None]]
+    _server_should_exit: bool
 
 
 class AgentMCPServer:
@@ -33,22 +79,73 @@ class AgentMCPServer:
         server_name: str = "FastAgent-MCP-Server",
         server_description: str | None = None,
         tool_description: str | None = None,
+        host: str = "0.0.0.0",
+        get_registry_version: Callable[[], int] | None = None,
+        reload_callback: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         """Initialize the server with the provided agent app."""
         self.primary_instance = primary_instance
         self._create_instance_task = create_instance
         self._dispose_instance_task = dispose_instance
         self._instance_scope = instance_scope
+        self._get_registry_version = get_registry_version
+        self._reload_callback = reload_callback
+        self._primary_registry_version = getattr(primary_instance, "registry_version", 0)
+        self._shared_instance_lock = asyncio.Lock()
+        self._shared_active_requests = 0
+        self._stale_instances: list[AgentInstance] = []
+
+        # Check for OAuth configuration
+        oauth_provider, oauth_scopes, resource_url = _get_oauth_config()
+        token_verifier = None
+        auth_settings = None
+
+        if oauth_provider == "huggingface":
+            from mcp.server.auth.settings import AuthSettings
+            from pydantic import AnyHttpUrl
+
+            from fast_agent.mcp.auth.presence import PresenceTokenVerifier
+
+            token_verifier = PresenceTokenVerifier(provider="huggingface", scopes=oauth_scopes)
+            auth_settings = AuthSettings(
+                issuer_url=AnyHttpUrl("https://huggingface.co"),
+                resource_server_url=AnyHttpUrl(resource_url),
+                required_scopes=oauth_scopes,
+            )
+            logger.info(
+                f"OAuth enabled for provider '{oauth_provider}'",
+                name="oauth_enabled",
+                provider=oauth_provider,
+                scopes=oauth_scopes,
+                resource_url=resource_url,
+            )
+
         self.mcp_server: FastMCP = FastMCP(
             name=server_name,
-            instructions=server_description
-            or f"This server provides access to {len(primary_instance.agents)} agents",
+            instructions=self._build_instructions(server_description),
+            token_verifier=token_verifier,
+            auth=auth_settings,
+            host=host,
         )
+        self._set_mcp_version()
+        self._configure_capabilities()
+
+        # Register root route for HTTP/SSE transport info
+        @self.mcp_server.custom_route("/", methods=["GET"])
+        async def root_info(request):
+            from starlette.responses import PlainTextResponse
+
+            version = get_version("fast-agent-mcp")
+            return PlainTextResponse(
+                f"fast-agent mcp server (v{version}) - see https://fast-agent.ai for more information."
+            )
+
         if self._instance_scope == "request":
             # Ensure FastMCP does not attempt to maintain sessions for stateless mode
             self.mcp_server.settings.stateless_http = True
         self._tool_description = tool_description
         self._shared_instance_active = True
+        self._registered_agents: set[str] = set(primary_instance.agents.keys())
         # Shutdown coordination
         self._graceful_shutdown_event = asyncio.Event()
         self._force_shutdown_event = asyncio.Event()
@@ -56,7 +153,7 @@ class AgentMCPServer:
 
         # Resource management
         self._exit_stack = AsyncExitStack()
-        self._active_connections: Set[any] = set()
+        self._active_connections: set[object] = set()
 
         # Server state
         self._server_task = None
@@ -83,9 +180,12 @@ class AgentMCPServer:
         """Register all agents as MCP tools."""
         for agent_name in self.primary_instance.agents.keys():
             self.register_agent_tools(agent_name)
+        if self._reload_callback is not None:
+            self._register_reload_tool()
 
     def register_agent_tools(self, agent_name: str) -> None:
         """Register tools for a specific agent."""
+        self._registered_agents.add(agent_name)
 
         # Basic send message tool
         tool_description = (
@@ -94,83 +194,242 @@ class AgentMCPServer:
             else self._tool_description
         )
 
+        agent = self.primary_instance.agents.get(agent_name)
+        agent_description = None
+        if agent is not None:
+            config = getattr(agent, "config", None)
+            agent_description = getattr(config, "description", None)
+
         @self.mcp_server.tool(
             name=f"{agent_name}_send",
-            description=tool_description or f"Send a message to the {agent_name} agent",
+            description=tool_description
+            or agent_description
+            or f"Send a message to the {agent_name} agent",
             structured_output=False,
             # MCP 1.10.1 turns every tool in to a structured output
         )
         async def send_message(message: str, ctx: MCPContext) -> str:
             """Send a message to the agent and return its response."""
-            instance = await self._acquire_instance(ctx)
-            agent = instance.app[agent_name]
-            agent_context = getattr(agent, "context", None)
+            # Extract bearer token from auth context for token passthrough
+            from fast_agent.mcp.auth.context import request_bearer_token
 
-            # Define the function to execute
-            async def execute_send():
-                start = time.perf_counter()
-                logger.info(
-                    f"MCP request received for agent '{agent_name}'",
-                    name="mcp_request_start",
-                    agent=agent_name,
-                    session=self._session_identifier(ctx),
-                )
-                self.std_logger.info(
-                    "MCP request received for agent '%s' (scope=%s)",
-                    agent_name,
-                    self._instance_scope,
-                )
-
-                response = await agent.send(message)
-                duration = time.perf_counter() - start
-
-                logger.info(
-                    f"Agent '{agent_name}' completed MCP request",
-                    name="mcp_request_complete",
-                    agent=agent_name,
-                    duration=duration,
-                    session=self._session_identifier(ctx),
-                )
-                self.std_logger.info(
-                    "Agent '%s' completed MCP request in %.2fs (scope=%s)",
-                    agent_name,
-                    duration,
-                    self._instance_scope,
-                )
-                return response
-
+            bearer_token = None
             try:
-                # Execute with bridged context
-                if agent_context and ctx:
-                    return await self.with_bridged_context(agent_context, ctx, execute_send)
-                return await execute_send()
-            finally:
-                await self._release_instance(ctx, instance)
+                from mcp.server.auth.middleware.auth_context import get_access_token
 
-        # Register a history prompt for this agent
-        @self.mcp_server.prompt(
-            name=f"{agent_name}_history",
-            description=f"Conversation history for the {agent_name} agent",
+                access_token = get_access_token()
+                if access_token:
+                    bearer_token = access_token.token
+            except Exception:
+                # Auth context not available (e.g., no auth configured)
+                pass
+
+            # Set the token in our contextvar for LLM provider access
+            saved_token = request_bearer_token.set(bearer_token)
+            report_progress = self._build_progress_reporter(ctx)
+            request_params = RequestParams(
+                tool_execution_handler=MCPToolProgressManager(report_progress),
+                emit_loop_progress=True,
+            )
+            try:
+                instance = await self._acquire_instance(ctx)
+                agent = instance.app[agent_name]
+                agent_context = getattr(agent, "context", None)
+
+                # Define the function to execute
+                async def execute_send():
+                    start = time.perf_counter()
+                    logger.info(
+                        f"MCP request received for agent '{agent_name}'",
+                        name="mcp_request_start",
+                        agent=agent_name,
+                        session=self._session_identifier(ctx),
+                    )
+                    self.std_logger.info(
+                        "MCP request received for agent '%s' (scope=%s)",
+                        agent_name,
+                        self._instance_scope,
+                    )
+
+                    response = await agent.send(message, request_params=request_params)
+                    duration = time.perf_counter() - start
+
+                    logger.info(
+                        f"Agent '{agent_name}' completed MCP request",
+                        name="mcp_request_complete",
+                        agent=agent_name,
+                        duration=duration,
+                        session=self._session_identifier(ctx),
+                    )
+                    self.std_logger.info(
+                        "Agent '%s' completed MCP request in %.2fs (scope=%s)",
+                        agent_name,
+                        duration,
+                        self._instance_scope,
+                    )
+                    return response
+
+                try:
+                    # Execute with bridged context
+                    if agent_context and ctx:
+                        return await self.with_bridged_context(agent_context, ctx, execute_send)
+                    return await execute_send()
+                finally:
+                    await self._release_instance(ctx, instance)
+            finally:
+                # Always reset the contextvar
+                request_bearer_token.reset(saved_token)
+
+        if self._instance_scope != "request":
+            # Register a history prompt for this agent
+            @self.mcp_server.prompt(
+                name=f"{agent_name}_history",
+                description=f"Conversation history for the {agent_name} agent",
+            )
+            async def get_history_prompt(ctx: MCPContext) -> list:
+                """Return the conversation history as MCP messages."""
+                instance = await self._acquire_instance(ctx)
+                agent = instance.app[agent_name]
+                try:
+                    multipart_history = agent.message_history
+                    if not multipart_history:
+                        return []
+
+                    # Convert the multipart message history to standard PromptMessages
+                    prompt_messages = fast_agent.core.prompt.Prompt.from_multipart(
+                        multipart_history
+                    )
+                    # In FastMCP, we need to return the raw list of messages
+                    return [{"role": msg.role, "content": msg.content} for msg in prompt_messages]
+                finally:
+                    await self._release_instance(ctx, instance, reuse_connection=True)
+
+    def _register_missing_agents(self, instance: AgentInstance) -> None:
+        new_agents = set(instance.agents.keys())
+        missing = new_agents - self._registered_agents
+        for agent_name in sorted(missing):
+            self.register_agent_tools(agent_name)
+
+    def _register_reload_tool(self) -> None:
+        @self.mcp_server.tool(
+            name="reload_agent_cards",
+            description="Reload AgentCards from disk",
+            structured_output=False,
         )
-        async def get_history_prompt(ctx: MCPContext) -> list:
-            """Return the conversation history as MCP messages."""
-            instance = await self._acquire_instance(ctx)
-            agent = instance.app[agent_name]
+        async def reload_agent_cards(ctx: MCPContext) -> str:
+            if not self._reload_callback:
+                return "Reload not available."
+            changed = await self._reload_callback()
+            if not changed:
+                return "No AgentCard changes detected."
+
+            if self._instance_scope == "shared":
+                await self._maybe_refresh_shared_instance()
+                return "Reloaded AgentCards."
+
+            if self._instance_scope == "connection":
+                session_key = self._connection_key(ctx)
+                new_instance = await self._create_instance_task()
+                old_instance = None
+                async with self._connection_lock:
+                    old_instance = self._connection_instances.get(session_key)
+                    self._connection_instances[session_key] = new_instance
+                self._register_missing_agents(new_instance)
+                if old_instance is not None:
+                    await self._dispose_instance_task(old_instance)
+                return "Reloaded AgentCards."
+
+            # request scope: register tools from a fresh instance, then dispose it
+            new_instance = await self._create_instance_task()
             try:
-                if not hasattr(agent, "_llm") or agent._llm is None:
-                    return []
-
-                # Convert the multipart message history to standard PromptMessages
-                multipart_history = agent._llm.message_history
-                prompt_messages = fast_agent.core.prompt.Prompt.from_multipart(multipart_history)
-
-                # In FastMCP, we need to return the raw list of messages
-                return [{"role": msg.role, "content": msg.content} for msg in prompt_messages]
+                self._register_missing_agents(new_instance)
             finally:
-                await self._release_instance(ctx, instance, reuse_connection=True)
+                await self._dispose_instance_task(new_instance)
+            return "Reloaded AgentCards."
+
+    def _set_mcp_version(self) -> None:
+        try:
+            self.mcp_server._mcp_server.version = get_version("fast-agent-mcp")
+            return
+        except Exception:
+            pass
+        try:
+            self.mcp_server._mcp_server.version = get_version("fast-agent")
+        except Exception:
+            pass
+
+    def _configure_capabilities(self) -> None:
+        from mcp import types
+
+        handlers = self.mcp_server._mcp_server.request_handlers
+        for request_type in (
+            types.ListResourcesRequest,
+            types.ReadResourceRequest,
+            types.ListResourceTemplatesRequest,
+        ):
+            handlers.pop(request_type, None)
+
+        if self._instance_scope == "request":
+            for request_type in (
+                types.ListPromptsRequest,
+                types.GetPromptRequest,
+            ):
+                handlers.pop(request_type, None)
+
+    def _build_instructions(self, server_description: str | None) -> str:
+        agent_count = len(self.primary_instance.agents)
+        base = server_description or f"This server provides access to {agent_count} agents."
+        if self._instance_scope == "request":
+            scope_info = "do NOT retain history between your requests"
+        elif self._instance_scope == "connection":
+            scope_info = "retain history between tool calls."
+        else:
+            scope_info = "retain history between tool calls."
+        return (
+            f"{base} Use the  `{self._name_for_send_tool()}` tools to send messages to agents. "
+            f"Instance mode is {self._instance_scope} "
+            f"Agents ({scope_info})"
+        )
+
+    def _name_for_send_tool(self) -> str:
+        return "<agent>_send"
+
+    def _build_progress_reporter(
+        self, ctx: MCPContext
+    ) -> Callable[[float, float | None, str | None], Awaitable[None]]:
+        async def report_progress(
+            progress: float, total: float | None = None, message: str | None = None
+        ) -> None:
+            try:
+                meta = ctx.request_context.meta
+                progress_token = meta.progressToken if meta else None
+                if progress_token is None:
+                    return
+
+                from mcp import types
+
+                await ctx.request_context.session.send_notification(
+                    types.ServerNotification(
+                        types.ProgressNotification(
+                            params=types.ProgressNotificationParams(
+                                progressToken=progress_token,
+                                progress=progress,
+                                total=total,
+                                message=message,
+                            )
+                        )
+                    ),
+                    related_request_id=ctx.request_context.request_id,
+                )
+            except Exception:
+                pass
+
+        return report_progress
 
     async def _acquire_instance(self, ctx: MCPContext | None) -> AgentInstance:
         if self._instance_scope == "shared":
+            await self._maybe_refresh_shared_instance()
+            self._shared_active_requests += 1
             return self.primary_instance
 
         if self._instance_scope == "request":
@@ -194,7 +453,11 @@ class AgentMCPServer:
         *,
         reuse_connection: bool = False,
     ) -> None:
-        if self._instance_scope == "request":
+        if self._instance_scope == "shared":
+            if self._shared_active_requests > 0:
+                self._shared_active_requests -= 1
+            await self._dispose_stale_instances_if_idle()
+        elif self._instance_scope == "request":
             await self._dispose_instance_task(instance)
         elif self._instance_scope == "connection" and reuse_connection is False:
             # Connection-scoped instances persist until session cleanup
@@ -223,12 +486,56 @@ class AgentMCPServer:
             return request.headers.get("mcp-session-id")
         return None
 
+    async def _maybe_refresh_shared_instance(self) -> None:
+        if not self._get_registry_version:
+            return
+        latest_version = self._get_registry_version()
+        if latest_version <= self._primary_registry_version:
+            return
+
+        async with self._shared_instance_lock:
+            latest_version = self._get_registry_version()
+            if latest_version <= self._primary_registry_version:
+                return
+
+            new_instance = await self._create_instance_task()
+            old_instance = self.primary_instance
+            self.primary_instance = new_instance
+            self._primary_registry_version = getattr(
+                new_instance, "registry_version", latest_version
+            )
+            self._stale_instances.append(old_instance)
+
+            new_agents = set(new_instance.agents.keys())
+            missing = new_agents - self._registered_agents
+            for agent_name in sorted(missing):
+                self.register_agent_tools(agent_name)
+
+    async def _dispose_stale_instances_if_idle(self) -> None:
+        if self._shared_active_requests:
+            return
+        if not self._stale_instances:
+            return
+
+        stale = list(self._stale_instances)
+        self._stale_instances.clear()
+        for instance in stale:
+            await self._dispose_instance_task(instance)
+
     async def _dispose_primary_instance(self) -> None:
         if self._shared_instance_active:
             try:
                 await self._dispose_instance_task(self.primary_instance)
             finally:
                 self._shared_instance_active = False
+
+    async def _dispose_all_stale_instances(self) -> None:
+        if not self._stale_instances:
+            return
+        stale = list(self._stale_instances)
+        self._stale_instances.clear()
+        for instance in stale:
+            await self._dispose_instance_task(instance)
 
     async def _dispose_all_connection_instances(self) -> None:
         pending_cleanups = list(self._connection_cleanup_tasks.values())
@@ -283,7 +590,12 @@ class AgentMCPServer:
         print("Press Ctrl+C again to force exit.")
         self._graceful_shutdown_event.set()
 
-    def run(self, transport: str = "http", host: str = "0.0.0.0", port: int = 8000) -> None:
+    def run(
+        self,
+        transport: TransportMode = "http",
+        host: str = "0.0.0.0",
+        port: int = 8000,
+    ) -> None:
         """Run the MCP server synchronously."""
         if transport in ["sse", "http"]:
             self.mcp_server.settings.host = host
@@ -293,10 +605,13 @@ class AgentMCPServer:
             try:
                 # Add any server attributes that might help with shutdown
                 if not hasattr(self.mcp_server, "_server_should_exit"):
-                    self.mcp_server._server_should_exit = False
+                    setattr(self.mcp_server, "_server_should_exit", False)
 
                 # Run the server
-                self.mcp_server.run(transport=transport)
+                mcp_transport: McpTransportMode = (
+                    "streamable-http" if transport == "http" else transport
+                )
+                self.mcp_server.run(transport=mcp_transport)
             except KeyboardInterrupt:
                 print("\nServer stopped by user (CTRL+C)")
             except SystemExit as e:
@@ -309,21 +624,21 @@ class AgentMCPServer:
             finally:
                 # Run an async cleanup in a new event loop
                 try:
-                    asyncio.run(self.shutdown())
+                    run_sync(self.shutdown)
                 except (SystemExit, KeyboardInterrupt):
                     # These are expected during shutdown
                     pass
         else:  # stdio
             try:
-                self.mcp_server.run(transport=transport)
+                self.mcp_server.run(transport="stdio")
             except KeyboardInterrupt:
                 print("\nServer stopped by user (CTRL+C)")
             finally:
                 # Minimal cleanup for stdio
-                asyncio.run(self._cleanup_stdio())
+                run_sync(self._cleanup_stdio)
 
     async def run_async(
-        self, transport: str = "http", host: str = "0.0.0.0", port: int = 8000
+        self, transport: TransportMode = "http", host: str = "0.0.0.0", port: int = 8000
     ) -> None:
         """Run the MCP server asynchronously with improved shutdown handling."""
         # Use different handling strategies based on transport type
@@ -335,7 +650,13 @@ class AgentMCPServer:
             self.mcp_server.settings.port = port
 
             # Start the server in a separate task so we can monitor it
-            self._server_task = asyncio.create_task(self._run_server_with_shutdown(transport))
+            if transport == "http":
+                http_transport: Literal["http", "sse"] = "http"
+            elif transport == "sse":
+                http_transport = "sse"
+            else:
+                raise ValueError("HTTP/SSE handler received stdio transport")
+            self._server_task = asyncio.create_task(self._run_server_with_shutdown(http_transport))
 
             try:
                 # Wait for the server task to complete
@@ -377,7 +698,7 @@ class AgentMCPServer:
             # Only perform minimal cleanup needed for STDIO
             await self._cleanup_stdio()
 
-    async def _run_server_with_shutdown(self, transport: str):
+    async def _run_server_with_shutdown(self, transport: Literal["http", "sse"]):
         """Run the server with proper shutdown handling."""
         # This method is used for SSE/HTTP transport
         if transport not in ["sse", "http"]:
@@ -388,9 +709,11 @@ class AgentMCPServer:
 
         try:
             # Patch SSE server to track connections if needed
-            if hasattr(self.mcp_server, "_sse_transport") and self.mcp_server._sse_transport:
+            mcp_ext = cast("_FastMCPLocalExtensions", self.mcp_server)
+            sse_transport = getattr(mcp_ext, "_sse_transport", None)
+            if sse_transport is not None:
                 # Store the original connect_sse method
-                original_connect = self.mcp_server._sse_transport.connect_sse
+                original_connect = sse_transport.connect_sse
 
                 # Create a wrapper that tracks connections
                 @asynccontextmanager
@@ -403,13 +726,18 @@ class AgentMCPServer:
                             self._active_connections.discard(streams)
 
                 # Replace with our tracking version
-                self.mcp_server._sse_transport.connect_sse = tracked_connect_sse
+                sse_transport.connect_sse = tracked_connect_sse
 
             # Run the server based on transport type
             if transport == "sse":
                 await self.mcp_server.run_sse_async()
             elif transport == "http":
-                await self.mcp_server.run_streamable_http_async()
+                # Check if HF OAuth is enabled - if so, wrap app with header middleware
+                oauth_provider = os.environ.get("FAST_AGENT_SERVE_OAUTH", "").lower()
+                if oauth_provider in ("hf", "huggingface"):
+                    await self._run_http_with_hf_middleware()
+                else:
+                    await self.mcp_server.run_streamable_http_async()
         finally:
             # Cancel the monitor when the server exits
             shutdown_monitor.cancel()
@@ -417,6 +745,32 @@ class AgentMCPServer:
                 await shutdown_monitor
             except asyncio.CancelledError:
                 pass
+
+    async def _run_http_with_hf_middleware(self) -> None:
+        """Run HTTP server with HuggingFace header normalization middleware.
+
+        This wraps the Starlette app with middleware that copies X-HF-Authorization
+        to Authorization header, enabling HuggingFace Spaces authentication.
+        """
+        import uvicorn
+
+        from fast_agent.mcp.auth.middleware import HFAuthHeaderMiddleware
+
+        # Get the Starlette app from FastMCP
+        starlette_app = self.mcp_server.streamable_http_app()
+
+        # Wrap with our header normalization middleware
+        wrapped_app = HFAuthHeaderMiddleware(starlette_app)
+
+        # Run uvicorn with the wrapped app
+        config = uvicorn.Config(
+            wrapped_app,
+            host=self.mcp_server.settings.host,
+            port=self.mcp_server.settings.port,
+            log_level=self.mcp_server.settings.log_level.lower(),
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
 
     async def _monitor_shutdown(self):
         """Monitor for shutdown signals and coordinate proper shutdown sequence."""
@@ -460,54 +814,51 @@ class AgentMCPServer:
         # Close tracked connections
         for conn in list(self._active_connections):
             try:
-                if hasattr(conn, "close"):
-                    await conn.close()
-                elif hasattr(conn, "aclose"):
-                    await conn.aclose()
+                close = getattr(conn, "close", None)
+                if callable(close):
+                    await close()
+                else:
+                    aclose = getattr(conn, "aclose", None)
+                    if callable(aclose):
+                        await aclose()
             except Exception as e:
                 logger.error(f"Error closing connection: {e}")
             self._active_connections.discard(conn)
 
         # Access the SSE transport if it exists to close stream writers
-        if (
-            hasattr(self.mcp_server, "_sse_transport")
-            and self.mcp_server._sse_transport is not None
-        ):
-            sse = self.mcp_server._sse_transport
-
+        mcp_ext = cast("_FastMCPLocalExtensions", self.mcp_server)
+        sse = getattr(mcp_ext, "_sse_transport", None)
+        if sse is not None:
             # Close all read stream writers
-            if hasattr(sse, "_read_stream_writers"):
-                writers = list(sse._read_stream_writers.items())
-                for session_id, writer in writers:
+            writers = list(sse._read_stream_writers.items())
+            for session_id, writer in writers:
+                try:
+                    logger.debug(f"Closing SSE connection: {session_id}")
+                    # Instead of aclose, try to close more gracefully
+                    # Send a special event to notify client, then close
                     try:
-                        logger.debug(f"Closing SSE connection: {session_id}")
-                        # Instead of aclose, try to close more gracefully
-                        # Send a special event to notify client, then close
-                        try:
-                            if hasattr(writer, "send") and not getattr(writer, "_closed", False):
-                                try:
-                                    # Try to send a close event if possible
-                                    await writer.send(Exception("Server shutting down"))
-                                except (AttributeError, asyncio.CancelledError):
-                                    pass
-                        except Exception:
-                            pass
+                        if hasattr(writer, "send") and not getattr(writer, "_closed", False):
+                            try:
+                                # Try to send a close event if possible
+                                await writer.send(Exception("Server shutting down"))
+                            except (AttributeError, asyncio.CancelledError):
+                                pass
+                    except Exception:
+                        pass
 
-                        # Now close the stream
-                        await writer.aclose()
-                        sse._read_stream_writers.pop(session_id, None)
-                    except Exception as e:
-                        logger.error(f"Error closing SSE connection {session_id}: {e}")
+                    # Now close the stream
+                    await writer.aclose()
+                    sse._read_stream_writers.pop(session_id, None)
+                except Exception as e:
+                    logger.error(f"Error closing SSE connection {session_id}: {e}")
 
         # If we have a ASGI lifespan hook, try to signal closure
-        if (
-            hasattr(self.mcp_server, "_lifespan_state")
-            and self.mcp_server._lifespan_state == "started"
-        ):
+        if getattr(mcp_ext, "_lifespan_state", None) == "started":
             logger.debug("Attempting to signal ASGI lifespan shutdown")
             try:
-                if hasattr(self.mcp_server, "_on_shutdown"):
-                    await self.mcp_server._on_shutdown()
+                on_shutdown = getattr(mcp_ext, "_on_shutdown", None)
+                if on_shutdown is not None:
+                    await on_shutdown()
             except Exception as e:
                 logger.error(f"Error during ASGI lifespan shutdown: {e}")
 
@@ -557,6 +908,7 @@ class AgentMCPServer:
         logger.info("Performing minimal STDIO cleanup")
 
         await self._dispose_primary_instance()
+        await self._dispose_all_stale_instances()
         await self._dispose_all_connection_instances()
 
         logger.info("STDIO cleanup complete")
@@ -584,6 +936,7 @@ class AgentMCPServer:
 
             # Dispose shared instance if still active
             await self._dispose_primary_instance()
+            await self._dispose_all_stale_instances()
         except Exception as e:
             # Log any errors but don't let them prevent shutdown
             logger.error(f"Error during shutdown: {e}", exc_info=True)
@@ -595,20 +948,16 @@ class AgentMCPServer:
         logger.info("Performing minimal cleanup before interrupt")
 
         # Only close SSE connection writers directly
-        if (
-            hasattr(self.mcp_server, "_sse_transport")
-            and self.mcp_server._sse_transport is not None
-        ):
-            sse = self.mcp_server._sse_transport
-
+        mcp_ext = cast("_FastMCPLocalExtensions", self.mcp_server)
+        sse = getattr(mcp_ext, "_sse_transport", None)
+        if sse is not None:
             # Close all read stream writers
-            if hasattr(sse, "_read_stream_writers"):
-                for session_id, writer in list(sse._read_stream_writers.items()):
-                    try:
-                        await writer.aclose()
-                    except Exception:
-                        # Ignore errors during cleanup
-                        pass
+            for session_id, writer in list(sse._read_stream_writers.items()):
+                try:
+                    await writer.aclose()
+                except Exception:
+                    # Ignore errors during cleanup
+                    pass
 
         # Clear active connections set to prevent further operations
         self._active_connections.clear()

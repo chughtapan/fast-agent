@@ -100,12 +100,18 @@ class RouterAgent(LlmAgent):
         self.agent_map = {agent.name: agent for agent in agents}
 
         # Set up base router request parameters with just the base instruction for now
-        base_params = {"systemPrompt": ROUTING_SYSTEM_INSTRUCTION, "use_history": False}
-
         if default_request_params:
-            merged_params = default_request_params.model_copy(update=base_params)
+            merged_params = default_request_params.model_copy(
+                update={
+                    "systemPrompt": ROUTING_SYSTEM_INSTRUCTION,
+                    "use_history": False,
+                }
+            )
         else:
-            merged_params = RequestParams(**base_params)
+            merged_params = RequestParams(
+                systemPrompt=ROUTING_SYSTEM_INSTRUCTION,
+                use_history=False,
+            )
 
         self._default_request_params = merged_params
 
@@ -127,8 +133,7 @@ class RouterAgent(LlmAgent):
             combined_system_prompt = (
                 ROUTING_SYSTEM_INSTRUCTION + "\n\n" + complete_routing_instruction
             )
-            self._default_request_params.systemPrompt = combined_system_prompt
-            self.instruction = combined_system_prompt
+            self.set_instruction(combined_system_prompt)
 
     async def shutdown(self) -> None:
         """Shutdown the router and all agents."""
@@ -214,7 +219,24 @@ class RouterAgent(LlmAgent):
 
             # Dispatch the request to the selected agent
             # discarded request_params: use llm defaults for subagents
-            return await agent.generate_impl(messages)
+            telemetry_arguments = {
+                "agent": route.agent,
+                "confidence": route.confidence,
+                "reasoning": route.reasoning,
+            }
+            async with self.workflow_telemetry.start_step(
+                "router.delegate",
+                server_name=self.name,
+                arguments=telemetry_arguments,
+            ) as step:
+                if route.reasoning:
+                    await step.update(message=route.reasoning)
+                result = await agent.generate_impl(messages)
+                await step.finish(
+                    True,
+                    text=f"Delegated to {agent.name}",
+                )
+                return result
 
     async def structured_impl(
         self,
@@ -247,7 +269,24 @@ class RouterAgent(LlmAgent):
             agent: LlmAgent = self.agent_map[route.agent]
 
             # Dispatch the request to the selected agent
-            return await agent.structured_impl(messages, model, request_params)
+            telemetry_arguments = {
+                "agent": route.agent,
+                "confidence": route.confidence,
+                "reasoning": route.reasoning,
+            }
+            async with self.workflow_telemetry.start_step(
+                "router.delegate_structured",
+                server_name=self.name,
+                arguments=telemetry_arguments,
+            ) as step:
+                if route.reasoning:
+                    await step.update(message=route.reasoning)
+                structured_response = await agent.structured_impl(messages, model, request_params)
+                await step.finish(
+                    True,
+                    text=f"{agent.name} produced structured output",
+                )
+                return structured_response
 
     async def _route_request(
         self, message: PromptMessageExtended

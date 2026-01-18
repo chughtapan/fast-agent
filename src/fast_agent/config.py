@@ -6,10 +6,16 @@ for the application configuration.
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Literal
 
-from mcp import Implementation
-from pydantic import AnyUrl, BaseModel, ConfigDict, field_validator, model_validator
+# Importing the MCP Implementation type eagerly pulls in the full MCP server
+# stack (uvicorn, Starlette, etc.) which slows down startup. We only need the
+# type for annotations, so avoid the runtime import.
+if TYPE_CHECKING:
+    from mcp import Implementation
+else:  # pragma: no cover - used only to satisfy type checkers
+    Implementation = Any
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -33,7 +39,34 @@ class MCPServerAuthSettings(BaseModel):
     # Token persistence: use OS keychain via 'keyring' by default; fallback to 'memory'.
     persist: Literal["keyring", "memory"] = "keyring"
 
+    # Client ID Metadata Document (CIMD) URL.
+    # When provided and the server advertises client_id_metadata_document_supported=true,
+    # this URL will be used as the client_id instead of performing dynamic client registration.
+    # Must be a valid HTTPS URL with a non-root pathname (e.g., https://example.com/client.json).
+    # See: https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization
+    client_metadata_url: str | None = None
+
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+    @field_validator("client_metadata_url", mode="after")
+    @classmethod
+    def _validate_client_metadata_url(cls, v: str | None) -> str | None:
+        """Validate that client_metadata_url is a valid HTTPS URL with a non-root path."""
+        if v is None:
+            return None
+        from urllib.parse import urlparse
+
+        try:
+            parsed = urlparse(v)
+            if parsed.scheme != "https":
+                raise ValueError("client_metadata_url must use HTTPS scheme")
+            if parsed.path in ("", "/"):
+                raise ValueError("client_metadata_url must have a non-root pathname")
+            return v
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"Invalid client_metadata_url: {e}")
 
 
 class MCPSamplingSettings(BaseModel):
@@ -99,7 +132,9 @@ class MCPTimelineSettings(BaseModel):
 class SkillsSettings(BaseModel):
     """Configuration for the skills directory override."""
 
-    directory: str | None = None
+    directories: list[str] | None = None
+    marketplace_url: str | None = None
+    marketplace_urls: list[str] | None = None
 
     model_config = ConfigDict(extra="ignore")
 
@@ -138,10 +173,10 @@ class MCPRootSettings(BaseModel):
     uri: str
     """The URI identifying the root."""
 
-    name: Optional[str] = None
+    name: str | None = None
     """Optional name for the root."""
 
-    server_uri_alias: Optional[str] = None
+    server_uri_alias: str | None = None
     """Optional URI alias for presentation to the server"""
 
     @field_validator("uri", "server_uri_alias")
@@ -172,11 +207,23 @@ class MCPServerSettings(BaseModel):
     command: str | None = None
     """The command to execute the server (e.g. npx)."""
 
-    args: List[str] | None = None
+    args: list[str] | None = None
     """The arguments for the server command."""
 
     read_timeout_seconds: int | None = None
     """The timeout in seconds for the session."""
+
+    ping_interval_seconds: int = 30
+    """Interval for MCP ping requests. Set <=0 to disable pinging."""
+
+    max_missed_pings: int = 3
+    """Number of consecutive missed ping responses before treating the connection as failed."""
+
+    http_timeout_seconds: int | None = None
+    """Overall HTTP timeout (seconds) for StreamableHTTP transport. Defaults to MCP SDK."""
+
+    http_read_timeout_seconds: int | None = None
+    """HTTP read timeout (seconds) for StreamableHTTP transport. Defaults to MCP SDK."""
 
     read_transport_sse_timeout_seconds: int = 300
     """The timeout in seconds for the server connection."""
@@ -184,16 +231,16 @@ class MCPServerSettings(BaseModel):
     url: str | None = None
     """The URL for the server (e.g. for SSE/SHTTP transport)."""
 
-    headers: Dict[str, str] | None = None
+    headers: dict[str, str] | None = None
     """Headers dictionary for HTTP connections"""
 
     auth: MCPServerAuthSettings | None = None
     """The authentication configuration for the server."""
 
-    roots: Optional[List[MCPRootSettings]] = None
+    roots: list[MCPRootSettings] | None = None
     """Root directories this server has access to."""
 
-    env: Dict[str, str] | None = None
+    env: dict[str, str] | None = None
     """Environment variables to pass to the server process."""
 
     sampling: MCPSamplingSettings | None = None
@@ -205,10 +252,31 @@ class MCPServerSettings(BaseModel):
     cwd: str | None = None
     """Working directory for the executed server command."""
 
+    load_on_start: bool = True
+    """Whether to connect to this server automatically when the agent starts."""
+
     include_instructions: bool = True
     """Whether to include this server's instructions in the system prompt (default: True)."""
 
+    reconnect_on_disconnect: bool = True
+    """Whether to automatically reconnect when the server session is terminated (e.g., 404).
+
+    When enabled, if a remote StreamableHTTP server returns a 404 indicating the session
+    has been terminated (e.g., due to server restart), the client will automatically
+    attempt to re-initialize the connection and retry the operation.
+    """
+
     implementation: Implementation | None = None
+
+    @field_validator("max_missed_pings", mode="before")
+    @classmethod
+    def _coerce_max_missed_pings(cls, value: Any) -> int:
+        if isinstance(value, str):
+            value = int(value.strip())
+        value = int(value)
+        if value <= 0:
+            raise ValueError("max_missed_pings must be greater than zero.")
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -250,7 +318,7 @@ class MCPServerSettings(BaseModel):
 class MCPSettings(BaseModel):
     """Configuration for all MCP servers."""
 
-    servers: Dict[str, MCPServerSettings] = {}
+    servers: dict[str, MCPServerSettings] = {}
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
 
@@ -271,6 +339,27 @@ class AnthropicSettings(BaseModel):
     - "auto": Currently same as "prompt" - caches tools+system prompt (1 block) and template content.
     """
 
+    cache_ttl_minutes: int = 5
+    """
+    Cache time-to-live in minutes for display purposes.
+    Default is 5 minutes (standard Anthropic ephemeral cache).
+    Set to 60 for extended 1-hour cache TTL.
+    """
+
+    thinking_enabled: bool = False
+    """
+    Enable extended thinking for supported Claude models (Sonnet 4+, Opus 4+).
+    When enabled, Claude will show its step-by-step reasoning process.
+    Note: Extended thinking is incompatible with structured output (forced tool choice).
+    """
+
+    thinking_budget_tokens: int = 10000
+    """
+    Maximum tokens for Claude's internal reasoning process (minimum 1024).
+    Larger budgets enable more thorough analysis for complex problems.
+    Must be less than max_tokens.
+    """
+
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
 
@@ -284,31 +373,58 @@ class OpenAISettings(BaseModel):
 
     base_url: str | None = None
 
+    default_headers: dict[str, str] | None = None
+    """Custom headers to include in all requests to the OpenAI API."""
+
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+
+
+
+class OpenResponsesSettings(BaseModel):
+    """
+    Settings for using Open Responses models in the fast-agent application.
+    """
+
+    api_key: str | None = None
+    reasoning_effort: Literal["minimal", "low", "medium", "high"] = "medium"
+
+    base_url: str | None = None
+
+    default_headers: dict[str, str] | None = None
+    """Custom headers to include in all requests to the Open Responses API."""
+
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
 
 class DeepSeekSettings(BaseModel):
     """
-    Settings for using OpenAI models in the fast-agent application.
+    Settings for using DeepSeek models in the fast-agent application.
     """
 
     api_key: str | None = None
     # reasoning_effort: Literal["low", "medium", "high"] = "medium"
 
     base_url: str | None = None
+
+    default_headers: dict[str, str] | None = None
+    """Custom headers to include in all requests to the DeepSeek API."""
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
 
 class GoogleSettings(BaseModel):
     """
-    Settings for using OpenAI models in the fast-agent application.
+    Settings for using Google models (via OpenAI-compatible API) in the fast-agent application.
     """
 
     api_key: str | None = None
     # reasoning_effort: Literal["low", "medium", "high"] = "medium"
 
     base_url: str | None = None
+
+    default_headers: dict[str, str] | None = None
+    """Custom headers to include in all requests to the Google API."""
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
@@ -321,17 +437,23 @@ class XAISettings(BaseModel):
     api_key: str | None = None
     base_url: str | None = "https://api.x.ai/v1"
 
+    default_headers: dict[str, str] | None = None
+    """Custom headers to include in all requests to the xAI API."""
+
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
 
 class GenericSettings(BaseModel):
     """
-    Settings for using OpenAI models in the fast-agent application.
+    Settings for using generic OpenAI-compatible models in the fast-agent application.
     """
 
     api_key: str | None = None
 
     base_url: str | None = None
+
+    default_headers: dict[str, str] | None = None
+    """Custom headers to include in all requests to the API."""
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
@@ -344,6 +466,9 @@ class OpenRouterSettings(BaseModel):
     api_key: str | None = None
 
     base_url: str | None = None  # Optional override, defaults handled in provider
+
+    default_headers: dict[str, str] | None = None
+    """Custom headers to include in all requests to the OpenRouter API."""
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
@@ -364,11 +489,14 @@ class AzureSettings(BaseModel):
 
 class GroqSettings(BaseModel):
     """
-    Settings for using xAI Grok models in the fast-agent application.
+    Settings for using Groq models in the fast-agent application.
     """
 
     api_key: str | None = None
     base_url: str | None = "https://api.groq.com/openai/v1"
+
+    default_headers: dict[str, str] | None = None
+    """Custom headers to include in all requests to the Groq API."""
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
@@ -399,6 +527,10 @@ class TensorZeroSettings(BaseModel):
 
     base_url: str | None = None
     api_key: str | None = None
+
+    default_headers: dict[str, str] | None = None
+    """Custom headers to include in all requests to the TensorZero API."""
+
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
 
@@ -424,8 +556,14 @@ class HuggingFaceSettings(BaseModel):
     Settings for HuggingFace authentication (used for MCP connections).
     """
 
-    base_url: str | None = "https://api.huggingface.co/v1"
+    # Leave unset to allow the provider to use its default router endpoint.
+    base_url: str | None = None
     api_key: str | None = None
+    default_provider: str | None = None
+
+    default_headers: dict[str, str] | None = None
+    """Custom headers to include in all requests to the HuggingFace API."""
+
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
 
@@ -476,7 +614,7 @@ class LoggerSettings(BaseModel):
     """Streaming renderer for assistant responses"""
 
 
-def find_fastagent_config_files(start_path: Path) -> Tuple[Optional[Path], Optional[Path]]:
+def find_fastagent_config_files(start_path: Path) -> tuple[Path | None, Path | None]:
     """
     Find FastAgent configuration files with standardized behavior.
 
@@ -546,10 +684,11 @@ class Settings(BaseSettings):
     execution_engine: Literal["asyncio"] = "asyncio"
     """Execution engine for the fast-agent application"""
 
-    default_model: str | None = "gpt-5-mini.low"
+    default_model: str | None = None
     """
     Default model for agents. Format is provider.model_name.<reasoning_effort>, for example openai.o3-mini.low
     Aliases are provided for common models e.g. sonnet, haiku, gpt-4.1, o3-mini etc.
+    If not set, falls back to FAST_AGENT_MODEL env var, then to "gpt-5-mini.low".
     """
 
     auto_sampling: bool = True
@@ -563,6 +702,9 @@ class Settings(BaseSettings):
 
     openai: OpenAISettings | None = None
     """Settings for using OpenAI models in the fast-agent application"""
+
+    openresponses: OpenResponsesSettings | None = None
+    """Settings for using Open Responses models in the fast-agent application"""
 
     deepseek: DeepSeekSettings | None = None
     """Settings for using DeepSeek models in the fast-agent application"""
@@ -579,7 +721,7 @@ class Settings(BaseSettings):
     generic: GenericSettings | None = None
     """Settings for using Generic models in the fast-agent application"""
 
-    tensorzero: Optional[TensorZeroSettings] = None
+    tensorzero: TensorZeroSettings | None = None
     """Settings for using TensorZero inference gateway"""
 
     azure: AzureSettings | None = None
@@ -591,7 +733,7 @@ class Settings(BaseSettings):
     bedrock: BedrockSettings | None = None
     """Settings for using AWS Bedrock models in the fast-agent application"""
 
-    huggingface: HuggingFaceSettings | None = None
+    hf: HuggingFaceSettings | None = None
     """Settings for HuggingFace authentication (used for MCP connections)"""
 
     groq: GroqSettings | None = None
@@ -621,6 +763,12 @@ class Settings(BaseSettings):
     shell_execution: ShellSettings = ShellSettings()
     """Shell execution timeout and warning settings."""
 
+    llm_retries: int = 0
+    """
+    Number of times to retry transient LLM API errors.
+    Defaults to 0; can be overridden via config or FAST_AGENT_RETRIES env.
+    """
+
     @classmethod
     def find_config(cls) -> Path | None:
         """Find the config file in the current directory or parent directories."""
@@ -643,7 +791,7 @@ class Settings(BaseSettings):
 _settings: Settings | None = None
 
 
-def get_settings(config_path: str | None = None) -> Settings:
+def get_settings(config_path: str | os.PathLike[str] | None = None) -> Settings:
     """Get settings instance, automatically loading from config file if available."""
 
     def resolve_env_vars(config_item: Any) -> Any:
@@ -741,3 +889,14 @@ def get_settings(config_path: str | None = None) -> Settings:
 
     _settings = Settings(**merged_settings)
     return _settings
+
+
+def update_global_settings(settings: Settings) -> None:
+    """Update the global settings instance.
+
+    This is used to propagate CLI overrides (like --skills-dir) into the
+    global settings so that functions like resolve_skill_directories()
+    work correctly without needing to pass settings around explicitly.
+    """
+    global _settings
+    _settings = settings

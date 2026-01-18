@@ -33,6 +33,8 @@ class ToolDisplay:
         name: str | None = None,
         tool_name: str | None = None,
         skybridge_config: "SkybridgeServerConfig | None" = None,
+        timing_ms: float | None = None,
+        type_label: str = "tool result",
     ) -> None:
         """Display a tool result in the console."""
         config = self._display.config
@@ -51,13 +53,15 @@ class ToolDisplay:
             for tool_cfg in skybridge_config.tools:
                 if tool_cfg.tool_name == tool_name and tool_cfg.is_valid:
                     is_skybridge_tool = True
-                    skybridge_resource_uri = tool_cfg.resource_uri
+                    skybridge_resource_uri = (
+                        str(tool_cfg.resource_uri) if tool_cfg.resource_uri is not None else None
+                    )
                     break
 
         if result.isError:
             status = "ERROR"
         else:
-            if len(content) == 0:
+            if not content:
                 status = "No Content"
             elif len(content) == 1 and is_text_content(content[0]):
                 text_content = get_text(content[0])
@@ -90,15 +94,17 @@ class ToolDisplay:
 
             bottom_metadata_items.append(transport_info)
 
-        elapsed = getattr(result, "transport_elapsed", None)
-        if isinstance(elapsed, (int, float)):
-            bottom_metadata_items.append(self._display._format_elapsed(float(elapsed)))
+        # Use timing from FAST_AGENT_TOOL_TIMING (passed as parameter)
+        if timing_ms is not None:
+            # Convert ms to seconds for display
+            timing_seconds = timing_ms / 1000.0
+            bottom_metadata_items.append(self._display._format_elapsed(timing_seconds))
 
         if has_structured:
             bottom_metadata_items.append("Structured ■")
 
         bottom_metadata = bottom_metadata_items or None
-        right_info = f"[dim]tool result - {status}[/dim]"
+        right_info = f"[dim]{type_label} - {status}[/dim]"
 
         if has_structured:
             config_map = MESSAGE_CONFIGS[MessageType.TOOL_RESULT]
@@ -197,6 +203,7 @@ class ToolDisplay:
         max_item_length: int | None = None,
         name: str | None = None,
         metadata: dict[str, Any] | None = None,
+        type_label: str = "tool call",
     ) -> None:
         """Display a tool call header and body."""
         config = self._display.config
@@ -206,7 +213,7 @@ class ToolDisplay:
         tool_args = tool_args or {}
         metadata = metadata or {}
 
-        right_info = f"[dim]tool request - {tool_name}[/dim]"
+        right_info = f"[dim]{type_label} - {tool_name}[/dim]"
         content: Any = tool_args
         pre_content: Text | None = None
         truncate_content = True

@@ -38,8 +38,23 @@ jobs:
           source .venv/bin/activate
           uv pip install -e ".[dev]"
 
-      - name: Build
-        run: uv build
+      - name: Sync wrapper package version
+        run: python3 scripts/sync-wrapper-version.py
+
+      - name: Build main package
+        run: uv build --package fast-agent-mcp
+
+      - name: Build wrapper package
+        run: |
+          pushd publish/fast-agent-acp
+          uv build
+          popd
+
+      - name: Build Hugging Face inference package
+        run: |
+          pushd publish/hf-inference-acp
+          uv build
+          popd
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -47,7 +62,8 @@ jobs:
           name: release-dists
           path: dist/
 
-      - name: Publish package to PyPI using uv
+      - name: Publish packages to PyPI
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        run: uv publish
+        run: |
+          uv publish dist/*

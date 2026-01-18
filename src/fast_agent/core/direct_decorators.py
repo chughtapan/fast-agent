@@ -10,10 +10,7 @@ from typing import (
     Any,
     Awaitable,
     Callable,
-    Dict,
-    List,
     Literal,
-    Optional,
     ParamSpec,
     Protocol,
     TypeVar,
@@ -22,12 +19,18 @@ from typing import (
 from mcp.client.session import ElicitationFnT
 from pydantic import AnyUrl
 
-from fast_agent.agents.agent_types import AgentConfig, AgentType
+from fast_agent.agents.agent_types import (
+    AgentConfig,
+    AgentType,
+    FunctionToolsConfig,
+    SkillConfig,
+)
 from fast_agent.agents.workflow.iterative_planner import ITERATIVE_PLAN_SYSTEM_PROMPT_TEMPLATE
 from fast_agent.agents.workflow.router_agent import (
     ROUTING_SYSTEM_INSTRUCTION,
 )
-from fast_agent.skills import SkillManifest, SkillRegistry
+from fast_agent.constants import DEFAULT_AGENT_INSTRUCTION
+from fast_agent.skills import SKILLS_DEFAULT
 from fast_agent.types import RequestParams
 
 # Type variables for the decorated function
@@ -49,7 +52,7 @@ class DecoratedAgentProtocol(Protocol[P, R]):
 class DecoratedOrchestratorProtocol(DecoratedAgentProtocol[P, R], Protocol):
     """Protocol for decorated orchestrator functions with additional metadata."""
 
-    _child_agents: List[str]
+    _child_agents: list[str]
     _plan_type: Literal["full", "iterative"]
 
 
@@ -57,21 +60,21 @@ class DecoratedOrchestratorProtocol(DecoratedAgentProtocol[P, R], Protocol):
 class DecoratedRouterProtocol(DecoratedAgentProtocol[P, R], Protocol):
     """Protocol for decorated router functions with additional metadata."""
 
-    _router_agents: List[str]
+    _router_agents: list[str]
 
 
 # Protocol for chain functions
 class DecoratedChainProtocol(DecoratedAgentProtocol[P, R], Protocol):
     """Protocol for decorated chain functions with additional metadata."""
 
-    _chain_agents: List[str]
+    _chain_agents: list[str]
 
 
 # Protocol for parallel functions
 class DecoratedParallelProtocol(DecoratedAgentProtocol[P, R], Protocol):
     """Protocol for decorated parallel functions with additional metadata."""
 
-    _fan_out: List[str]
+    _fan_out: list[str]
     _fan_in: str
 
 
@@ -81,6 +84,15 @@ class DecoratedEvaluatorOptimizerProtocol(DecoratedAgentProtocol[P, R], Protocol
 
     _generator: str
     _evaluator: str
+
+
+# Protocol for maker functions
+class DecoratedMakerProtocol(DecoratedAgentProtocol[P, R], Protocol):
+    """Protocol for decorated MAKER functions with additional metadata."""
+
+    _worker: str
+    _k: int
+    _max_samples: int
 
 
 def _fetch_url_content(url: str) -> str:
@@ -111,6 +123,9 @@ def _apply_templates(text: str) -> str:
     Supported templates:
         {{currentDate}} - Current date in format "24 July 2025"
         {{url:https://...}} - Content fetched from the specified URL
+
+    Note: File templates ({{file:...}} and {{file_silent:...}}) are resolved later
+    during runtime to ensure they're relative to the workspaceRoot.
 
     Args:
         text: The text to process
@@ -174,18 +189,16 @@ def _decorator_impl(
     name: str,
     instruction: str,
     *,
-    servers: List[str] = [],
-    model: Optional[str] = None,
+    servers: list[str] = [],
+    model: str | None = None,
     use_history: bool = True,
     request_params: RequestParams | None = None,
     human_input: bool = False,
     default: bool = False,
-    tools: Optional[Dict[str, List[str]]] = None,
-    resources: Optional[Dict[str, List[str]]] = None,
-    prompts: Optional[Dict[str, List[str]]] = None,
-    skills: SkillManifest | SkillRegistry | Path | str | List[
-        SkillManifest | SkillRegistry | Path | str | None
-    ] | None = None,
+    tools: dict[str, list[str]] | None = None,
+    resources: dict[str, list[str]] | None = None,
+    prompts: dict[str, list[str]] | None = None,
+    skills: SkillConfig = SKILLS_DEFAULT,
     **extra_kwargs,
 ) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """
@@ -210,9 +223,9 @@ def _decorator_impl(
             name=name,
             instruction=instruction,
             servers=servers,
-            tools=tools,
-            resources=resources,
-            prompts=prompts,
+            tools=tools or {},
+            resources=resources or {},
+            prompts=prompts or {},
             skills=skills,
             model=model,
             use_history=use_history,
@@ -220,6 +233,7 @@ def _decorator_impl(
             default=default,
             elicitation_handler=extra_kwargs.get("elicitation_handler"),
             api_key=extra_kwargs.get("api_key"),
+            function_tools=extra_kwargs.get("function_tools"),
         )
 
         # Update request params if provided
@@ -254,21 +268,28 @@ def _decorator_impl(
 def agent(
     self,
     name: str = "default",
-    instruction_or_kwarg: Optional[str | Path | AnyUrl] = None,
+    instruction_or_kwarg: str | Path | AnyUrl | None = None,
     *,
-    instruction: str | Path | AnyUrl = "You are a helpful agent.",
-    servers: List[str] = [],
-    tools: Optional[Dict[str, List[str]]] = None,
-    resources: Optional[Dict[str, List[str]]] = None,
-    prompts: Optional[Dict[str, List[str]]] = None,
-    skills: SkillManifest | SkillRegistry | Path | str | None = None,
-    model: Optional[str] = None,
+    instruction: str | Path | AnyUrl = DEFAULT_AGENT_INSTRUCTION,
+    agents: list[str] | None = None,
+    servers: list[str] = [],
+    tools: dict[str, list[str]] | None = None,
+    resources: dict[str, list[str]] | None = None,
+    prompts: dict[str, list[str]] | None = None,
+    skills: SkillConfig = SKILLS_DEFAULT,
+    function_tools: FunctionToolsConfig = None,
+    model: str | None = None,
     use_history: bool = True,
     request_params: RequestParams | None = None,
     human_input: bool = False,
     default: bool = False,
-    elicitation_handler: Optional[ElicitationFnT] = None,
+    elicitation_handler: ElicitationFnT | None = None,
     api_key: str | None = None,
+    history_source: Any | None = None,
+    history_merge_target: Any | None = None,
+    max_parallel: int | None = None,
+    child_timeout_sec: int | None = None,
+    max_display_instances: int | None = None,
 ) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """
     Decorator to create and register a standard agent with type-safe signature.
@@ -281,6 +302,7 @@ def agent(
         tools: Optional list of tool names or patterns to include
         resources: Optional list of resource names or patterns to include
         prompts: Optional list of prompt names or patterns to include
+        function_tools: Optional list of Python function tools to include
         model: Model specification string
         use_history: Whether to maintain conversation history
         request_params: Additional request parameters for the LLM
@@ -302,6 +324,7 @@ def agent(
         AgentType.BASIC,
         name=name,
         instruction=final_instruction,
+        child_agents=agents,
         servers=servers,
         model=model,
         use_history=use_history,
@@ -313,7 +336,15 @@ def agent(
         resources=resources,
         prompts=prompts,
         skills=skills,
+        function_tools=function_tools,
         api_key=api_key,
+        agents_as_tools_options={
+            "history_source": history_source,
+            "history_merge_target": history_merge_target,
+            "max_parallel": max_parallel,
+            "child_timeout_sec": child_timeout_sec,
+            "max_display_instances": max_display_instances,
+        },
     )
 
 
@@ -321,20 +352,21 @@ def custom(
     self,
     cls,
     name: str = "default",
-    instruction_or_kwarg: Optional[str | Path | AnyUrl] = None,
+    instruction_or_kwarg: str | Path | AnyUrl | None = None,
     *,
     instruction: str | Path | AnyUrl = "You are a helpful agent.",
-    servers: List[str] = [],
-    tools: Optional[Dict[str, List[str]]] = None,
-    resources: Optional[Dict[str, List[str]]] = None,
-    prompts: Optional[Dict[str, List[str]]] = None,
-    skills: SkillManifest | SkillRegistry | Path | str | None = None,
-    model: Optional[str] = None,
+    agents: list[str] | None = None,
+    servers: list[str] = [],
+    tools: dict[str, list[str]] | None = None,
+    resources: dict[str, list[str]] | None = None,
+    prompts: dict[str, list[str]] | None = None,
+    skills: SkillConfig = SKILLS_DEFAULT,
+    model: str | None = None,
     use_history: bool = True,
     request_params: RequestParams | None = None,
     human_input: bool = False,
     default: bool = False,
-    elicitation_handler: Optional[ElicitationFnT] = None,
+    elicitation_handler: ElicitationFnT | None = None,
     api_key: str | None = None,
 ) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """
@@ -364,6 +396,7 @@ def custom(
         AgentType.CUSTOM,
         name=name,
         instruction=final_instruction,
+        child_agents=agents,
         servers=servers,
         model=model,
         use_history=use_history,
@@ -391,9 +424,9 @@ def orchestrator(
     self,
     name: str,
     *,
-    agents: List[str],
+    agents: list[str],
     instruction: str | Path | AnyUrl = DEFAULT_INSTRUCTION_ORCHESTRATOR,
-    model: Optional[str] = None,
+    model: str | None = None,
     request_params: RequestParams | None = None,
     use_history: bool = False,
     human_input: bool = False,
@@ -446,9 +479,9 @@ def iterative_planner(
     self,
     name: str,
     *,
-    agents: List[str],
+    agents: list[str],
     instruction: str | Path | AnyUrl = ITERATIVE_PLAN_SYSTEM_PROMPT_TEMPLATE,
-    model: Optional[str] = None,
+    model: str | None = None,
     request_params: RequestParams | None = None,
     plan_iterations: int = -1,
     default: bool = False,
@@ -496,20 +529,19 @@ def router(
     self,
     name: str,
     *,
-    agents: List[str],
-    instruction: Optional[str | Path | AnyUrl] = None,
-    servers: List[str] = [],
-    tools: Optional[Dict[str, List[str]]] = None,
-    resources: Optional[Dict[str, List[str]]] = None,
-    prompts: Optional[Dict[str, List[str]]] = None,
-    model: Optional[str] = None,
+    agents: list[str],
+    instruction: str | Path | AnyUrl | None = None,
+    servers: list[str] = [],
+    tools: dict[str, list[str]] | None = None,
+    resources: dict[str, list[str]] | None = None,
+    prompts: dict[str, list[str]] | None = None,
+    model: str | None = None,
     use_history: bool = False,
     request_params: RequestParams | None = None,
     human_input: bool = False,
     default: bool = False,
-    elicitation_handler: Optional[
-        ElicitationFnT
-    ] = None,  ## exclude from docs, decide whether allowable
+    elicitation_handler: ElicitationFnT
+    | None = None,  ## exclude from docs, decide whether allowable
     api_key: str | None = None,
 ) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """
@@ -555,8 +587,8 @@ def chain(
     self,
     name: str,
     *,
-    sequence: List[str],
-    instruction: Optional[str | Path | AnyUrl] = None,
+    sequence: list[str],
+    instruction: str | Path | AnyUrl | None = None,
     cumulative: bool = False,
     default: bool = False,
 ) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
@@ -579,10 +611,7 @@ def chain(
 
         raise AgentConfigError(f"Chain '{name}' requires at least one agent in the sequence")
 
-    default_instruction = """
-    You are a chain that processes requests through a series of specialized agents in sequence.
-    Pass the output of each agent to the next agent in the chain.
-    """
+    default_instruction = """Chain processes requests through a series of agents in sequence, the output of each agent is passed to the next."""
     resolved_instruction = _resolve_instruction(instruction or default_instruction)
 
     return _decorator_impl(
@@ -600,9 +629,9 @@ def parallel(
     self,
     name: str,
     *,
-    fan_out: List[str],
+    fan_out: list[str],
     fan_in: str | None = None,
-    instruction: Optional[str | Path | AnyUrl] = None,
+    instruction: str | Path | AnyUrl | None = None,
     include_request: bool = True,
     default: bool = False,
 ) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
@@ -645,9 +674,10 @@ def evaluator_optimizer(
     *,
     generator: str,
     evaluator: str,
-    instruction: Optional[str | Path | AnyUrl] = None,
+    instruction: str | Path | AnyUrl | None = None,
     min_rating: str = "GOOD",
     max_refinements: int = 3,
+    refinement_instruction: str | None = None,
     default: bool = False,
 ) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """
@@ -682,5 +712,81 @@ def evaluator_optimizer(
         evaluator=evaluator,
         min_rating=min_rating,
         max_refinements=max_refinements,
+        refinement_instruction=refinement_instruction,
+        default=default,
+    )
+
+
+def maker(
+    self,
+    name: str,
+    *,
+    worker: str,
+    k: int = 3,
+    max_samples: int = 50,
+    match_strategy: str = "exact",
+    red_flag_max_length: int | None = None,
+    instruction: str | Path | AnyUrl | None = None,
+    default: bool = False,
+) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
+    """
+    Decorator to create a MAKER agent for statistical error correction via voting.
+
+    MAKER: Massively decomposed Agentic processes with K-voting Error Reduction.
+
+    Based on the paper "Solving a Million-Step LLM Task with Zero Errors"
+    (arXiv:2511.09030). Implements first-to-ahead-by-k voting where multiple
+    samples are drawn from a worker agent, and the first response to achieve
+    a k-vote margin over alternatives wins.
+
+    This enables high reliability with cost-effective models by trading
+    compute (multiple samples) for accuracy (statistical consensus).
+
+    Args:
+        name: Name of the MAKER agent
+        worker: Name of the agent to sample from for voting
+        k: Margin required to declare winner (first-to-ahead-by-k).
+           Higher k = more reliable but more samples needed.
+           Default of 3 provides strong guarantees for most use cases.
+        max_samples: Maximum samples before falling back to plurality vote
+        match_strategy: How to compare responses for voting:
+            - "exact": Character-for-character match
+            - "normalized": Ignore whitespace and case differences
+            - "structured": Parse as JSON and compare structurally
+        red_flag_max_length: Discard responses longer than this (characters).
+                             Per the paper, overly long responses correlate
+                             with errors. None = no length limit.
+        instruction: Base instruction for the MAKER agent
+        default: Whether to mark this as the default agent
+
+    Returns:
+        A decorator that registers the MAKER agent
+
+    Example:
+        @fast.agent(name="calculator", instruction="Return only the numeric result")
+        @fast.maker(name="reliable_calc", worker="calculator", k=3)
+        async def main():
+            async with fast.run() as agent:
+                result = await agent.reliable_calc.send("What is 17 * 23?")
+    """
+    default_instruction = """
+    MAKER: Massively decomposed Agentic processes with K-voting Error Reduction.
+    Implements statistical error correction through voting consensus.
+    Multiple samples are drawn and the first response to achieve a k-vote
+    margin wins, ensuring high reliability even with cost-effective models.
+    """
+    resolved_instruction = _resolve_instruction(instruction or default_instruction)
+
+    return _decorator_impl(
+        self,
+        AgentType.MAKER,
+        name=name,
+        instruction=resolved_instruction,
+        servers=[],  # MAKER doesn't connect to servers directly
+        worker=worker,
+        k=k,
+        max_samples=max_samples,
+        match_strategy=match_strategy,
+        red_flag_max_length=red_flag_max_length,
         default=default,
     )

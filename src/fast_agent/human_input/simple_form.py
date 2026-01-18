@@ -1,18 +1,18 @@
 """Simple form API for elicitation schemas without MCP wrappers."""
 
-import asyncio
-from typing import Any, Dict, Optional, Union
+from typing import Any, Union
 
 from mcp.types import ElicitRequestedSchema
 
 from fast_agent.human_input.form_fields import FormSchema
+from fast_agent.utils.async_utils import run_sync
 
 
 async def form(
-    schema: Union[FormSchema, ElicitRequestedSchema, Dict[str, Any]],
+    schema: Union[FormSchema, ElicitRequestedSchema, dict[str, Any]],
     message: str = "Please fill out the form",
     title: str = "Form Input",
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """
     Simple form API that presents an elicitation form and returns results.
 
@@ -61,10 +61,10 @@ async def form(
 
 
 def form_sync(
-    schema: Union[FormSchema, ElicitRequestedSchema, Dict[str, Any]],
+    schema: Union[FormSchema, ElicitRequestedSchema, dict[str, Any]],
     message: str = "Please fill out the form",
     title: str = "Form Input",
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """
     Synchronous wrapper for the form function.
 
@@ -76,14 +76,14 @@ def form_sync(
     Returns:
         Dict with form data if accepted, None if cancelled/declined
     """
-    return asyncio.run(form(schema, message, title))
+    return run_sync(form, schema, message, title)
 
 
 # Convenience function with a shorter name
 async def ask(
-    schema: Union[FormSchema, ElicitRequestedSchema, Dict[str, Any]],
+    schema: Union[FormSchema, ElicitRequestedSchema, dict[str, Any]],
     message: str = "Please provide the requested information",
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """
     Short alias for form() function.
 
@@ -101,9 +101,9 @@ async def ask(
 
 
 def ask_sync(
-    schema: Union[FormSchema, ElicitRequestedSchema, Dict[str, Any]],
+    schema: Union[FormSchema, ElicitRequestedSchema, dict[str, Any]],
     message: str = "Please provide the requested information",
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """
     Synchronous version of ask().
 

@@ -1,4 +1,4 @@
-from typing import List
+from typing import Any
 
 from fast_agent.llm.fastagent_llm import FastAgentLLM
 from fast_agent.llm.provider.anthropic.llm_anthropic import AnthropicLLM
@@ -11,18 +11,25 @@ from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
 class StubLLM(FastAgentLLM):
     """Minimal implementation of FastAgentLLM for testing purposes"""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(provider=Provider.FAST_AGENT, *args, **kwargs)
+    def __init__(self, **kwargs: Any) -> None:
+        kwargs.pop("provider", None)
+        super().__init__(provider=Provider.FAST_AGENT, **kwargs)
 
     async def _apply_prompt_provider_specific(
         self,
-        multipart_messages: List["PromptMessageExtended"],
+        multipart_messages: list["PromptMessageExtended"],
         request_params: RequestParams | None = None,
         tools=None,
         is_template: bool = False,
     ) -> PromptMessageExtended:
         """Implement the abstract method with minimal functionality"""
         return multipart_messages[-1]
+
+    def _convert_extended_messages_to_provider(
+        self, messages: list[PromptMessageExtended]
+    ) -> list[Any]:
+        """Convert messages to provider format - stub returns empty list"""
+        return []
 
 
 class TestRequestParamsInLLM:
@@ -192,7 +199,7 @@ class TestRequestParamsInLLM:
         llm = StubLLM()
 
         base_args = {"model": "test-model"}
-        params = RequestParams(temperature=None, top_p=0.9)
+        params = RequestParams(temperature=None, metadata={"top_p": 0.9})
 
         result = llm.prepare_provider_arguments(base_args, params)
 

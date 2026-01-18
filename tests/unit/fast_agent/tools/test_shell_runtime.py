@@ -5,9 +5,10 @@ import signal
 import subprocess
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any
 
 import pytest
+from mcp.types import TextContent
 
 from fast_agent.tools.shell_runtime import ShellRuntime
 from fast_agent.ui import console
@@ -57,15 +58,15 @@ def _no_progress():
 
 
 def _setup_runtime(
-    monkeypatch: pytest.MonkeyPatch, runtime_info: Dict[str, str]
-) -> Tuple[ShellRuntime, DummyProcess, Dict[str, Any]]:
+    monkeypatch: pytest.MonkeyPatch, runtime_info: dict[str, str]
+) -> tuple[ShellRuntime, DummyProcess, dict[str, Any]]:
     logger = logging.getLogger("shell-runtime-test")
     runtime = ShellRuntime(activation_reason="test", logger=logger)
     runtime.runtime_info = lambda: runtime_info  # type: ignore[assignment]
     runtime.working_directory = lambda: Path(".")  # type: ignore[assignment]
 
     dummy_process = DummyProcess()
-    captured: Dict[str, Any] = {}
+    captured: dict[str, Any] = {}
 
     async def fake_exec(*args, **kwargs):
         captured["exec_args"] = args
@@ -102,6 +103,9 @@ async def test_execute_simple_command() -> None:
     result = await runtime.execute({"command": "echo hello"})
 
     assert result.isError is False
+    assert result.content is not None
+    assert result.content[0].type == "text"
+    assert isinstance(result.content[0], TextContent)
     assert "hello" in result.content[0].text
     assert "exit code" in result.content[0].text
 
@@ -121,6 +125,9 @@ async def test_execute_command_with_exit_code() -> None:
         result = await runtime.execute({"command": "false"})
 
     assert result.isError is True
+    assert result.content is not None
+    assert result.content[0].type == "text"
+    assert isinstance(result.content[0], TextContent)
     assert "exit code" in result.content[0].text
 
 
@@ -140,8 +147,13 @@ async def test_timeout_sends_ctrl_break_for_pwsh(monkeypatch: pytest.MonkeyPatch
 
     result = await runtime.execute({"command": "Start-Sleep -Seconds 5"})
 
-    assert signal.CTRL_BREAK_EVENT in process.sent_signals
+    ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+    assert ctrl_break is not None
+    assert ctrl_break in process.sent_signals
     assert process.terminated is True
     assert captured["exec_args"][0].endswith("pwsh.exe")
     assert result.isError is True
+    assert result.content is not None
+    assert result.content[0].type == "text"
+    assert isinstance(result.content[0], TextContent)
     assert "(timeout after 0s" in result.content[0].text

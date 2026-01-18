@@ -4,15 +4,12 @@ Manages the lifecycle of multiple MCP server connections.
 
 import asyncio
 import traceback
-from datetime import timedelta
-from typing import (
-    TYPE_CHECKING,
-    AsyncGenerator,
-    Callable,
-    Dict,
-    Optional,
-)
+from collections import deque
+from contextlib import AbstractAsyncContextManager, suppress
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING, Callable, Union, cast
 
+import httpx
 from anyio import Event, Lock, create_task_group
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from httpx import HTTPStatusError
@@ -22,6 +19,11 @@ from mcp.client.stdio import (
     get_default_environment,
 )
 from mcp.client.streamable_http import GetSessionIdCallback
+from mcp.shared._httpx_utils import (
+    MCP_DEFAULT_SSE_READ_TIMEOUT,
+    MCP_DEFAULT_TIMEOUT,
+    create_mcp_http_client,
+)
 from mcp.types import Implementation, JSONRPCMessage, ServerCapabilities
 
 from fast_agent.config import MCPServerSettings
@@ -69,7 +71,7 @@ def _add_none_to_context(context_manager):
 
 def _prepare_headers_and_auth(
     server_config: MCPServerSettings,
-) -> tuple[dict[str, str], Optional["OAuthClientProvider"], set[str]]:
+) -> tuple[dict[str, str], Union["OAuthClientProvider", None], set[str]]:
     """
     Prepare request headers and determine if OAuth authentication should be used.
 
@@ -112,19 +114,15 @@ class ServerConnection:
         server_config: MCPServerSettings,
         transport_context_factory: Callable[
             [],
-            AsyncGenerator[
+            AbstractAsyncContextManager[
                 tuple[
                     MemoryObjectReceiveStream[JSONRPCMessage | Exception],
                     MemoryObjectSendStream[JSONRPCMessage],
                     GetSessionIdCallback | None,
-                ],
-                None,
+                ]
             ],
         ],
-        client_session_factory: Callable[
-            [MemoryObjectReceiveStream, MemoryObjectSendStream, timedelta | None],
-            ClientSession,
-        ],
+        client_session_factory: Callable[..., ClientSession],
     ) -> None:
         self.server_name = server_name
         self.server_config = server_config
@@ -153,6 +151,13 @@ class ServerConnection:
         self.session_id: str | None = None
         self._get_session_id_cb: GetSessionIdCallback | None = None
         self.transport_metrics: TransportChannelMetrics | None = None
+        self._ping_ok_count = 0
+        self._ping_fail_count = 0
+        self._ping_consecutive_failures = 0
+        self._ping_last_ok_at: datetime | None = None
+        self._ping_last_fail_at: datetime | None = None
+        self._ping_last_error: str | None = None
+        self._ping_history: deque[tuple[datetime, str]] = deque(maxlen=200)
 
     def is_healthy(self) -> bool:
         """Check if the server connection is healthy and ready to use."""
@@ -185,12 +190,9 @@ class ServerConnection:
 
         self.server_capabilities = result.capabilities
         # InitializeResult exposes server info via `serverInfo`; keep fallback for older fields
-        implementation = getattr(result, "serverInfo", None)
-        if implementation is None:
-            implementation = getattr(result, "implementation", None)
-        self.server_implementation = implementation
+        self.server_implementation = result.serverInfo
 
-        raw_instructions = getattr(result, "instructions", None)
+        raw_instructions = result.instructions
         self.server_instructions_available = bool(raw_instructions)
 
         # Store instructions if provided by the server and enabled in config
@@ -222,6 +224,43 @@ class ServerConnection:
         """
         await self._initialized_event.wait()
 
+    def record_ping_event(self, state: str) -> None:
+        self._ping_history.append((datetime.now(timezone.utc), state))
+
+    def build_ping_activity_buckets(self, bucket_seconds: int, bucket_count: int) -> list[str]:
+        try:
+            seconds = int(bucket_seconds)
+        except (TypeError, ValueError):
+            seconds = 30
+        if seconds <= 0:
+            seconds = 30
+
+        try:
+            count = int(bucket_count)
+        except (TypeError, ValueError):
+            count = 20
+        if count <= 0:
+            count = 20
+
+        if not self._ping_history:
+            return ["none"] * count
+
+        priority = {"error": 2, "ping": 1, "none": 0}
+        history_map: dict[int, str] = {}
+        for timestamp, state in self._ping_history:
+            bucket = int(timestamp.timestamp() // seconds)
+            existing = history_map.get(bucket)
+            if existing is None or priority.get(state, 0) >= priority.get(existing, 0):
+                history_map[bucket] = state
+
+        current_bucket = int(datetime.now(timezone.utc).timestamp() // seconds)
+        buckets: list[str] = []
+        for offset in range(count - 1, -1, -1):
+            bucket_index = current_bucket - offset
+            buckets.append(history_map.get(bucket_index, "none"))
+
+        return buckets
+
     def create_session(
         self,
         read_stream: MemoryObjectReceiveStream,
@@ -251,40 +290,137 @@ class ServerConnection:
         return session
 
 
+async def _run_ping_loop(server_conn: ServerConnection) -> None:
+    interval = server_conn.server_config.ping_interval_seconds
+    if not interval or interval <= 0:
+        return
+
+    max_missed = server_conn.server_config.max_missed_pings
+    missed = 0
+    read_timeout = (
+        timedelta(seconds=server_conn.server_config.read_timeout_seconds)
+        if server_conn.server_config.read_timeout_seconds
+        else None
+    )
+    if read_timeout is None:
+        read_timeout = timedelta(seconds=interval)
+
+    while not server_conn._shutdown_event.is_set():
+        await asyncio.sleep(interval)
+        if server_conn._shutdown_event.is_set():
+            break
+        session = server_conn.session
+        if session is None:
+            break
+        if not hasattr(session, "ping"):
+            return
+        try:
+            await cast("MCPAgentClientSession", session).ping(read_timeout_seconds=read_timeout)
+            missed = 0
+            server_conn._ping_ok_count += 1
+            server_conn._ping_consecutive_failures = 0
+            server_conn._ping_last_ok_at = datetime.now(timezone.utc)
+            server_conn._ping_last_error = None
+            server_conn.record_ping_event("ping")
+        except Exception as exc:
+            missed += 1
+            server_conn._ping_fail_count += 1
+            server_conn._ping_consecutive_failures = missed
+            server_conn._ping_last_fail_at = datetime.now(timezone.utc)
+            server_conn._ping_last_error = str(exc)
+            server_conn.record_ping_event("error")
+            logger.warning(
+                f"{server_conn.server_name}: Ping failed ({missed}/{max_missed}): {exc}"
+            )
+            if missed >= max_missed:
+                server_conn._error_occurred = True
+                server_conn._error_message = (
+                    f"Ping failed {missed} time(s); last error: {exc}"
+                )
+                server_conn.request_shutdown()
+                break
+
+
 async def _server_lifecycle_task(server_conn: ServerConnection) -> None:
     """
     Manage the lifecycle of a single server connection.
     Runs inside the MCPConnectionManager's shared TaskGroup.
+
+    IMPORTANT: This function must NEVER raise an exception, as it runs in a shared
+    task group. Any exceptions must be caught and handled gracefully, with errors
+    recorded in server_conn._error_occurred and _error_message.
     """
     server_name = server_conn.server_name
     try:
         transport_context = server_conn._transport_context_factory()
 
-        async with transport_context as (read_stream, write_stream, get_session_id_cb):
-            server_conn._get_session_id_cb = get_session_id_cb
-
-            if get_session_id_cb is not None:
-                try:
-                    server_conn.session_id = get_session_id_cb()
-                except Exception:
-                    logger.debug(f"{server_name}: Unable to retrieve session id from transport")
-            elif server_conn.server_config.transport == "stdio":
-                server_conn.session_id = "local"
-
-            server_conn.create_session(read_stream, write_stream)
-
-            async with server_conn.session:
-                await server_conn.initialize_session()
+        try:
+            async with transport_context as (read_stream, write_stream, get_session_id_cb):
+                server_conn._get_session_id_cb = get_session_id_cb
 
                 if get_session_id_cb is not None:
                     try:
-                        server_conn.session_id = get_session_id_cb() or server_conn.session_id
+                        server_conn.session_id = get_session_id_cb()
                     except Exception:
-                        logger.debug(f"{server_name}: Unable to refresh session id after init")
+                        logger.debug(f"{server_name}: Unable to retrieve session id from transport")
                 elif server_conn.server_config.transport == "stdio":
                     server_conn.session_id = "local"
 
-                await server_conn.wait_for_shutdown_request()
+                server_conn.create_session(read_stream, write_stream)
+                assert server_conn.session is not None
+
+                try:
+                    async with server_conn.session:
+                        await server_conn.initialize_session()
+
+                        if get_session_id_cb is not None:
+                            try:
+                                server_conn.session_id = get_session_id_cb() or server_conn.session_id
+                            except Exception:
+                                logger.debug(f"{server_name}: Unable to refresh session id after init")
+                        elif server_conn.server_config.transport == "stdio":
+                            server_conn.session_id = "local"
+
+                        if (
+                            server_conn.server_config.ping_interval_seconds
+                            and server_conn.server_config.ping_interval_seconds > 0
+                        ):
+                            ping_task = asyncio.create_task(_run_ping_loop(server_conn))
+                            try:
+                                await server_conn.wait_for_shutdown_request()
+                            finally:
+                                if not ping_task.done():
+                                    ping_task.cancel()
+                                with suppress(asyncio.CancelledError):
+                                    await ping_task
+                        else:
+                            await server_conn.wait_for_shutdown_request()
+                except Exception as session_exit_exc:
+                    if server_conn._shutdown_event.is_set():
+                        # Cleanup errors can happen when disconnecting a session that was already
+                        # terminated; treat as expected during shutdown.
+                        logger.debug(
+                            f"{server_name}: Exception during session cleanup (expected during shutdown): {session_exit_exc}"
+                        )
+                        if not server_conn._initialized_event.is_set():
+                            server_conn._error_occurred = True
+                            server_conn._error_message = "Shutdown requested before initialization"
+                            server_conn._initialized_event.set()
+                    else:
+                        raise
+        except Exception as transport_exit_exc:
+            if server_conn._shutdown_event.is_set():
+                # Cleanup errors can happen when disconnecting a transport that was already
+                # terminated; treat as expected during shutdown.
+                logger.debug(
+                    f"{server_name}: Exception during transport cleanup (expected during shutdown): {transport_exit_exc}"
+                )
+                if not server_conn._initialized_event.is_set():
+                    server_conn._error_occurred = True
+                    server_conn._error_message = "Shutdown requested before initialization"
+                    server_conn._initialized_event.set()
+            else:
+                raise
 
     except HTTPStatusError as http_exc:
         logger.error(
@@ -359,11 +495,11 @@ class MCPConnectionManager(ContextDependent):
     """
 
     def __init__(
-        self, server_registry: "ServerRegistry", context: Optional["Context"] = None
+        self, server_registry: "ServerRegistry", context: Union["Context", None] = None
     ) -> None:
         super().__init__(context=context)
         self.server_registry = server_registry
-        self.running_servers: Dict[str, ServerConnection] = {}
+        self.running_servers: dict[str, ServerConnection] = {}
         self._lock = Lock()
         # Manage our own task group - independent of task context
         self._task_group = None
@@ -390,12 +526,13 @@ class MCPConnectionManager(ContextDependent):
 
             # Then close the task group if it's active
             if self._task_group_active:
+                assert self._task_group is not None
                 await self._task_group.__aexit__(exc_type, exc_val, exc_tb)
                 self._task_group_active = False
                 self._task_group = None
                 self._tg = None
-        except Exception as e:
-            logger.error(f"Error during connection manager shutdown: {e}")
+        except Exception:
+            logger.exception("Error during connection manager shutdown")
 
     def _suppress_mcp_sse_errors(self) -> None:
         """Suppress MCP library's 'Error in sse_reader' messages."""
@@ -542,10 +679,24 @@ class MCPConnectionManager(ContextDependent):
                                 exc_info=True,
                             )
 
+                timeout = None
+                if (
+                    config.http_timeout_seconds is not None
+                    or config.http_read_timeout_seconds is not None
+                ):
+                    timeout = httpx.Timeout(
+                        config.http_timeout_seconds or MCP_DEFAULT_TIMEOUT,
+                        read=config.http_read_timeout_seconds or MCP_DEFAULT_SSE_READ_TIMEOUT,
+                    )
+
+                http_client = create_mcp_http_client(
+                    headers=headers,
+                    auth=oauth_auth,
+                    timeout=timeout,
+                )
                 return tracking_streamablehttp_client(
                     config.url,
-                    headers,
-                    auth=oauth_auth,
+                    http_client=http_client,
                     channel_hook=channel_hook,
                 )
             else:
@@ -567,6 +718,7 @@ class MCPConnectionManager(ContextDependent):
                 return self.running_servers[server_name]
 
             self.running_servers[server_name] = server_conn
+            assert self._tg is not None
             self._tg.start_soon(_server_lifecycle_task, server_conn)
 
         logger.info(f"{server_name}: Up and running with a persistent connection!")
@@ -639,6 +791,57 @@ class MCPConnectionManager(ContextDependent):
             logger.info(f"{server_name}: Shutdown signal sent (lifecycle task will exit).")
         else:
             logger.info(f"{server_name}: No persistent connection found. Skipping server shutdown")
+
+    async def reconnect_server(
+        self,
+        server_name: str,
+        client_session_factory: Callable,
+    ) -> "ServerConnection":
+        """
+        Force reconnection to a server by disconnecting and re-establishing the connection.
+
+        This is used when a session has been terminated (e.g., 404 from server restart)
+        and we need to create a fresh connection with a new session.
+
+        Args:
+            server_name: Name of the server to reconnect
+            client_session_factory: Factory function to create client sessions
+
+        Returns:
+            The new ServerConnection instance
+        """
+        logger.info(f"{server_name}: Initiating reconnection...")
+
+        # First, disconnect the existing connection
+        await self.disconnect_server(server_name)
+
+        # Brief pause to allow cleanup
+        await asyncio.sleep(0.1)
+
+        # Launch a fresh connection
+        server_conn = await self.launch_server(
+            server_name=server_name,
+            client_session_factory=client_session_factory,
+        )
+
+        # Wait for initialization
+        await server_conn.wait_for_initialized()
+
+        # Check if the reconnection was successful
+        if not server_conn.is_healthy():
+            error_msg = server_conn._error_message or "Unknown error during reconnection"
+            if isinstance(error_msg, list):
+                formatted_error = "\n".join(error_msg)
+            else:
+                formatted_error = str(error_msg)
+
+            raise ServerInitializationError(
+                f"MCP Server: '{server_name}': Failed to reconnect - see details.",
+                formatted_error,
+            )
+
+        logger.info(f"{server_name}: Reconnection successful")
+        return server_conn
 
     async def disconnect_all(self) -> None:
         """Disconnect all servers that are running under this connection manager."""

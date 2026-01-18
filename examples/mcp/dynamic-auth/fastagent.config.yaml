@@ -1,0 +1,11 @@
+default_model: "openai.gpt-4.1"
+
+mcp:
+  servers:
+    auth_demo:
+        command: python
+        args: ["server.py"]
+                            
+# Optional: Enable debug logging to see tool change notifications
+# logging:
+#   level: DEBUG

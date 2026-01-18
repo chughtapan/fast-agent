@@ -9,7 +9,7 @@ import json
 import traceback
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, List, Protocol
+from typing import Protocol
 
 import aiohttp
 from opentelemetry import trace
@@ -22,6 +22,7 @@ from fast_agent.core.logging.events import Event, EventFilter
 from fast_agent.core.logging.json_serializer import JSONSerializer
 from fast_agent.core.logging.listeners import EventListener, LifecycleAwareListener
 from fast_agent.ui.console import console
+from fast_agent.utils.async_utils import ensure_event_loop, gather_with_cancel
 
 
 class EventTransport(Protocol):
@@ -71,7 +72,7 @@ class ConsoleTransport(FilteredEventTransport):
         super().__init__(event_filter=event_filter)
         # Use shared console instances
         self._serializer = JSONSerializer()
-        self.log_level_styles: Dict[str, str] = {
+        self.log_level_styles: dict[str, str] = {
             "info": "bold green",
             "debug": "dim white",
             "warning": "bold yellow",
@@ -182,7 +183,7 @@ class HTTPTransport(FilteredEventTransport):
     def __init__(
         self,
         endpoint: str,
-        headers: Dict[str, str] = None,
+        headers: dict[str, str] | None = None,
         batch_size: int = 100,
         timeout: float = 5.0,
         event_filter: EventFilter | None = None,
@@ -193,7 +194,7 @@ class HTTPTransport(FilteredEventTransport):
         self.batch_size = batch_size
         self.timeout = timeout
 
-        self.batch: List[Event] = []
+        self.batch: list[Event] = []
         self.lock = asyncio.Lock()
         self._session: aiohttp.ClientSession | None = None
         self._serializer = JSONSerializer()
@@ -227,6 +228,7 @@ class HTTPTransport(FilteredEventTransport):
 
         if not self._session:
             await self.start()
+        assert self._session is not None
 
         try:
             # Convert events to JSON-serializable dicts
@@ -240,7 +242,7 @@ class HTTPTransport(FilteredEventTransport):
                     "data": self._serializer(event.data),
                     "trace_id": event.trace_id,
                     "span_id": event.span_id,
-                    "context": event.context.dict() if event.context else None,
+                    "context": event.context.model_dump() if event.context else None,
                 }
                 for event in self.batch
             ]
@@ -268,7 +270,7 @@ class AsyncEventBus:
 
     def __init__(self, transport: EventTransport | None = None) -> None:
         self.transport: EventTransport = transport or NoOpTransport()
-        self.listeners: Dict[str, EventListener] = {}
+        self.listeners: dict[str, EventListener] = {}
         self._queue: asyncio.Queue | None = None
         self._task: asyncio.Task | None = None
         self._running = False
@@ -302,11 +304,7 @@ class AsyncEventBus:
         if self._running:
             return
 
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        ensure_event_loop()
 
         self._queue = asyncio.Queue()
 
@@ -322,13 +320,22 @@ class AsyncEventBus:
     async def stop(self) -> None:
         """Stop the event bus and all lifecycle-aware listeners."""
         if not self._running:
+            if self._task and not self._task.done():
+                self._task.cancel()
+                try:
+                    await asyncio.wait_for(self._task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass  # Task was cancelled or timed out
+                except Exception as e:
+                    print(f"Error cancelling process task: {e}")
+            self._task = None
             return
 
         # Signal processing to stop
         self._running = False
 
         # Try to process remaining items with a timeout
-        if not self._queue.empty():
+        if self._queue is not None and not self._queue.empty():
             try:
                 # Give some time for remaining items to be processed
                 await asyncio.wait_for(self._queue.join(), timeout=5.0)
@@ -385,7 +392,8 @@ class AsyncEventBus:
             print(f"Error in transport.send_event: {e}")
 
         # Then queue for listeners
-        await self._queue.put(event)
+        if self._queue is not None:
+            await self._queue.put(event)
 
     def add_listener(self, name: str, listener: EventListener) -> None:
         """Add a listener to the event bus."""
@@ -401,6 +409,8 @@ class AsyncEventBus:
             event = None
             try:
                 # Use wait_for with a timeout to allow checking running state
+                if self._queue is None:
+                    continue
                 try:
                     event = await asyncio.wait_for(self._queue.get(), timeout=0.1)
                 except asyncio.TimeoutError:
@@ -415,7 +425,7 @@ class AsyncEventBus:
                         print(f"Error creating listener task: {e}")
 
                 if tasks:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    results = await gather_with_cancel(tasks)
                     for r in results:
                         if isinstance(r, Exception):
                             print(f"Error in listener: {r}")
@@ -446,7 +456,7 @@ class AsyncEventBus:
                         except Exception:
                             pass
                     if tasks:
-                        await asyncio.gather(*tasks, return_exceptions=True)
+                        await gather_with_cancel(tasks)
                     self._queue.task_done()
                 except asyncio.QueueEmpty:
                     break

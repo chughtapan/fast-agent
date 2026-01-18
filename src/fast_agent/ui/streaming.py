@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import time
-from typing import TYPE_CHECKING, Any, Protocol
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from rich.console import Group
 from rich.live import Live
@@ -11,30 +11,52 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from fast_agent.core.logging.logger import get_logger
+from fast_agent.llm.stream_types import StreamChunk
 from fast_agent.ui import console
 from fast_agent.ui.markdown_helpers import prepare_markdown_content
 from fast_agent.ui.markdown_truncator import MarkdownTruncator
 from fast_agent.ui.plain_text_truncator import PlainTextTruncator
+from fast_agent.ui.stream_segments import StreamSegmentAssembler
+from fast_agent.ui.stream_viewport import StreamViewport, estimate_plain_text_height
 
 if TYPE_CHECKING:
+    from rich.console import RenderableType
+
     from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
     from fast_agent.ui.console_display import ConsoleDisplay
 
 
 logger = get_logger(__name__)
 
-MARKDOWN_STREAM_TARGET_RATIO = 0.75
+MARKDOWN_STREAM_TARGET_RATIO = 0.9
 MARKDOWN_STREAM_REFRESH_PER_SECOND = 4
-MARKDOWN_STREAM_HEIGHT_FUDGE = 1
-PLAIN_STREAM_TARGET_RATIO = 0.9
+MARKDOWN_STREAM_HEIGHT_FUDGE = 2
+PLAIN_STREAM_TARGET_RATIO = 0.92
 PLAIN_STREAM_REFRESH_PER_SECOND = 20
-PLAIN_STREAM_HEIGHT_FUDGE = 1
+PLAIN_STREAM_HEIGHT_FUDGE = 2
+STREAM_BATCH_PERIOD = 1 / 100
+STREAM_BATCH_MAX_DURATION = 1 / 60
+
+
+@dataclass(frozen=True)
+class _ToolStreamEvent:
+    event_type: str
+    info: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class _QueuedItem:
+    payload: object
+    enqueued_at: float
 
 
 class NullStreamingHandle:
     """No-op streaming handle used when streaming is disabled."""
 
     def update(self, _chunk: str) -> None:
+        return
+
+    def update_chunk(self, _chunk: StreamChunk) -> None:
         return
 
     def finalize(self, _message: "PromptMessageExtended | str") -> None:
@@ -61,6 +83,7 @@ class StreamingMessageHandle:
         header_left: str = "",
         header_right: str = "",
         progress_display: Any = None,
+        performance_hook: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._display = display
         self._bottom_items = bottom_items
@@ -71,12 +94,27 @@ class StreamingMessageHandle:
         self._header_right = header_right
         self._progress_display = progress_display
         self._progress_paused = False
-        self._buffer: list[str] = []
         self._plain_text_style: str | None = None
-        self._convert_literal_newlines = False
-        self._pending_literal_backslashes = ""
+        base_kind = "plain" if use_plain_text else "markdown"
+        self._render_reasoning_markdown = not use_plain_text
+        self._segment_assembler = StreamSegmentAssembler(
+            base_kind=base_kind,
+            tool_prefix="→",
+        )
+        self._markdown_truncator = MarkdownTruncator(target_height_ratio=1.0)
+        self._plain_truncator = PlainTextTruncator(target_height_ratio=1.0)
+        self._viewport = StreamViewport(
+            markdown_truncator=self._markdown_truncator,
+            plain_truncator=self._plain_truncator,
+        )
+        self._stream_target_ratio = (
+            PLAIN_STREAM_TARGET_RATIO if use_plain_text else MARKDOWN_STREAM_TARGET_RATIO
+        )
+        self._height_fudge = (
+            PLAIN_STREAM_HEIGHT_FUDGE if use_plain_text else MARKDOWN_STREAM_HEIGHT_FUDGE
+        )
         initial_renderable = (
-            Text("", style=self._plain_text_style) if self._use_plain_text else Markdown("")
+            Text("", style=self._plain_text_style or "") if self._use_plain_text else Markdown("")
         )
         refresh_rate = (
             PLAIN_STREAM_REFRESH_PER_SECOND
@@ -85,6 +123,12 @@ class StreamingMessageHandle:
         )
         self._min_render_interval = 1.0 / refresh_rate if refresh_rate else None
         self._last_render_time = 0.0
+        self._performance_hook = performance_hook
+        self._batch_period = STREAM_BATCH_PERIOD
+        self._batch_max_duration = STREAM_BATCH_MAX_DURATION
+        self._pending_batch_meta: dict[str, Any] | None = None
+        self._scrolling_started = False
+        self._scroll_start_time: float | None = None
         try:
             self._loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
         except RuntimeError:
@@ -103,14 +147,6 @@ class StreamingMessageHandle:
         self._live_started = False
         self._active = True
         self._finalized = False
-        self._in_table = False
-        self._pending_table_row = ""
-        self._truncator = MarkdownTruncator(target_height_ratio=MARKDOWN_STREAM_TARGET_RATIO)
-        self._plain_truncator = (
-            PlainTextTruncator(target_height_ratio=PLAIN_STREAM_TARGET_RATIO)
-            if self._use_plain_text
-            else None
-        )
         self._max_render_height = 0
 
         if self._async_mode and self._loop and self._queue is not None:
@@ -125,6 +161,34 @@ class StreamingMessageHandle:
             return
 
         if self._handle_chunk(chunk):
+            now = time.perf_counter()
+            self._pending_batch_meta = {
+                "batch_size": 1,
+                "queue_depth": 0,
+                "oldest_enqueued_at": now,
+                "newest_enqueued_at": now,
+                "batch_chars": len(chunk),
+            }
+            self._render_current_buffer()
+
+    def update_chunk(self, chunk: StreamChunk) -> None:
+        """Structured streaming update with an explicit reasoning flag."""
+        if not self._active or not chunk or not chunk.text:
+            return
+
+        if self._async_mode and self._queue is not None:
+            self._enqueue_chunk(chunk)
+            return
+
+        if self._handle_stream_chunk(chunk):
+            now = time.perf_counter()
+            self._pending_batch_meta = {
+                "batch_size": 1,
+                "queue_depth": 0,
+                "oldest_enqueued_at": now,
+                "newest_enqueued_at": now,
+                "batch_chars": len(chunk.text),
+            }
             self._render_current_buffer()
 
     def _build_header(self) -> Text:
@@ -189,41 +253,15 @@ class StreamingMessageHandle:
 
         return text
 
-    def _trim_to_displayable(self, text: str) -> str:
-        if not text:
-            return text
-
-        terminal_height = console.console.size.height - 1
-
-        if self._use_plain_text and self._plain_truncator:
-            terminal_width = console.console.size.width
-            return self._plain_truncator.truncate(
-                text,
-                terminal_height=terminal_height,
-                terminal_width=terminal_width,
-            )
-
-        return self._truncator.truncate(
-            text,
-            terminal_height=terminal_height,
-            console=console.console,
-            code_theme=self._display.code_style,
-            prefer_recent=True,
-        )
-
-    def _switch_to_plain_text(self) -> None:
-        if not self._use_plain_text:
-            self._use_plain_text = True
-        if not self._plain_truncator:
-            self._plain_truncator = PlainTextTruncator(
-                target_height_ratio=PLAIN_STREAM_TARGET_RATIO
-            )
-        self._plain_text_style = "dim"
-        self._convert_literal_newlines = True
-
     def finalize(self, _message: "PromptMessageExtended | str") -> None:
         if not self._active or self._finalized:
             return
+
+        # Flush any buffered reasoning content before closing the live view
+        if self._segment_assembler.flush():
+            self._render_current_buffer()
+        elif self._segment_assembler.segments:
+            self._render_current_buffer()
 
         self._finalized = True
         self.close()
@@ -262,121 +300,7 @@ class StreamingMessageHandle:
         self._shutdown_live_resources()
         self._max_render_height = 0
 
-    def _extract_trailing_paragraph(self, text: str) -> str:
-        if not text:
-            return ""
-        double_break = text.rfind("\n\n")
-        if double_break != -1:
-            candidate = text[double_break + 2 :]
-        else:
-            candidate = text
-        if "\n" in candidate:
-            candidate = candidate.split("\n")[-1]
-        return candidate
-
-    def _wrap_plain_chunk(self, chunk: str) -> str:
-        width = max(1, console.console.size.width)
-        if not chunk or width <= 1:
-            return chunk
-
-        result_segments: list[str] = []
-        start = 0
-        length = len(chunk)
-
-        while start < length:
-            newline_pos = chunk.find("\n", start)
-            if newline_pos == -1:
-                line = chunk[start:]
-                delimiter = ""
-                start = length
-            else:
-                line = chunk[start:newline_pos]
-                delimiter = "\n"
-                start = newline_pos + 1
-
-            if len(line.expandtabs()) > width:
-                wrapped = self._wrap_plain_line(line, width)
-                result_segments.append("\n".join(wrapped))
-            else:
-                result_segments.append(line)
-
-            result_segments.append(delimiter)
-
-        return "".join(result_segments)
-
-    @staticmethod
-    def _wrap_plain_line(line: str, width: int) -> list[str]:
-        if not line:
-            return [""]
-
-        segments: list[str] = []
-        remaining = line
-
-        while len(remaining) > width:
-            break_at = remaining.rfind(" ", 0, width)
-            if break_at == -1 or break_at < width // 2:
-                break_at = width
-                segments.append(remaining[:break_at])
-                remaining = remaining[break_at:]
-            else:
-                segments.append(remaining[:break_at])
-                remaining = remaining[break_at + 1 :]
-        segments.append(remaining)
-        return segments
-
-    def _decode_literal_newlines(self, chunk: str) -> str:
-        if not chunk:
-            return chunk
-
-        text = chunk
-        if self._pending_literal_backslashes:
-            text = self._pending_literal_backslashes + text
-            self._pending_literal_backslashes = ""
-
-        result: list[str] = []
-        length = len(text)
-        index = 0
-
-        while index < length:
-            char = text[index]
-            if char == "\\":
-                start = index
-                while index < length and text[index] == "\\":
-                    index += 1
-                count = index - start
-
-                if index >= length:
-                    self._pending_literal_backslashes = "\\" * count
-                    break
-
-                next_char = text[index]
-                if next_char == "n" and count % 2 == 1:
-                    if count > 1:
-                        result.append("\\" * (count - 1))
-                    result.append("\n")
-                    index += 1
-                else:
-                    result.append("\\" * count)
-                    continue
-            else:
-                result.append(char)
-                index += 1
-
-        return "".join(result)
-
-    def _estimate_plain_render_height(self, text: str) -> int:
-        if not text:
-            return 0
-
-        width = max(1, console.console.size.width)
-        lines = text.split("\n")
-        total = 0
-        for line in lines:
-            expanded_len = len(line.expandtabs())
-            total += max(1, math.ceil(expanded_len / width)) if expanded_len else 1
-        return total
-
-    def _enqueue_chunk(self, chunk: str) -> None:
+    def _enqueue_chunk(self, chunk: object) -> None:
         if not self._queue or not self._loop:
             return
 
@@ -385,61 +309,39 @@ class StreamingMessageHandle:
         except RuntimeError:
             current_loop = None
 
+        queued = chunk if isinstance(chunk, _QueuedItem) else _QueuedItem(
+            payload=chunk, enqueued_at=time.perf_counter()
+        )
         if current_loop is self._loop:
             try:
-                self._queue.put_nowait(chunk)
+                self._queue.put_nowait(queued)
             except asyncio.QueueFull:
                 pass
         else:
             try:
-                self._loop.call_soon_threadsafe(self._queue.put_nowait, chunk)
+                self._loop.call_soon_threadsafe(self._queue.put_nowait, queued)
             except RuntimeError as exc:
                 logger.debug(
                     "RuntimeError while enqueuing chunk (expected during shutdown)",
-                    data={"error": str(exc), "chunk_length": len(chunk)},
+                    data={"error": str(exc), "chunk_repr": repr(chunk)},
                 )
             except Exception as exc:
                 logger.warning(
                     "Unexpected error while enqueuing chunk",
                     exc_info=True,
-                    data={"error": str(exc), "chunk_length": len(chunk)},
+                    data={"error": str(exc), "chunk_repr": repr(chunk)},
                 )
 
+    def _handle_stream_chunk(self, chunk: StreamChunk) -> bool:
+        """Process a typed stream chunk with explicit reasoning flag."""
+        return self._segment_assembler.handle_stream_chunk(chunk)
+
     def _handle_chunk(self, chunk: str) -> bool:
-        if not chunk:
-            return False
-
-        if self._use_plain_text:
-            if self._convert_literal_newlines:
-                chunk = self._decode_literal_newlines(chunk)
-                if not chunk:
-                    if self._pending_table_row:
-                        self._buffer.append(self._pending_table_row)
-                        self._pending_table_row = ""
-                    return False
-            chunk = self._wrap_plain_chunk(chunk)
-            if self._pending_table_row:
-                self._buffer.append(self._pending_table_row)
-                self._pending_table_row = ""
-        else:
-            text_so_far = "".join(self._buffer)
-            lines = text_so_far.strip().split("\n")
-            last_line = lines[-1] if lines else ""
-            currently_in_table = last_line.strip().startswith("|")
-
-            if currently_in_table and "\n" not in chunk:
-                self._pending_table_row += chunk
-                return False
-
-            if self._pending_table_row:
-                self._buffer.append(self._pending_table_row)
-                self._pending_table_row = ""
-
-        self._buffer.append(chunk)
-        return True
+        return self._segment_assembler.handle_text(chunk)
 
     def _render_current_buffer(self) -> None:
-        if not self._buffer:
+        segments = self._segment_assembler.segments
+        if not segments:
             return
 
         self._ensure_started()
@@ -447,75 +349,91 @@ class StreamingMessageHandle:
         if not self._live:
             return
 
-        # Consolidate buffer if it gets fragmented (>10 items)
-        # Then check if we need to truncate to keep only recent content
-        if len(self._buffer) > 10:
-            text = "".join(self._buffer)
-            trimmed = self._trim_to_displayable(text)
-            # Only update buffer if truncation actually reduced content
-            # This keeps buffer size manageable for continuous scrolling
-            if len(trimmed) < len(text):
-                self._buffer = [trimmed]
-            else:
-                self._buffer = [text]
-
-        text = "".join(self._buffer)
-
-        # Check if trailing paragraph is too long and needs trimming
-        trailing_paragraph = self._extract_trailing_paragraph(text)
-        if trailing_paragraph and "\n" not in trailing_paragraph:
-            width = max(1, console.console.size.width)
-            target_ratio = (
-                PLAIN_STREAM_TARGET_RATIO if self._use_plain_text else MARKDOWN_STREAM_TARGET_RATIO
-            )
-            target_rows = max(1, int(console.console.size.height * target_ratio) - 1)
-            estimated_rows = math.ceil(len(trailing_paragraph.expandtabs()) / width)
-            if estimated_rows > target_rows:
-                trimmed = self._trim_to_displayable(text)
-                if len(trimmed) < len(text):
-                    text = trimmed
-                    self._buffer = [trimmed]
-
         header = self._build_header()
         max_allowed_height = max(1, console.console.size.height - 2)
+        window_segments = self._viewport.slice_segments(
+            segments,
+            terminal_height=max_allowed_height,
+            console=console.console,
+            target_ratio=self._stream_target_ratio,
+        )
+        if not window_segments:
+            return
+        is_truncated = len(window_segments) < len(segments) or (
+            window_segments and segments and window_segments[0] is not segments[0]
+        )
+        if is_truncated and not self._scrolling_started:
+            self._scrolling_started = True
+            self._scroll_start_time = time.monotonic()
+        self._segment_assembler.compact(window_segments)
+
+        renderables: list[RenderableType] = []
+        content_height = 0
+        width = console.console.size.width
+        render_start = time.perf_counter()
+
+        for segment in window_segments:
+            if segment.kind == "markdown":
+                prepared = prepare_markdown_content(segment.text, self._display._escape_xml)
+                prepared_for_display = self._close_incomplete_code_blocks(prepared)
+                if prepared_for_display:
+                    renderables.append(
+                        Markdown(prepared_for_display, code_theme=self._display.code_style)
+                    )
+                    content_height += self._markdown_truncator.measure_rendered_height(
+                        prepared_for_display,
+                        console.console,
+                        self._display.code_style,
+                    )
+                else:
+                    renderables.append(Text(""))
+            elif segment.kind == "reasoning":
+                if self._render_reasoning_markdown:
+                    prepared = prepare_markdown_content(segment.text, self._display._escape_xml)
+                    prepared_for_display = self._close_incomplete_code_blocks(prepared)
+                    markdown = Markdown(
+                        prepared_for_display,
+                        code_theme=self._display.code_style,
+                        style="dim italic",
+                    )
+                    renderables.append(markdown)
+                    content_height += self._markdown_truncator.measure_rendered_height(
+                        prepared_for_display,
+                        console.console,
+                        self._display.code_style,
+                    )
+                else:
+                    renderables.append(Text(segment.text, style="dim italic"))
+                    content_height += estimate_plain_text_height(segment.text, width)
+            else:
+                renderables.append(Text(segment.text))
+                content_height += estimate_plain_text_height(segment.text, width)
+
         self._max_render_height = min(self._max_render_height, max_allowed_height)
+        budget_height = min(content_height + self._height_fudge, max_allowed_height)
 
-        if self._use_plain_text:
-            content_height = self._estimate_plain_render_height(text)
-            budget_height = min(content_height + PLAIN_STREAM_HEIGHT_FUDGE, max_allowed_height)
+        if budget_height > self._max_render_height:
+            self._max_render_height = budget_height
 
-            if budget_height > self._max_render_height:
-                self._max_render_height = budget_height
+        padding_lines = max(0, self._max_render_height - content_height)
+        if padding_lines:
+            # Text("\n" * n) renders n+1 lines, so subtract one for exact padding.
+            renderables.append(Text("\n" * max(0, padding_lines - 1)))
 
-            padding_lines = max(0, self._max_render_height - content_height)
-            display_text = text + ("\n" * padding_lines if padding_lines else "")
-            content = (
-                Text(display_text, style=self._plain_text_style)
-                if self._plain_text_style
-                else Text(display_text)
-            )
-        else:
-            prepared = prepare_markdown_content(text, self._display._escape_xml)
-            prepared_for_display = self._close_incomplete_code_blocks(prepared)
-
-            content_height = self._truncator.measure_rendered_height(
-                prepared_for_display, console.console, self._display.code_style
-            )
-            budget_height = min(content_height + MARKDOWN_STREAM_HEIGHT_FUDGE, max_allowed_height)
-
-            if budget_height > self._max_render_height:
-                self._max_render_height = budget_height
-
-            padding_lines = max(0, self._max_render_height - content_height)
-            if padding_lines:
-                prepared_for_display = prepared_for_display + ("\n" * padding_lines)
-
-            content = Markdown(prepared_for_display, code_theme=self._display.code_style)
+        content = (
+            Group(*renderables)
+            if len(renderables) > 1
+            else (renderables[0] if renderables else Text(""))
+        )
 
         header_with_spacing = header.copy()
         header_with_spacing.append("\n", style="default")
 
         combined = Group(header_with_spacing, content)
+        now = time.monotonic()
+        render_interval_ms = (
+            (now - self._last_render_time) * 1000 if self._last_render_time else None
+        )
         try:
             self._live.update(combined)
             self._last_render_time = time.monotonic()
@@ -525,6 +443,54 @@ class StreamingMessageHandle:
                 exc_info=True,
                 data={"error": str(exc)},
             )
+        finally:
+            if self._performance_hook:
+                render_ms = (time.perf_counter() - render_start) * 1000
+                batch_meta = self._pending_batch_meta or {}
+                oldest_enqueued = batch_meta.get("oldest_enqueued_at")
+                newest_enqueued = batch_meta.get("newest_enqueued_at")
+                queue_age_ms = (
+                    (render_start - oldest_enqueued) * 1000
+                    if isinstance(oldest_enqueued, (int, float))
+                    else None
+                )
+                batch_span_ms = (
+                    (newest_enqueued - oldest_enqueued) * 1000
+                    if isinstance(oldest_enqueued, (int, float))
+                    and isinstance(newest_enqueued, (int, float))
+                    else None
+                )
+                scroll_age_ms = (
+                    (now - self._scroll_start_time) * 1000
+                    if self._scroll_start_time is not None
+                    else None
+                )
+                try:
+                    self._performance_hook(
+                        {
+                            "render_ms": render_ms,
+                            "content_height": content_height,
+                            "max_allowed_height": max_allowed_height,
+                            "max_render_height": self._max_render_height,
+                            "segment_count": len(segments),
+                            "window_segment_count": len(window_segments),
+                            "width": width,
+                            "height": console.console.size.height,
+                            "batch_size": batch_meta.get("batch_size"),
+                            "queue_depth": batch_meta.get("queue_depth"),
+                            "queue_age_ms": queue_age_ms,
+                            "batch_span_ms": batch_span_ms,
+                            "batch_window_ms": batch_meta.get("batch_window_ms"),
+                            "batch_chars": batch_meta.get("batch_chars"),
+                            "render_interval_ms": render_interval_ms,
+                            "phase": "scrolling" if self._scrolling_started else "pre_scroll",
+                            "is_truncated": is_truncated,
+                            "scroll_age_ms": scroll_age_ms,
+                        }
+                    )
+                except Exception:
+                    pass
+                self._pending_batch_meta = None
 
     async def _render_worker(self) -> None:
         assert self._queue is not None
@@ -540,22 +506,63 @@ class StreamingMessageHandle:
 
                 stop_requested = False
                 chunks = [item]
+                batch_start = time.monotonic()
                 while True:
                     try:
                         next_item = self._queue.get_nowait()
                     except asyncio.QueueEmpty:
-                        break
+                        elapsed = time.monotonic() - batch_start
+                        if elapsed >= self._batch_max_duration:
+                            break
+                        try:
+                            timeout = min(self._batch_period, self._batch_max_duration - elapsed)
+                            next_item = await asyncio.wait_for(
+                                self._queue.get(), timeout=timeout
+                            )
+                        except asyncio.TimeoutError:
+                            break
                     if next_item is self._stop_sentinel:
                         stop_requested = True
                         break
                     chunks.append(next_item)
 
                 should_render = False
+                queued_items: list[_QueuedItem] = []
+                batch_chars = 0
                 for chunk in chunks:
-                    if isinstance(chunk, str):
-                        should_render = self._handle_chunk(chunk) or should_render
+                    payload = chunk
+                    if isinstance(chunk, _QueuedItem):
+                        queued_items.append(chunk)
+                        payload = chunk.payload
+                    if isinstance(payload, StreamChunk):
+                        if payload.text:
+                            batch_chars += len(payload.text)
+                        should_render = self._handle_stream_chunk(payload) or should_render
+                    elif isinstance(payload, str):
+                        batch_chars += len(payload)
+                        should_render = self._handle_chunk(payload) or should_render
+                    elif isinstance(payload, _ToolStreamEvent):
+                        should_render = (
+                            self._segment_assembler.handle_tool_event(
+                                payload.event_type, payload.info
+                            )
+                            or should_render
+                        )
 
                 if should_render:
+                    oldest_enqueued_at = None
+                    newest_enqueued_at = None
+                    if queued_items:
+                        oldest_enqueued_at = min(item.enqueued_at for item in queued_items)
+                        newest_enqueued_at = max(item.enqueued_at for item in queued_items)
+                    self._pending_batch_meta = {
+                        "batch_size": len(chunks),
+                        "queue_depth": self._queue.qsize() if self._queue else 0,
+                        "oldest_enqueued_at": oldest_enqueued_at,
+                        "newest_enqueued_at": newest_enqueued_at,
+                        "batch_window_ms": (time.monotonic() - batch_start) * 1000,
+                        "batch_chars": batch_chars,
+                    }
                     self._render_current_buffer()
                     if self._min_render_interval:
                         try:
@@ -587,37 +594,27 @@ class StreamingMessageHandle:
             if not self._active:
                 return
 
-            streams_arguments = info.get("streams_arguments", False) if info else False
-            tool_name = info.get("tool_name", "unknown") if info else "unknown"
-
-            if event_type == "start":
-                if streams_arguments:
-                    self._switch_to_plain_text()
-                    self.update(f"\n→ Calling {tool_name}\n")
-                else:
-                    self._pause_progress_display()
-                    self._switch_to_plain_text()
-                    self.update(f"\n→ Calling {tool_name}\n")
+            event = _ToolStreamEvent(event_type=event_type, info=info)
+            if self._async_mode and self._queue is not None:
+                self._enqueue_chunk(event)
                 return
-            if event_type == "delta":
-                if streams_arguments and info and "chunk" in info:
-                    self.update(info["chunk"])
-            elif event_type == "text":
-                self._pause_progress_display()
-            elif event_type == "stop":
-                if streams_arguments:
-                    self.update("\n")
-                    self.close()
-                else:
-                    self.update("\n")
-                    self.close()
+
+            if self._segment_assembler.handle_tool_event(event_type, info):
+                now = time.perf_counter()
+                self._pending_batch_meta = {
+                    "batch_size": 1,
+                    "queue_depth": 0,
+                    "oldest_enqueued_at": now,
+                    "newest_enqueued_at": now,
+                    "batch_chars": 0,
+                }
+                self._render_current_buffer()
         except Exception as exc:
             logger.warning(
                 "Error handling tool event",
                 exc_info=True,
                 data={
                     "event_type": event_type,
-                    "streams_arguments": info.get("streams_arguments") if info else None,
                     "error": str(exc),
                 },
             )
@@ -638,6 +635,7 @@ __all__ = [
 
 class StreamingHandle(Protocol):
     def update(self, chunk: str) -> None: ...
+    def update_chunk(self, chunk: StreamChunk) -> None: ...
 
     def finalize(self, message: "PromptMessageExtended | str") -> None: ...
 

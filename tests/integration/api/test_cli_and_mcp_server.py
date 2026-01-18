@@ -1,10 +1,13 @@
 import asyncio
 import os
 import subprocess
+import sys
 from typing import TYPE_CHECKING
 
 import httpx
 import pytest
+from mcp import ClientSession, types
+from mcp.client.streamable_http import streamable_http_client
 
 from fast_agent.mcp.helpers.content_helpers import get_text
 
@@ -116,7 +119,7 @@ def test_agent_message_cli_quiet_flag():
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_agent_server_option_stdio(fast_agent):
-    """Test that FastAgent supports --server flag with STDIO transport."""
+    """Test STDIO transport works end-to-end."""
 
     @fast_agent.agent(name="client", servers=["std_io"])
     async def agent_function():
@@ -131,7 +134,7 @@ async def test_agent_server_option_stdio(fast_agent):
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_agent_server_option_stdio_and_prompt_history(fast_agent):
-    """Test that FastAgent supports --server flag with STDIO transport."""
+    """Test STDIO transport preserves prompt history."""
 
     @fast_agent.agent(name="client", servers=["std_io"])
     async def agent_function():
@@ -151,8 +154,8 @@ async def test_agent_server_option_stdio_and_prompt_history(fast_agent):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_agent_server_option_sse(fast_agent):
-    """Test that FastAgent supports --server flag with SSE transport."""
+async def test_agent_transport_option_sse(fast_agent, mcp_test_ports, wait_for_port):
+    """Test that FastAgent enables server mode when --transport is provided (SSE)."""
 
     # Start the SSE server in a subprocess
     import os
@@ -163,7 +166,7 @@ async def test_agent_server_option_sse(fast_agent):
     test_agent_path = os.path.join(test_dir, "integration_agent.py")
 
     # Port must match what's in the fastagent.config.yaml
-    port = 8723
+    port = mcp_test_ports["sse"]
 
     # Start the server process
     server_proc = subprocess.Popen(
@@ -171,7 +174,6 @@ async def test_agent_server_option_sse(fast_agent):
             "uv",
             "run",
             test_agent_path,
-            "--server",
             "--transport",
             "sse",
             "--port",
@@ -185,8 +187,7 @@ async def test_agent_server_option_sse(fast_agent):
     )
 
     try:
-        # Give the server a moment to start
-        await asyncio.sleep(2)
+        await wait_for_port("127.0.0.1", port, process=server_proc)
 
         # Now connect to it via the configured MCP server
         @fast_agent.agent(name="client", servers=["sse"])
@@ -211,17 +212,16 @@ async def test_agent_server_option_sse(fast_agent):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_serve_request_scope_disables_session_header():
+async def test_serve_request_scope_disables_session_header(mcp_test_ports, wait_for_port):
     """Request-scoped instances should not advertise an MCP session id."""
 
     import os
     import subprocess
 
-
     test_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(test_dir, "fastagent.config.yaml")
 
-    port = 8731
+    port = mcp_test_ports["request_http"]
 
     server_proc = subprocess.Popen(
         [
@@ -247,20 +247,7 @@ async def test_serve_request_scope_disables_session_header():
     )
 
     try:
-        # Wait until the server is listening
-        for _ in range(40):
-            if server_proc.poll() is not None:
-                stdout, stderr = server_proc.communicate(timeout=1)
-                raise AssertionError(f"Server exited early. stdout={stdout} stderr={stderr}")
-            try:
-                reader, writer = await asyncio.open_connection("127.0.0.1", port)
-                writer.close()
-                await writer.wait_closed()
-                break
-            except OSError:
-                await asyncio.sleep(0.25)
-        else:
-            raise AssertionError("Server did not start listening in time")
+        await wait_for_port("127.0.0.1", port, process=server_proc, timeout=10.0)
 
         async with httpx.AsyncClient(timeout=5.0) as client:
             init_payload = {
@@ -284,6 +271,15 @@ async def test_serve_request_scope_disables_session_header():
             ) as response:
                 assert response.status_code == 200
                 assert "mcp-session-id" not in response.headers
+
+        async with streamable_http_client(f"http://127.0.0.1:{port}/mcp") as (
+            read_stream,
+            write_stream,
+            _,
+        ):
+            async with ClientSession(read_stream, write_stream) as session:
+                init_result = await session.initialize()
+                assert init_result.capabilities.prompts is None
     finally:
         if server_proc.poll() is None:
             server_proc.terminate()
@@ -295,8 +291,8 @@ async def test_serve_request_scope_disables_session_header():
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_agent_server_option_http(fast_agent):
-    """Test that FastAgent supports --server flag with HTTP transport."""
+async def test_agent_server_option_http(fast_agent, mcp_test_ports, wait_for_port):
+    """Test that FastAgent still accepts the legacy --server flag with HTTP transport."""
 
     # Start the SSE server in a subprocess
     import os
@@ -307,7 +303,7 @@ async def test_agent_server_option_http(fast_agent):
     test_agent_path = os.path.join(test_dir, "integration_agent.py")
 
     # Port must match what's in the fastagent.config.yaml
-    port = 8724
+    port = mcp_test_ports["http"]
 
     # Start the server process
     server_proc = subprocess.Popen(
@@ -329,8 +325,7 @@ async def test_agent_server_option_http(fast_agent):
     )
 
     try:
-        # Give the server a moment to start
-        await asyncio.sleep(2)
+        await wait_for_port("127.0.0.1", port, process=server_proc)
 
         # Now connect to it via the configured MCP server
         @fast_agent.agent(name="client", servers=["http"])
@@ -346,6 +341,146 @@ async def test_agent_server_option_http(fast_agent):
     finally:
         # Terminate the server process
         if server_proc.poll() is None:  # If still running
+            server_proc.terminate()
+            try:
+                server_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                server_proc.kill()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_agent_server_option_http_with_watch(mcp_test_ports, wait_for_port, tmp_path):
+    """Server mode should start cleanly with --watch enabled."""
+
+    config_path = tmp_path / "fastagent.config.yaml"
+    config_path.write_text("", encoding="utf-8")
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    card_path = agents_dir / "watcher.md"
+    card_path.write_text(
+        "---\ntype: agent\nname: watcher\n---\nEcho test.\n",
+        encoding="utf-8",
+    )
+
+    port = mcp_test_ports["http"]
+
+    server_proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "fast_agent.cli",
+            "serve",
+            "--config-path",
+            str(config_path),
+            "--transport",
+            "http",
+            "--port",
+            str(port),
+            "--model",
+            "passthrough",
+            "--name",
+            "fast-agent-watch-test",
+            "--card",
+            str(agents_dir),
+            "--watch",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=tmp_path,
+    )
+
+    try:
+        await wait_for_port("127.0.0.1", port, process=server_proc)
+        card_path.write_text(
+            "---\ntype: agent\nname: watcher\n---\nEcho test updated.\n",
+            encoding="utf-8",
+        )
+        await asyncio.sleep(0.25)
+        assert server_proc.poll() is None
+    finally:
+        if server_proc.poll() is None:
+            server_proc.terminate()
+            try:
+                server_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                server_proc.kill()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_agent_server_emits_mcp_progress_notifications(
+    fast_agent, mcp_test_ports, wait_for_port
+):
+    """Test that MCP progress notifications are emitted during tool execution."""
+
+    import os
+    import subprocess
+
+    test_dir = os.path.dirname(os.path.abspath(__file__))
+    test_agent_path = os.path.join(test_dir, "integration_agent.py")
+
+    port = mcp_test_ports["http"]
+
+    server_proc = subprocess.Popen(
+        [
+            "uv",
+            "run",
+            test_agent_path,
+            "--server",
+            "--transport",
+            "http",
+            "--port",
+            str(port),
+            "--quiet",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=test_dir,
+    )
+
+    try:
+        await wait_for_port("127.0.0.1", port, process=server_proc)
+
+        progress_events: list[tuple[float, float | None, str | None]] = []
+
+        async def on_progress(progress: float, total: float | None, message: str | None) -> None:
+            progress_events.append((progress, total, message))
+
+        async with streamable_http_client(f"http://127.0.0.1:{port}/mcp") as (
+            read_stream,
+            write_stream,
+            _,
+        ):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                params = types.CallToolRequestParams(
+                    name="test_send", arguments={"message": "progress check"}
+                )
+                request = types.CallToolRequest(method="tools/call", params=params)
+                result = await session.send_request(
+                    types.ClientRequest(request),
+                    types.CallToolResult,
+                    progress_callback=on_progress,
+                )
+
+                assert result.content
+                assert "progress check" in (get_text(result.content[0]) or "")
+
+        for _ in range(20):
+            if progress_events:
+                break
+            await asyncio.sleep(0.1)
+
+        assert progress_events
+        assert any(message and "step" in message for _, _, message in progress_events), (
+            f"Unexpected progress messages: {progress_events}"
+        )
+    finally:
+        if server_proc.poll() is None:
             server_proc.terminate()
             try:
                 server_proc.wait(timeout=2)

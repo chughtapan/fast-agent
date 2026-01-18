@@ -4,7 +4,7 @@ import re
 import sys
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Type, Union
+from typing import TYPE_CHECKING, Any, Type, Union
 
 from mcp import Tool
 from mcp.types import (
@@ -19,6 +19,7 @@ from fast_agent.core.logging.logger import get_logger
 from fast_agent.event_progress import ProgressAction
 from fast_agent.interfaces import ModelT
 from fast_agent.llm.fastagent_llm import FastAgentLLM
+from fast_agent.llm.provider.bedrock.multipart_converter_bedrock import BedrockConverter
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.usage_tracking import TurnUsage
 from fast_agent.types import PromptMessageExtended, RequestParams
@@ -35,13 +36,17 @@ if TYPE_CHECKING:
     from mcp import ListToolsResult
 
 try:
-    import boto3
-    from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
+    import boto3  # ty: ignore[unresolved-import]
+    from botocore.exceptions import (  # ty: ignore[unresolved-import]
+        BotoCoreError,
+        ClientError,
+        NoCredentialsError,
+    )
 except ImportError:
-    boto3 = None
-    BotoCoreError = Exception
-    ClientError = Exception
-    NoCredentialsError = Exception
+    boto3 = None  # type: ignore[assignment]
+    BotoCoreError = Exception  # type: ignore[assignment, misc]
+    ClientError = Exception  # type: ignore[assignment, misc]
+    NoCredentialsError = Exception  # type: ignore[assignment, misc]
 
 
 DEFAULT_BEDROCK_MODEL = "amazon.nova-lite-v1:0"
@@ -67,8 +72,8 @@ REASONING_EFFORT_BUDGETS = {
 }
 
 # Bedrock message format types
-BedrockMessage = Dict[str, Any]  # Bedrock message format
-BedrockMessageParam = Dict[str, Any]  # Bedrock message parameter format
+BedrockMessage = dict[str, Any]  # Bedrock message format
+BedrockMessageParam = dict[str, Any]  # Bedrock message parameter format
 
 
 class ToolSchemaType(Enum):
@@ -131,7 +136,7 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
     """
 
     # Class-level capabilities cache shared across all instances
-    capabilities: Dict[str, ModelCapabilities] = {}
+    capabilities: dict[str, ModelCapabilities] = {}
 
     @classmethod
     def debug_cache(cls) -> None:
@@ -196,8 +201,11 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         # Extract AWS configuration from kwargs first
         self.aws_region = kwargs.pop("region", None)
         self.aws_profile = kwargs.pop("profile", None)
+        kwargs.pop("provider", None)
+        if args and isinstance(args[0], Provider):
+            args = args[1:]
 
-        super().__init__(*args, provider=Provider.BEDROCK, **kwargs)
+        super().__init__(Provider.BEDROCK, *args, **kwargs)
 
         # Use config values if not provided in kwargs (after super().__init__)
         if self.context.config and self.context.config.bedrock:
@@ -249,7 +257,7 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
     @property
     def model(self) -> str:
         """Get the model name, guaranteed to be set."""
-        return self.default_request_params.model
+        return self.default_request_params.model or DEFAULT_BEDROCK_MODEL
 
     def _get_bedrock_client(self):
         """Get or create Bedrock client."""
@@ -279,9 +287,28 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
                 ) from e
         return self._bedrock_runtime_client
 
+    def _convert_extended_messages_to_provider(
+        self, messages: list[PromptMessageExtended]
+    ) -> list[BedrockMessageParam]:
+        """
+        Convert PromptMessageExtended list to Bedrock BedrockMessageParam format.
+        This is called fresh on every API call from _convert_to_provider_format().
+
+        Args:
+            messages: List of PromptMessageExtended objects
+
+        Returns:
+            List of Bedrock BedrockMessageParam objects
+        """
+        converted: list[BedrockMessageParam] = []
+        for msg in messages:
+            bedrock_msg = BedrockConverter.convert_to_bedrock(msg)
+            converted.append(bedrock_msg)
+        return converted
+
     def _build_tool_name_mapping(
         self, tools: "ListToolsResult", name_policy: ToolNamePolicy
-    ) -> Dict[str, str]:
+    ) -> dict[str, str]:
         """Build tool name mapping based on schema type and name policy.
 
         Returns dict mapping from converted_name -> original_name for tool execution.
@@ -304,8 +331,8 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         return mapping
 
     def _convert_tools_nova_format(
-        self, tools: "ListToolsResult", tool_name_mapping: Dict[str, str]
-    ) -> List[Dict[str, Any]]:
+        self, tools: "ListToolsResult", tool_name_mapping: dict[str, str]
+    ) -> list[dict[str, Any]]:
         """Convert MCP tools to Nova-specific toolSpec format.
 
         Note: Nova models have VERY strict JSON schema requirements:
@@ -327,14 +354,14 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
 
             # Create Nova-compliant schema with ONLY the three allowed fields
             # Always include type and properties (even if empty)
-            nova_schema: Dict[str, Any] = {"type": "object", "properties": {}}
+            nova_schema: dict[str, Any] = {"type": "object", "properties": {}}
 
             # Properties - clean them strictly
-            properties: Dict[str, Any] = {}
+            properties: dict[str, Any] = {}
             if "properties" in input_schema and isinstance(input_schema["properties"], dict):
                 for prop_name, prop_def in input_schema["properties"].items():
                     # Only include type and description for each property
-                    clean_prop: Dict[str, Any] = {}
+                    clean_prop: dict[str, Any] = {}
 
                     if isinstance(prop_def, dict):
                         # Only include type (required) and description (optional)
@@ -388,7 +415,7 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         return bedrock_tools
 
     def _convert_tools_system_prompt_format(
-        self, tools: "ListToolsResult", tool_name_mapping: Dict[str, str]
+        self, tools: "ListToolsResult", tool_name_mapping: dict[str, str]
     ) -> str:
         """Convert MCP tools to system prompt format."""
         if not tools.tools:
@@ -440,8 +467,8 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         return system_prompt
 
     def _convert_tools_anthropic_format(
-        self, tools: "ListToolsResult", tool_name_mapping: Dict[str, str]
-    ) -> List[Dict[str, Any]]:
+        self, tools: "ListToolsResult", tool_name_mapping: dict[str, str]
+    ) -> list[dict[str, Any]]:
         """Convert MCP tools to Anthropic format wrapped in Bedrock toolSpec - preserves raw schema."""
 
         self.logger.debug(
@@ -473,8 +500,8 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         return bedrock_tools
 
     def _parse_system_prompt_tool_response(
-        self, processed_response: Dict[str, Any], model: str
-    ) -> List[Dict[str, Any]]:
+        self, processed_response: dict[str, Any], model: str
+    ) -> list[dict[str, Any]]:
         """Parse system prompt tool response format: function calls in text."""
         # Extract text content from the response
         text_content = ""
@@ -702,8 +729,8 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         return []
 
     def _parse_anthropic_tool_response(
-        self, processed_response: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
+        self, processed_response: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         """Parse Anthropic tool response format (same as native provider)."""
         tool_uses = []
 
@@ -723,8 +750,8 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         return tool_uses
 
     def _parse_tool_response(
-        self, processed_response: Dict[str, Any], model: str
-    ) -> List[Dict[str, Any]]:
+        self, processed_response: dict[str, Any], model: str
+    ) -> list[dict[str, Any]]:
         """Parse tool responses using cached schema, without model/family heuristics."""
         caps = self.capabilities.get(model) or ModelCapabilities()
         schema = caps.schema
@@ -742,7 +769,7 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
             if isinstance(c, dict) and "toolUse" in c
         ]
         if tool_uses:
-            parsed_tools: List[Dict[str, Any]] = []
+            parsed_tools: list[dict[str, Any]] = []
             for item in tool_uses:
                 tu = item.get("toolUse", {})
                 if not isinstance(tu, dict):
@@ -800,8 +827,8 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         return []
 
     def _build_tool_calls_dict(
-        self, parsed_tools: List[Dict[str, Any]]
-    ) -> Dict[str, CallToolRequest]:
+        self, parsed_tools: list[dict[str, Any]]
+    ) -> dict[str, CallToolRequest]:
         """
         Convert parsed tools to CallToolRequest dict for external execution.
 
@@ -870,7 +897,8 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         Returns:
             Bedrock message parameter dictionary
         """
-        bedrock_msg = {"role": msg.role, "content": []}
+        content_blocks: list[dict[str, Any]] = []
+        bedrock_msg = {"role": msg.role, "content": content_blocks}
 
         # Handle tool results first (if present)
         if msg.tool_results:
@@ -900,7 +928,7 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
 
                 if tool_result_parts:
                     full_result_text = f"Tool Results:\n{', '.join(tool_result_parts)}"
-                    bedrock_msg["content"].append({"type": "text", "text": full_result_text})
+                    content_blocks.append({"type": "text", "text": full_result_text})
             else:
                 # For Nova/Anthropic models: use structured tool_result format
                 for tool_id, tool_result in msg.tool_results.items():
@@ -913,7 +941,7 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
                     if not result_content_blocks:
                         result_content_blocks.append({"text": "[No content in tool result]"})
 
-                    bedrock_msg["content"].append(
+                    content_blocks.append(
                         {
                             "type": "tool_result",
                             "tool_use_id": tool_id,
@@ -925,13 +953,13 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         # Handle regular content
         for content_item in msg.content:
             if isinstance(content_item, TextContent):
-                bedrock_msg["content"].append({"type": "text", "text": content_item.text})
+                content_blocks.append({"type": "text", "text": content_item.text})
 
         return bedrock_msg
 
     def _convert_messages_to_bedrock(
-        self, messages: List[BedrockMessageParam]
-    ) -> List[Dict[str, Any]]:
+        self, messages: list[BedrockMessageParam]
+    ) -> list[dict[str, Any]]:
         """Convert message parameters to Bedrock format."""
         bedrock_messages = []
         for message in messages:
@@ -988,7 +1016,11 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
 
         return bedrock_messages
 
-    async def _process_stream(self, stream_response, model: str) -> BedrockMessage:
+    async def _process_stream(
+        self,
+        stream_response,
+        model: str,
+    ) -> BedrockMessage:
         """Process streaming response from Bedrock."""
         estimated_tokens = 0
         response_content = []
@@ -997,7 +1029,9 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         usage = {"input_tokens": 0, "output_tokens": 0}
 
         try:
+            # Cancellation is handled via asyncio.Task.cancel() which raises CancelledError
             for event in stream_response["stream"]:
+
                 if "messageStart" in event:
                     # Message started
                     continue
@@ -1108,8 +1142,11 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
 
         # Construct the response message
         full_text = "".join(response_content)
+        response_content_items: list[dict[str, Any]] = (
+            [{"text": full_text}] if full_text else []
+        )
         response = {
-            "content": [{"text": full_text}] if full_text else [],
+            "content": response_content_items,
             "stop_reason": stop_reason or "end_turn",
             "usage": {
                 "input_tokens": usage.get("inputTokens", 0),
@@ -1148,7 +1185,7 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
                     # Clean up the accumulator
                     del tool_use["toolUse"]["_input_accumulator"]
 
-            response["content"].extend(tool_uses)
+            response_content_items.extend(tool_uses)
 
         return response
 
@@ -1191,8 +1228,9 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         self,
         message_param: BedrockMessageParam,
         request_params: RequestParams | None = None,
-        tools: List[Tool] | None = None,
-        pre_messages: List[BedrockMessageParam] | None = None,
+        tools: list[Tool] | None = None,
+        pre_messages: list[BedrockMessageParam] | None = None,
+        history: list[PromptMessageExtended] | None = None,
     ) -> PromptMessageExtended:
         """
         Process a query using Bedrock and available tools.
@@ -1201,7 +1239,7 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         client = self._get_bedrock_runtime_client()
 
         try:
-            messages: List[BedrockMessageParam] = list(pre_messages) if pre_messages else []
+            messages: list[BedrockMessageParam] = list(pre_messages) if pre_messages else []
             params = self.get_request_params(request_params)
         except (ClientError, BotoCoreError) as e:
             error_msg = str(e)
@@ -1216,35 +1254,22 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
                     f"Error accessing Bedrock: {error_msg}",
                 ) from e
 
-        # Always include prompt messages, but only include conversation history
-        # if use_history is True
-        messages.extend(self.history.get(include_completion_history=params.use_history))
-        messages.append(message_param)
+        # Convert supplied history/messages directly
+        if history:
+            messages.extend(self._convert_to_provider_format(history))
+        else:
+            messages.append(message_param)
 
-        # Get available tools (no resolver gating; fallback logic will decide wiring)
+        # Tools are provided by the caller (aligned with other providers)
         tool_list = None
-
-        try:
-            tool_list = await self.aggregator.list_tools()
-            self.logger.debug(f"Found {len(tool_list.tools)} MCP tools")
-        except Exception as e:
-            self.logger.error(f"Error fetching MCP tools: {e}")
-            import traceback
-
-            self.logger.debug(f"Traceback: {traceback.format_exc()}")
-            tool_list = None
-
-        # Use tools parameter if provided, otherwise get from aggregator
-        if tools is None:
-            tools = tool_list.tools if tool_list else []
-        elif tool_list is None and tools:
+        if tools:
             # Create a ListToolsResult from the provided tools for conversion
             from mcp.types import ListToolsResult
 
             tool_list = ListToolsResult(tools=tools)
 
-        response_content_blocks: List[ContentBlock] = []
-        model = self.default_request_params.model
+        response_content_blocks: list[ContentBlock] = []
+        model = self.default_request_params.model or DEFAULT_BEDROCK_MODEL
 
         # Single API call - no tool execution loop
         self._log_chat_progress(self.chat_turn(), model=model)
@@ -1294,15 +1319,18 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         # Track whether we changed system mode cache this turn
         tried_system_fallback = False
 
-        processed_response = None  # type: ignore[assignment]
+        processed_response: dict[str, Any] | None = None
         last_error_msg = None
 
         for schema_choice in schema_order:
             # Fresh messages per attempt
-            converse_args = {"modelId": model, "messages": [dict(m) for m in bedrock_messages]}
+            converse_args: dict[str, Any] = {
+                "modelId": model,
+                "messages": [dict(m) for m in bedrock_messages],
+            }
 
             # Build tools representation for this schema
-            tools_payload: Union[List[Dict[str, Any]], str, None] = None
+            tools_payload: Union[list[dict[str, Any]], str, None] = None
             # Get tool name policy (needed even when no tools for cache logic)
             name_policy = (
                 self.capabilities.get(model) or ModelCapabilities()
@@ -1428,7 +1456,7 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
                 converse_args["toolConfig"] = {"tools": tools_payload}
 
             # Inference configuration and overrides
-            inference_config: Dict[str, Any] = {}
+            inference_config: dict[str, Any] = {}
             if params.maxTokens is not None:
                 inference_config["maxTokens"] = params.maxTokens
             if params.stopSequences:
@@ -1538,7 +1566,9 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
                         )
                         attempted_streaming = True
                         response = client.converse_stream(**converse_args)
-                        processed_response = await self._process_stream(response, model)
+                        processed_response = await self._process_stream(
+                            response, model
+                        )
                 except (ClientError, BotoCoreError) as e:
                     # Check if this is a reasoning-related error
                     if reasoning_budget > 0 and (
@@ -1556,9 +1586,11 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
 
                         # Apply temperature now that reasoning is disabled
                         if params.temperature is not None:
-                            if "inferenceConfig" not in converse_args:
-                                converse_args["inferenceConfig"] = {}
-                            converse_args["inferenceConfig"]["temperature"] = params.temperature
+                            retry_inference_config = converse_args.get("inferenceConfig")
+                            if not isinstance(retry_inference_config, dict):
+                                retry_inference_config = {}
+                                converse_args["inferenceConfig"] = retry_inference_config
+                            retry_inference_config["temperature"] = params.temperature
 
                         # Retry the API call
                         if not use_streaming:
@@ -1568,7 +1600,9 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
                             )
                         else:
                             response = client.converse_stream(**converse_args)
-                            processed_response = await self._process_stream(response, model)
+                            processed_response = await self._process_stream(
+                                response, model
+                            )
                     else:
                         # Not a reasoning error, re-raise
                         raise
@@ -1642,7 +1676,7 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
                     # Retry the same schema immediately in inject mode
                     try:
                         # Rebuild messages for inject
-                        converse_args = {
+                        converse_args: dict[str, Any] = {
                             "modelId": model,
                             "messages": [dict(m) for m in bedrock_messages],
                         }
@@ -1682,7 +1716,9 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
                             )
                         else:
                             response = client.converse_stream(**converse_args)
-                            processed_response = await self._process_stream(response, model)
+                            processed_response = await self._process_stream(
+                                response, model
+                            )
                         if not caps.schema and has_tools:
                             caps.schema = ToolSchemaType(schema_choice)
                         self.capabilities[model] = caps
@@ -1716,15 +1752,16 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
             }
 
         # Track usage
-        if processed_response.get("usage"):
+        usage = processed_response.get("usage") if processed_response else None
+        if isinstance(usage, dict):
             try:
-                usage = processed_response["usage"]
                 turn_usage = TurnUsage(
-                    provider=Provider.BEDROCK.value,
+                    provider=Provider.BEDROCK,
                     model=model,
-                    input_tokens=usage.get("input_tokens", 0),
-                    output_tokens=usage.get("output_tokens", 0),
-                    total_tokens=usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+                    input_tokens=int(usage.get("input_tokens", 0) or 0),
+                    output_tokens=int(usage.get("output_tokens", 0) or 0),
+                    total_tokens=int(usage.get("input_tokens", 0) or 0)
+                    + int(usage.get("output_tokens", 0) or 0),
                     raw_usage=usage,
                 )
                 self.usage_accumulator.add_turn(turn_usage)
@@ -1738,9 +1775,10 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         messages.append(response_message_param)
 
         # Extract text content for responses
-        if processed_response.get("content"):
-            for content_item in processed_response["content"]:
-                if content_item.get("text"):
+        content_items = processed_response.get("content") if processed_response else None
+        if isinstance(content_items, list):
+            for content_item in content_items:
+                if isinstance(content_item, dict) and content_item.get("text"):
                     response_content_blocks.append(
                         TextContent(type="text", text=content_item["text"])
                     )
@@ -1786,7 +1824,8 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
                 pass
 
         # Handle different stop reasons
-        stop_reason = processed_response.get("stop_reason", "end_turn")
+        stop_reason_value = processed_response.get("stop_reason", "end_turn")
+        stop_reason = stop_reason_value if isinstance(stop_reason_value, str) else "end_turn"
 
         # Determine if we should parse for system-prompt tool calls (unified capabilities)
         caps_tmp = self.capabilities.get(model) or ModelCapabilities()
@@ -1796,7 +1835,7 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         if stop_reason == "end_turn" and tools:
             # Only parse for tools if text contains actual function call structure
             message_text = ""
-            for content_item in processed_response.get("content", []):
+            for content_item in content_items or []:
                 if isinstance(content_item, dict) and "text" in content_item:
                     message_text += content_item.get("text", "")
 
@@ -1811,7 +1850,7 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
                     self.capabilities[model] = caps_tmp
 
         # NEW: Handle tool calls without execution - return them for external handling
-        tool_calls: Dict[str, CallToolRequest] | None = None
+        tool_calls: dict[str, CallToolRequest] | None = None
         if stop_reason in ["tool_use", "tool_calls"]:
             parsed_tools = self._parse_tool_response(processed_response, model)
             if parsed_tools:
@@ -1820,20 +1859,9 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
         # Map stop reason to LlmStopReason
         mapped_stop_reason = self._map_bedrock_stop_reason(stop_reason)
 
-        # Update history
-        if params.use_history:
-            # Get current prompt messages
-            prompt_messages = self.history.get(include_completion_history=False)
-
-            # Calculate new conversation messages (excluding prompts)
-            new_messages = messages[len(prompt_messages) :]
-
-            # Remove system prompt from new messages if it was added
-            if (self.instruction or params.systemPrompt) and new_messages:
-                # System prompt is not added to messages list in Bedrock, so no need to remove it
-                pass
-
-            self.history.set(new_messages)
+        # Update diagnostic snapshot (never read again)
+        # This provides a snapshot of what was sent to the provider for debugging
+        self.history.set(messages)
 
         self._log_chat_finished(model=model)
 
@@ -1846,53 +1874,37 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
 
     async def _apply_prompt_provider_specific(
         self,
-        multipart_messages: List[PromptMessageExtended],
+        multipart_messages: list[PromptMessageExtended],
         request_params: RequestParams | None = None,
-        tools: List[Tool] | None = None,
+        tools: list[Tool] | None = None,
         is_template: bool = False,
     ) -> PromptMessageExtended:
-        """Apply Bedrock-specific prompt formatting."""
+        """
+        Provider-specific prompt application.
+        Templates are handled by the agent; messages already include them.
+        """
         if not multipart_messages:
             return PromptMessageExtended(role="user", content=[])
 
         # Check the last message role
         last_message = multipart_messages[-1]
 
-        # Add all previous messages to history (or all messages if last is from assistant)
-        # if the last message is a "user" inference is required
-        # if the last message is a "user" inference is required
-        messages_to_add = (
-            multipart_messages[:-1] if last_message.role == "user" else multipart_messages
-        )
-        converted = []
-        for msg in messages_to_add:
-            # Convert each message to Bedrock message parameter format
-            bedrock_msg = self._convert_multipart_to_bedrock_message(msg)
-            converted.append(bedrock_msg)
-
-        # Only persist prior messages when history is enabled; otherwise inline for this call
-        params = self.get_request_params(request_params)
-        pre_messages: List[BedrockMessageParam] | None = None
-        if params.use_history:
-            self.history.extend(converted, is_prompt=is_template)
-        else:
-            pre_messages = converted
-
         if last_message.role == "assistant":
             # For assistant messages: Return the last message (no completion needed)
             return last_message
 
-        # For user messages with tool_results, we need to add the tool result message to the conversation
-        if last_message.tool_results:
-            # Convert the tool result message and use it as the final input
-            message_param = self._convert_multipart_to_bedrock_message(last_message)
-        else:
-            # Convert the last user message to Bedrock message parameter format
-            message_param = self._convert_multipart_to_bedrock_message(last_message)
+        # Convert the last user message to Bedrock message parameter format
+        message_param = BedrockConverter.convert_to_bedrock(last_message)
 
-        # Call the completion method with optional pre_messages for no-history mode
+        # Call the completion method
+        # No need to pass pre_messages - conversion happens in _bedrock_completion
+        # via _convert_to_provider_format()
         return await self._bedrock_completion(
-            message_param, request_params, tools, pre_messages=pre_messages
+            message_param,
+            request_params,
+            tools,
+            pre_messages=None,
+            history=multipart_messages,
         )
 
     def _generate_simplified_schema(self, model: Type[ModelT]) -> str:
@@ -1945,11 +1957,12 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
             else:
                 return "any"
 
-        def _generate_schema_dict(model_class: Type) -> Dict[str, Any]:
+        def _generate_schema_dict(model_class: Type) -> dict[str, Any]:
             """Recursively generate the schema as a dictionary."""
             schema_dict = {}
-            if hasattr(model_class, "model_fields"):
-                for field_name, field_info in model_class.model_fields.items():
+            model_fields = getattr(model_class, "model_fields", None)
+            if isinstance(model_fields, dict):
+                for field_name, field_info in model_fields.items():
                     schema_dict[field_name] = get_field_type_representation(field_info.annotation)
             return schema_dict
 
@@ -1958,10 +1971,10 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
 
     async def _apply_prompt_provider_specific_structured(
         self,
-        multipart_messages: List[PromptMessageExtended],
+        multipart_messages: list[PromptMessageExtended],
         model: Type[ModelT],
         request_params: RequestParams | None = None,
-    ) -> Tuple[ModelT | None, PromptMessageExtended]:
+    ) -> tuple[ModelT | None, PromptMessageExtended]:
         """Apply structured output for Bedrock using prompt engineering with a simplified schema."""
         # Short-circuit: if the last message is already an assistant JSON payload,
         # parse it directly without invoking the model. This restores pre-regression behavior
@@ -2132,7 +2145,7 @@ class BedrockLLM(FastAgentLLM[BedrockMessageParam, BedrockMessage]):
 
     def _structured_from_multipart(
         self, message: PromptMessageExtended, model: Type[ModelT]
-    ) -> Tuple[ModelT | None, PromptMessageExtended]:
+    ) -> tuple[ModelT | None, PromptMessageExtended]:
         """Override to apply JSON cleaning before parsing."""
         # Get the text from the multipart message
         text = message.all_text()

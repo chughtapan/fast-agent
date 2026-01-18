@@ -6,12 +6,11 @@ Uses the prompt_template module for clean, testable handling of prompt templates
 """
 
 import argparse
-import asyncio
 import base64
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import Any, Awaitable, Callable, Sequence, Union
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.prompts.base import (
@@ -39,6 +38,7 @@ from fast_agent.mcp.prompts.prompt_template import (
     PromptTemplateLoader,
 )
 from fast_agent.types import PromptMessageExtended
+from fast_agent.utils.async_utils import run_sync
 
 # Configure logging
 logging.basicConfig(level=logging.ERROR)
@@ -48,7 +48,9 @@ logger = logging.getLogger("prompt_server")
 mcp = FastMCP("Prompt Server")
 
 
-def convert_to_fastmcp_messages(prompt_messages: List[Union[PromptMessage, PromptMessageExtended]]) -> List[Message]:
+def convert_to_fastmcp_messages(
+    prompt_messages: Sequence[Union[PromptMessage, PromptMessageExtended]],
+) -> list[Message]:
     """
     Convert PromptMessage or PromptMessageExtended objects to FastMCP Message objects.
     This adapter prevents double-wrapping of messages and handles both types.
@@ -63,26 +65,19 @@ def convert_to_fastmcp_messages(prompt_messages: List[Union[PromptMessage, Promp
 
     for msg in prompt_messages:
         # Handle both PromptMessage and PromptMessageExtended
-        if hasattr(msg, 'from_multipart'):
-            # PromptMessageExtended - convert to regular PromptMessage format
+        if isinstance(msg, PromptMessageExtended):
             flat_messages = msg.from_multipart()
-            for flat_msg in flat_messages:
-                if flat_msg.role == "user":
-                    result.append(UserMessage(content=flat_msg.content))
-                elif flat_msg.role == "assistant":
-                    result.append(AssistantMessage(content=flat_msg.content))
-                else:
-                    logger.warning(f"Unknown message role: {flat_msg.role}, defaulting to user")
-                    result.append(UserMessage(content=flat_msg.content))
         else:
-            # Regular PromptMessage - use directly
-            if msg.role == "user":
-                result.append(UserMessage(content=msg.content))
-            elif msg.role == "assistant":
-                result.append(AssistantMessage(content=msg.content))
+            flat_messages = [msg]
+
+        for flat_msg in flat_messages:
+            if flat_msg.role == "user":
+                result.append(UserMessage(content=flat_msg.content))
+            elif flat_msg.role == "assistant":
+                result.append(AssistantMessage(content=flat_msg.content))
             else:
-                logger.warning(f"Unknown message role: {msg.role}, defaulting to user")
-                result.append(UserMessage(content=msg.content))
+                logger.warning(f"Unknown message role: {flat_msg.role}, defaulting to user")
+                result.append(UserMessage(content=flat_msg.content))
 
     return result
 
@@ -90,7 +85,7 @@ def convert_to_fastmcp_messages(prompt_messages: List[Union[PromptMessage, Promp
 class PromptConfig(PromptMetadata):
     """Configuration for the prompt server"""
 
-    prompt_files: List[Path] = []
+    prompt_files: list[Path] = []
     user_delimiter: str = DEFAULT_USER_DELIMITER
     assistant_delimiter: str = DEFAULT_ASSISTANT_DELIMITER
     resource_delimiter: str = DEFAULT_RESOURCE_DELIMITER
@@ -101,12 +96,12 @@ class PromptConfig(PromptMetadata):
 
 
 # We'll maintain registries of all exposed resources and prompts
-exposed_resources: Dict[str, Path] = {}
-prompt_registry: Dict[str, PromptMetadata] = {}
+exposed_resources: dict[str, Path] = {}
+prompt_registry: dict[str, PromptMetadata] = {}
 
 
 # Define a single type for prompt handlers to avoid mypy issues
-PromptHandler = Callable[..., Awaitable[List[Message]]]
+PromptHandler = Callable[..., Awaitable[list[Message]]]
 
 
 # Type for resource handler
@@ -132,8 +127,8 @@ def create_resource_handler(resource_path: Path, mime_type: str) -> ResourceHand
 
 
 def get_delimiter_config(
-    config: Optional[PromptConfig] = None, file_path: Optional[Path] = None
-) -> Dict[str, Any]:
+    config: PromptConfig | None = None, file_path: Path | None = None
+) -> dict[str, Any]:
     """Get delimiter configuration, falling back to defaults if config is None"""
     # Set defaults
     config_values = {
@@ -153,7 +148,7 @@ def get_delimiter_config(
     return config_values
 
 
-def register_prompt(file_path: Path, config: Optional[PromptConfig] = None) -> None:
+def register_prompt(file_path: Path, config: PromptConfig | None = None) -> None:
     """Register a prompt file"""
     try:
         # Check if it's a JSON file for ultra-minimal path
@@ -539,7 +534,8 @@ async def async_main() -> int:
 def main() -> int:
     """Run the FastMCP server"""
     try:
-        return asyncio.run(async_main())
+        result = run_sync(async_main)
+        return result if result is not None else 1
     except KeyboardInterrupt:
         logger.info("\nServer stopped by user")
     except Exception as e:

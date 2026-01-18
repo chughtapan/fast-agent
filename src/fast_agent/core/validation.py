@@ -2,7 +2,7 @@
 Validation utilities for FastAgent configuration and dependencies.
 """
 
-from typing import Any, Dict, List
+from typing import Any
 
 from fast_agent.agents.agent_types import AgentType
 from fast_agent.core.exceptions import (
@@ -10,10 +10,11 @@ from fast_agent.core.exceptions import (
     CircularDependencyError,
     ServerConfigError,
 )
+from fast_agent.interfaces import LlmAgentProtocol
 from fast_agent.llm.fastagent_llm import FastAgentLLM
 
 
-def validate_server_references(context, agents: Dict[str, Dict[str, Any]]) -> None:
+def validate_server_references(context, agents: dict[str, dict[str, Any]]) -> None:
     """
     Validate that all server references in agent configurations exist in config.
     Raises ServerConfigError if any referenced servers are not defined.
@@ -39,7 +40,7 @@ def validate_server_references(context, agents: Dict[str, Dict[str, Any]]) -> No
                 )
 
 
-def validate_workflow_references(agents: Dict[str, Dict[str, Any]]) -> None:
+def validate_workflow_references(agents: dict[str, dict[str, Any]]) -> None:
     """
     Validate that all workflow references point to valid agents/workflows.
     Also validates that referenced agents have required configuration.
@@ -98,11 +99,11 @@ def validate_workflow_references(agents: Dict[str, Dict[str, Any]]) -> None:
                 if not (
                     isinstance(func, FastAgentLLM)
                     or child_data["type"] in workflow_types
-                    or (hasattr(func, "_llm") and func._llm is not None)
+                    or (isinstance(func, LlmAgentProtocol) and func.llm is not None)
                 ):
                     raise AgentConfigError(
                         f"Agent '{agent_name}' used by orchestrator '{name}' lacks LLM capability",
-                        "All agents used by orchestrators must be LLM-capable (either an AugmentedLLM or have an _llm property)",
+                        "All agents used by orchestrators must be LLM-capable (either an AugmentedLLM or implement LlmAgentProtocol)",
                     )
 
         elif agent_type == AgentType.ROUTER.value:
@@ -140,11 +141,11 @@ def validate_workflow_references(agents: Dict[str, Dict[str, Any]]) -> None:
 
 def get_dependencies(
     name: str,
-    agents: Dict[str, Dict[str, Any]],
+    agents: dict[str, dict[str, Any]],
     visited: set,
     path: set,
-    agent_type: AgentType = None,
-) -> List[str]:
+    agent_type: AgentType | None = None,
+) -> list[str]:
     """
     Get dependencies for an agent in topological order.
     Works for both Parallel and Chain workflows.
@@ -207,6 +208,7 @@ def get_agent_dependencies(agent_data: dict[str, Any]) -> set[str]:
         AgentType.EVALUATOR_OPTIMIZER: ("evaluator", "generator", "eval_optimizer_agents"),
         AgentType.ITERATIVE_PLANNER: ("child_agents",),
         AgentType.ORCHESTRATOR: ("child_agents",),
+        AgentType.BASIC: ("child_agents",),
         AgentType.PARALLEL: ("fan_out", "fan_in", "parallel_agents"),
         AgentType.ROUTER: ("router_agents",),
     }
@@ -229,8 +231,8 @@ def get_agent_dependencies(agent_data: dict[str, Any]) -> set[str]:
 
 
 def get_dependencies_groups(
-    agents_dict: Dict[str, Dict[str, Any]], allow_cycles: bool = False
-) -> List[List[str]]:
+    agents_dict: dict[str, dict[str, Any]], allow_cycles: bool = False
+) -> list[list[str]]:
     """
     Get dependencies between agents and group them into dependency layers.
     Each layer can be initialized in parallel.
@@ -305,7 +307,7 @@ def get_dependencies_groups(
     return result
 
 
-def validate_provider_keys_post_creation(active_agents: Dict[str, Any]) -> None:
+def validate_provider_keys_post_creation(active_agents: dict[str, Any]) -> None:
     """
     Validate that API keys are available for all created agents with LLMs.
 
