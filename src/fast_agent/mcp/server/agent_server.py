@@ -1,15 +1,13 @@
-"""
-Enhanced AgentMCPServer with robust shutdown handling for SSE transport.
-"""
+"""Agent MCP server."""
 
 import asyncio
 import logging
 import os
 import signal
 import time
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack
 from importlib.metadata import version as get_version
-from typing import Any, AsyncContextManager, Awaitable, Callable, Literal, Protocol, cast
+from typing import Any, Awaitable, Callable, Literal
 
 from mcp.server.fastmcp import Context as MCPContext
 from mcp.server.fastmcp import FastMCP
@@ -70,20 +68,8 @@ def _get_oauth_config() -> tuple[str | None, list[str], str]:
     return oauth_provider, oauth_scopes, resource_url
 
 
-TransportMode = Literal["http", "sse", "stdio"]
-McpTransportMode = Literal["streamable-http", "sse", "stdio"]
-
-
-class _LocalSseTransport(Protocol):
-    connect_sse: Callable[..., AsyncContextManager[Any]]
-    _read_stream_writers: dict[Any, Any]
-
-
-class _FastMCPLocalExtensions(Protocol):
-    _sse_transport: _LocalSseTransport | None
-    _lifespan_state: str
-    _on_shutdown: Callable[[], Awaitable[None]]
-    _server_should_exit: bool
+TransportMode = Literal["http", "stdio"]
+McpTransportMode = Literal["streamable-http", "stdio"]
 
 
 class AgentMCPServer:
@@ -154,7 +140,7 @@ class AgentMCPServer:
         self._set_mcp_version()
         self._configure_capabilities()
 
-        # Register root route for HTTP/SSE transport info
+        # Register root route for HTTP transport info
         @self.mcp_server.custom_route("/", methods=["GET"])
         async def root_info(request):
             from starlette.responses import PlainTextResponse
@@ -176,7 +162,6 @@ class AgentMCPServer:
 
         # Resource management
         self._exit_stack = AsyncExitStack()
-        self._active_connections: set[object] = set()
 
         # Server state
         self._server_task = None
@@ -653,7 +638,7 @@ class AgentMCPServer:
         port: int = 8000,
     ) -> None:
         """Run the MCP server synchronously."""
-        if transport in ["sse", "http"]:
+        if transport == "http":
             self.mcp_server.settings.host = host
             self.mcp_server.settings.port = port
 
@@ -664,9 +649,7 @@ class AgentMCPServer:
                     setattr(self.mcp_server, "_server_should_exit", False)
 
                 # Run the server
-                mcp_transport: McpTransportMode = (
-                    "streamable-http" if transport == "http" else transport
-                )
+                mcp_transport: McpTransportMode = "streamable-http"
                 self.mcp_server.run(transport=mcp_transport)
             except KeyboardInterrupt:
                 print("\nServer stopped by user (CTRL+C)")
@@ -684,7 +667,7 @@ class AgentMCPServer:
                 except (SystemExit, KeyboardInterrupt):
                     # These are expected during shutdown
                     pass
-        else:  # stdio
+        elif transport == "stdio":
             try:
                 self.mcp_server.run(transport="stdio")
             except KeyboardInterrupt:
@@ -692,27 +675,21 @@ class AgentMCPServer:
             finally:
                 # Minimal cleanup for stdio
                 run_sync(self._cleanup_stdio)
+        else:
+            raise ValueError(f"Unsupported MCP server transport: {transport}")
 
     async def run_async(
         self, transport: TransportMode = "http", host: str = "0.0.0.0", port: int = 8000
     ) -> None:
         """Run the MCP server asynchronously with improved shutdown handling."""
-        # Use different handling strategies based on transport type
-        if transport in ["sse", "http"]:
-            # For SSE/HTTP, use our enhanced shutdown handling
+        if transport == "http":
             self._setup_signal_handlers()
 
             self.mcp_server.settings.host = host
             self.mcp_server.settings.port = port
 
             # Start the server in a separate task so we can monitor it
-            if transport == "http":
-                http_transport: Literal["http", "sse"] = "http"
-            elif transport == "sse":
-                http_transport = "sse"
-            else:
-                raise ValueError("HTTP/SSE handler received stdio transport")
-            self._server_task = asyncio.create_task(self._run_server_with_shutdown(http_transport))
+            self._server_task = asyncio.create_task(self._run_server_with_shutdown())
 
             try:
                 # Wait for the server task to complete
@@ -735,7 +712,7 @@ class AgentMCPServer:
                 # Only do minimal cleanup - don't try to be too clever
                 await self._cleanup_stdio()
                 print("\nServer shutdown complete.")
-        else:  # stdio
+        elif transport == "stdio":
             # For STDIO, use simpler approach that respects STDIO lifecycle
             try:
                 # Run directly without extra monitoring or signal handlers
@@ -753,47 +730,21 @@ class AgentMCPServer:
                     raise
             # Only perform minimal cleanup needed for STDIO
             await self._cleanup_stdio()
+        else:
+            raise ValueError(f"Unsupported MCP server transport: {transport}")
 
-    async def _run_server_with_shutdown(self, transport: Literal["http", "sse"]):
+    async def _run_server_with_shutdown(self):
         """Run the server with proper shutdown handling."""
-        # This method is used for SSE/HTTP transport
-        if transport not in ["sse", "http"]:
-            raise ValueError("This method should only be used with SSE or HTTP transport")
-
         # Start a monitor task for shutdown
         shutdown_monitor = asyncio.create_task(self._monitor_shutdown())
 
         try:
-            # Patch SSE server to track connections if needed
-            mcp_ext = cast("_FastMCPLocalExtensions", self.mcp_server)
-            sse_transport = getattr(mcp_ext, "_sse_transport", None)
-            if sse_transport is not None:
-                # Store the original connect_sse method
-                original_connect = sse_transport.connect_sse
-
-                # Create a wrapper that tracks connections
-                @asynccontextmanager
-                async def tracked_connect_sse(*args, **kwargs):
-                    async with original_connect(*args, **kwargs) as streams:
-                        self._active_connections.add(streams)
-                        try:
-                            yield streams
-                        finally:
-                            self._active_connections.discard(streams)
-
-                # Replace with our tracking version
-                sse_transport.connect_sse = tracked_connect_sse
-
-            # Run the server based on transport type
-            if transport == "sse":
-                await self.mcp_server.run_sse_async()
-            elif transport == "http":
-                # Check if HF OAuth is enabled - if so, wrap app with header middleware
-                oauth_provider = os.environ.get("FAST_AGENT_SERVE_OAUTH", "").lower()
-                if oauth_provider in ("hf", "huggingface"):
-                    await self._run_http_with_hf_middleware()
-                else:
-                    await self.mcp_server.run_streamable_http_async()
+            # Check if HF OAuth is enabled - if so, wrap app with header middleware
+            oauth_provider = os.environ.get("FAST_AGENT_SERVE_OAUTH", "").lower()
+            if oauth_provider in ("hf", "huggingface"):
+                await self._run_http_with_hf_middleware()
+            else:
+                await self.mcp_server.run_streamable_http_async()
         finally:
             # Cancel the monitor when the server exits
             shutdown_monitor.cancel()
@@ -865,59 +816,6 @@ class AgentMCPServer:
         except Exception as e:
             logger.error(f"Error in shutdown monitor: {e}", exc_info=True)
 
-    async def _close_sse_connections(self):
-        """Force close all SSE connections."""
-        # Close tracked connections
-        for conn in list(self._active_connections):
-            try:
-                close = getattr(conn, "close", None)
-                if callable(close):
-                    await close()
-                else:
-                    aclose = getattr(conn, "aclose", None)
-                    if callable(aclose):
-                        await aclose()
-            except Exception as e:
-                logger.error(f"Error closing connection: {e}")
-            self._active_connections.discard(conn)
-
-        # Access the SSE transport if it exists to close stream writers
-        mcp_ext = cast("_FastMCPLocalExtensions", self.mcp_server)
-        sse = getattr(mcp_ext, "_sse_transport", None)
-        if sse is not None:
-            # Close all read stream writers
-            writers = list(sse._read_stream_writers.items())
-            for session_id, writer in writers:
-                try:
-                    logger.debug(f"Closing SSE connection: {session_id}")
-                    # Instead of aclose, try to close more gracefully
-                    # Send a special event to notify client, then close
-                    try:
-                        if hasattr(writer, "send") and not getattr(writer, "_closed", False):
-                            try:
-                                # Try to send a close event if possible
-                                await writer.send(Exception("Server shutting down"))
-                            except (AttributeError, asyncio.CancelledError):
-                                pass
-                    except Exception:
-                        pass
-
-                    # Now close the stream
-                    await writer.aclose()
-                    sse._read_stream_writers.pop(session_id, None)
-                except Exception as e:
-                    logger.error(f"Error closing SSE connection {session_id}: {e}")
-
-        # If we have a ASGI lifespan hook, try to signal closure
-        if getattr(mcp_ext, "_lifespan_state", None) == "started":
-            logger.debug("Attempting to signal ASGI lifespan shutdown")
-            try:
-                on_shutdown = getattr(mcp_ext, "_on_shutdown", None)
-                if on_shutdown is not None:
-                    await on_shutdown()
-            except Exception as e:
-                logger.error(f"Error during ASGI lifespan shutdown: {e}")
-
     async def with_bridged_context(self, agent_context, mcp_context, func, *args, **kwargs):
         """
         Execute a function with bridged context between MCP and agent
@@ -981,9 +879,6 @@ class AgentMCPServer:
         self._graceful_shutdown_event.set()
 
         try:
-            # Close SSE connections
-            await self._close_sse_connections()
-
             # Close any resources in the exit stack
             await self._exit_stack.aclose()
 
@@ -998,22 +893,3 @@ class AgentMCPServer:
             logger.error(f"Error during shutdown: {e}", exc_info=True)
         finally:
             logger.info("Full shutdown complete")
-
-    async def _cleanup_minimal(self):
-        """Perform minimal cleanup before simulating a KeyboardInterrupt."""
-        logger.info("Performing minimal cleanup before interrupt")
-
-        # Only close SSE connection writers directly
-        mcp_ext = cast("_FastMCPLocalExtensions", self.mcp_server)
-        sse = getattr(mcp_ext, "_sse_transport", None)
-        if sse is not None:
-            # Close all read stream writers
-            for session_id, writer in list(sse._read_stream_writers.items()):
-                try:
-                    await writer.aclose()
-                except Exception:
-                    # Ignore errors during cleanup
-                    pass
-
-        # Clear active connections set to prevent further operations
-        self._active_connections.clear()

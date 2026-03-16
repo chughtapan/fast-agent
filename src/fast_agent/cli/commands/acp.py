@@ -126,12 +126,12 @@ def run_acp(
     host: str = typer.Option(
         "0.0.0.0",
         "--host",
-        help="Host address to bind when using HTTP or SSE transport",
+        help="Host address to bind when using HTTP transport",
     ),
     port: int = typer.Option(
         8000,
         "--port",
-        help="Port to use when running as a server with HTTP or SSE transport",
+        help="Port to use when running as a server with HTTP transport",
     ),
     description: str | None = typer.Option(
         None,

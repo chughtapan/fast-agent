@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 
 class ServeTransport(str, Enum):
     HTTP = "http"
-    SSE = "sse"
     STDIO = "stdio"
     ACP = "acp"
 
@@ -148,17 +147,17 @@ def serve(
     transport: ServeTransport = typer.Option(
         ServeTransport.HTTP,
         "--transport",
-        help="Transport protocol to expose (http, sse, stdio, acp)",
+        help="Transport protocol to expose (http, stdio, acp)",
     ),
     host: str = typer.Option(
         "0.0.0.0",
         "--host",
-        help="Host address to bind when using HTTP or SSE transport",
+        help="Host address to bind when using HTTP transport",
     ),
     port: int = typer.Option(
         8000,
         "--port",
-        help="Port to use when running as a server with HTTP or SSE transport",
+        help="Port to use when running as a server with HTTP transport",
     ),
     shell: bool = CommonAgentOptions.shell(),
     instance_scope: InstanceScope = typer.Option(

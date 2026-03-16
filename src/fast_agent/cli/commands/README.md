@@ -99,9 +99,9 @@ fast-agent serve [OPTIONS]
 - `--npx TEXT`: NPX package and args to run as an MCP server (quoted)
 - `--uvx TEXT`: UVX package and args to run as an MCP server (quoted)
 - `--stdio TEXT`: Command to run as STDIO MCP server (quoted)
-- `--transport [http|sse|stdio|acp]`: Transport protocol to expose (default: http)
-- `--host TEXT`: Host address when using HTTP or SSE transport (default: 0.0.0.0)
-- `--port INTEGER`: Port when using HTTP or SSE transport (default: 8000)
+- `--transport [http|stdio|acp]`: Transport protocol to expose (default: http)
+- `--host TEXT`: Host address when using HTTP transport (default: 0.0.0.0)
+- `--port INTEGER`: Port when using HTTP transport (default: 8000)
 - `--shell`, `-x`: Enable a local shell runtime and expose the execute tool
 - `--description`, `-d TEXT`: Description used for each send tool (supports `{agent}` placeholder)
 - `--tool-name-template TEXT`: Template for exposed agent tool names (supports `{agent}` placeholder)
@@ -118,9 +118,6 @@ When configuring agents in code, `skills=None` explicitly disables skills for th
 ```bash
 # HTTP transport on default port
 fast-agent serve --model=haiku --transport=http
-
-# SSE transport on a custom port
-fast-agent serve --transport=sse --port=8723
 
 # Expose an MCP stdio server alongside the agent
 fast-agent serve --stdio "python my_server.py --debug"

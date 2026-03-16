@@ -175,53 +175,8 @@ async def test_handling_multipart_json_format(fast_agent):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_prompt_server_sse_can_set_ports(fast_agent, mcp_test_ports, wait_for_port):
-    # Start the SSE server in a subprocess
-    import subprocess
-
-    # Get the path to the test agent
-    test_dir = Path(__file__).resolve().parent
-
-    # Port must match what's in the fastagent.config.yaml
-    port = mcp_test_ports["sse"]
-
-    # Start the server process
-    server_proc = subprocess.Popen(
-        ["prompt-server", "--transport", "sse", "--port", str(port), "simple.txt"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        cwd=test_dir,
-    )
-
-    try:
-        await wait_for_port("127.0.0.1", port, process=server_proc)
-
-        # Now connect to it via the configured MCP server
-        @fast_agent.agent(name="client", servers=["prompt_sse"], model="passthrough")
-        async def agent_function():
-            async with fast_agent.run() as agent:
-                # Try connecting and sending a message
-                assert "simple" in await agent.apply_prompt("simple")
-
-        #                assert "connected" == await agent.send("connected")
-
-        await agent_function()
-
-    finally:
-        # Terminate the server process
-        if server_proc.poll() is None:  # If still running
-            server_proc.terminate()
-            try:
-                server_proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                server_proc.kill()
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
 async def test_prompt_server_http_can_set_ports(fast_agent, mcp_test_ports, wait_for_port):
-    # Start the SSE server in a subprocess
+    # Start the HTTP server in a subprocess
     import subprocess
 
     # Get the path to the test agent
