@@ -18,6 +18,7 @@ from _session_base import (
     session_meta,
 )
 from fastmcp import Context, FastMCP
+from fastmcp.tools import ToolResult
 
 HASH_ALGORITHM = "sha256"
 
@@ -67,12 +68,12 @@ def build_server() -> FastMCP:
     register_session_handlers(mcp._mcp_server, sessions)
 
     @mcp.tool(name="hashcheck_store")
-    async def hashcheck_store(ctx: Context, text: str) -> types.CallToolResult:
+    async def hashcheck_store(ctx: Context, text: str) -> ToolResult:
         record = require_session(ctx, sessions)
         sessions.touch(record)
         digest = hashes.digest(text)
         count = hashes.add(record.session_id, digest)
-        return types.CallToolResult(
+        return ToolResult(
             content=[
                 types.TextContent(
                     type="text",
@@ -82,28 +83,28 @@ def build_server() -> FastMCP:
                     ),
                 )
             ],
-            _meta=session_meta(record, sessions),
+            meta=session_meta(record, sessions),
         )
 
     @mcp.tool(name="hashcheck_verify")
-    async def hashcheck_verify(ctx: Context, text: str) -> types.CallToolResult:
+    async def hashcheck_verify(ctx: Context, text: str) -> ToolResult:
         record = require_session(ctx, sessions)
         sessions.touch(record)
         digest = hashes.digest(text)
         matched = hashes.contains(record.session_id, digest)
         message = "MATCH" if matched else "NOT FOUND"
-        return types.CallToolResult(
+        return ToolResult(
             content=[
                 types.TextContent(
                     type="text",
                     text=f"{message} for {digest[:16]}...",
                 )
             ],
-            _meta=session_meta(record, sessions),
+            meta=session_meta(record, sessions),
         )
 
     @mcp.tool(name="hashcheck_list")
-    async def hashcheck_list(ctx: Context) -> types.CallToolResult:
+    async def hashcheck_list(ctx: Context) -> ToolResult:
         record = require_session(ctx, sessions)
         sessions.touch(record)
         entries = hashes.list(record.session_id)
@@ -112,26 +113,26 @@ def build_server() -> FastMCP:
         else:
             lines = [f"  {idx}. {digest[:16]}..." for idx, digest in enumerate(entries, 1)]
             text = f"Hash store ({len(entries)} entries):\n" + "\n".join(lines)
-        return types.CallToolResult(
+        return ToolResult(
             content=[types.TextContent(type="text", text=text)],
-            _meta=session_meta(record, sessions),
+            meta=session_meta(record, sessions),
         )
 
     @mcp.tool(name="hashcheck_delete")
-    async def hashcheck_delete(ctx: Context, text: str) -> types.CallToolResult:
+    async def hashcheck_delete(ctx: Context, text: str) -> ToolResult:
         record = require_session(ctx, sessions)
         sessions.touch(record)
         digest = hashes.digest(text)
         deleted = hashes.remove(record.session_id, digest)
         message = "Deleted" if deleted else "Not found"
-        return types.CallToolResult(
+        return ToolResult(
             content=[
                 types.TextContent(
                     type="text",
                     text=f"{message}: {digest[:16]}...",
                 )
             ],
-            _meta=session_meta(record, sessions),
+            meta=session_meta(record, sessions),
         )
 
     return mcp

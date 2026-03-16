@@ -17,6 +17,7 @@ from _session_base import (
     session_meta,
 )
 from fastmcp import Context, FastMCP
+from fastmcp.tools import ToolResult
 
 
 def build_server() -> FastMCP:
@@ -25,28 +26,28 @@ def build_server() -> FastMCP:
     register_session_handlers(mcp._mcp_server, sessions)
 
     @mcp.tool(name="echo")
-    async def echo(ctx: Context, text: str) -> types.CallToolResult:
+    async def echo(ctx: Context, text: str) -> ToolResult:
         """Echo text back — requires an active session."""
         record = require_session(ctx, sessions)
         sessions.touch(record)
-        return types.CallToolResult(
+        return ToolResult(
             content=[types.TextContent(type="text", text=text)],
-            _meta=session_meta(record, sessions),
+            meta=session_meta(record, sessions),
         )
 
     @mcp.tool(name="whoami")
-    async def whoami(ctx: Context) -> types.CallToolResult:
+    async def whoami(ctx: Context) -> ToolResult:
         """Return basic session information."""
         record = require_session(ctx, sessions)
         sessions.touch(record)
-        return types.CallToolResult(
+        return ToolResult(
             content=[
                 types.TextContent(
                     type="text",
                     text=f"Session {record.session_id}, calls={record.tool_calls}",
                 )
             ],
-            _meta=session_meta(record, sessions),
+            meta=session_meta(record, sessions),
         )
 
     return mcp

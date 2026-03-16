@@ -20,6 +20,7 @@ from _session_base import (
     session_meta,
 )
 from fastmcp import Context, FastMCP
+from fastmcp.tools import ToolResult
 
 
 class SessionCounterStore:
@@ -55,51 +56,51 @@ def build_server() -> FastMCP:
     register_session_handlers(mcp._mcp_server, sessions)
 
     @mcp.tool(name="public_echo")
-    async def public_echo(ctx: Context, text: str) -> types.CallToolResult:
+    async def public_echo(ctx: Context, text: str) -> ToolResult:
         """Always works; session is optional."""
         record = optional_session(ctx, sessions)
         meta: dict[str, object] | None = None
         if record is not None:
             sessions.touch(record)
             meta = session_meta(record, sessions)
-        return types.CallToolResult(
+        return ToolResult(
             content=[
                 types.TextContent(
                     type="text",
                     text=f"public tool ok: {text}",
                 )
             ],
-            _meta=meta,
+            meta=meta,
         )
 
     @mcp.tool(name="session_start")
-    async def session_start(label: str | None = None) -> types.CallToolResult:
+    async def session_start(label: str | None = None) -> ToolResult:
         """Create a fresh session via tool call."""
         record = sessions.create(title=_resolve_session_title(label), reason="tool/session_start")
-        return types.CallToolResult(
+        return ToolResult(
             content=[
                 types.TextContent(
                     type="text",
                     text=f"new session started: {record.session_id}",
                 )
             ],
-            _meta=session_meta(record, sessions),
+            meta=session_meta(record, sessions),
         )
 
     @mcp.tool(name="session_reset")
-    async def session_reset(ctx: Context) -> types.CallToolResult:
+    async def session_reset(ctx: Context) -> ToolResult:
         """Delete active session and reset per-session counter."""
         record = require_session(ctx, sessions)
         counters.reset(record.session_id)
         _ = sessions.delete(record.session_id)
-        return types.CallToolResult(
+        return ToolResult(
             content=[
                 types.TextContent(
                     type="text",
                     text=f"session reset: deleted {record.session_id}",
                 )
             ],
-            _meta={
+            meta={
                 SESSION_META_KEY: {
                     "sessionId": record.session_id,
                 }
@@ -107,35 +108,35 @@ def build_server() -> FastMCP:
         )
 
     @mcp.tool(name="session_counter_inc")
-    async def session_counter_inc(ctx: Context) -> types.CallToolResult:
+    async def session_counter_inc(ctx: Context) -> ToolResult:
         """Requires an active session; increments per-session counter."""
         record = require_session(ctx, sessions)
         sessions.touch(record)
         value = counters.increment(record.session_id)
-        return types.CallToolResult(
+        return ToolResult(
             content=[
                 types.TextContent(
                     type="text",
                     text=f"session counter for {record.session_id}: {value}",
                 )
             ],
-            _meta=session_meta(record, sessions),
+            meta=session_meta(record, sessions),
         )
 
     @mcp.tool(name="session_counter_get")
-    async def session_counter_get(ctx: Context) -> types.CallToolResult:
+    async def session_counter_get(ctx: Context) -> ToolResult:
         """Requires an active session; reads per-session counter."""
         record = require_session(ctx, sessions)
         sessions.touch(record)
         value = counters.get(record.session_id)
-        return types.CallToolResult(
+        return ToolResult(
             content=[
                 types.TextContent(
                     type="text",
                     text=f"session counter for {record.session_id}: {value}",
                 )
             ],
-            _meta=session_meta(record, sessions),
+            meta=session_meta(record, sessions),
         )
 
     return mcp

@@ -11,8 +11,8 @@ import logging
 import sys
 
 from fastmcp import Context, FastMCP
+from fastmcp.tools import ToolResult
 from mcp.types import (
-    CallToolResult,
     SamplingMessage,
     TextContent,
     Tool,
@@ -98,7 +98,7 @@ SECRET_CODE = "WHISKEY-TANGO-FOXTROT-42"
 
 
 @mcp.tool()
-async def fetch_secret(ctx: Context) -> CallToolResult:
+async def fetch_secret(ctx: Context) -> ToolResult:
     """
     Test tool that uses sampling with tools to fetch a secret code.
 
@@ -176,13 +176,12 @@ async def fetch_secret(ctx: Context) -> CallToolResult:
                 final_text = str(final_result.content)
 
             logger.info(f"Final response: {final_text}")
-            return CallToolResult(content=[TextContent(type="text", text=final_text)])
+            return ToolResult(content=[TextContent(type="text", text=final_text)])
 
     # Fallback - sampling with tools didn't work as expected
     logger.warning("Tool was not called - sampling with tools may not be working")
-    return CallToolResult(
+    return ToolResult(
         content=[TextContent(type="text", text="ERROR: Tool was not called")],
-        isError=True,
     )
 
 

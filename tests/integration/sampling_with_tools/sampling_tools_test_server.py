@@ -8,9 +8,9 @@ import logging
 import sys
 
 from fastmcp import Context, FastMCP
+from fastmcp.tools import ToolResult
 from mcp.types import (
     AudioContent,
-    CallToolResult,
     ImageContent,
     SamplingMessage,
     TextContent,
@@ -56,7 +56,7 @@ TEST_TOOLS = [
 
 
 @mcp.tool()
-async def test_sampling_with_tools(ctx: Context, message: str) -> CallToolResult:
+async def test_sampling_with_tools(ctx: Context, message: str) -> ToolResult:
     """
     Test sampling with tools - sends a request with tools and checks the response.
 
@@ -83,13 +83,13 @@ async def test_sampling_with_tools(ctx: Context, message: str) -> CallToolResult
 
     # Return info about what we received
     info = f"stopReason={result.stopReason}, model={result.model}"
-    return CallToolResult(
+    return ToolResult(
         content=[TextContent(type="text", text=f"Sampling completed: {info}")]
     )
 
 
 @mcp.tool()
-async def test_sampling_without_tools(ctx: Context, message: str) -> CallToolResult:
+async def test_sampling_without_tools(ctx: Context, message: str) -> ToolResult:
     """
     Test sampling without tools - verifies backward compatibility.
     """
@@ -117,13 +117,13 @@ async def test_sampling_without_tools(ctx: Context, message: str) -> CallToolRes
     else:
         response_text = str(result.content)
 
-    return CallToolResult(
+    return ToolResult(
         content=[TextContent(type="text", text=f"Response: {response_text}")]
     )
 
 
 @mcp.tool()
-async def test_tool_result_handling(ctx: Context) -> CallToolResult:
+async def test_tool_result_handling(ctx: Context) -> ToolResult:
     """
     Test a multi-turn tool conversation.
 
@@ -186,7 +186,7 @@ async def test_tool_result_handling(ctx: Context) -> CallToolResult:
                 tools=TEST_TOOLS,
             )
 
-            return CallToolResult(
+            return ToolResult(
                 content=[
                     TextContent(
                         type="text",
@@ -196,7 +196,7 @@ async def test_tool_result_handling(ctx: Context) -> CallToolResult:
             )
 
     # Single turn response
-    return CallToolResult(
+    return ToolResult(
         content=[
             TextContent(type="text", text=f"Single turn: stopReason={result.stopReason}")
         ]

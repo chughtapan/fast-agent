@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import anyio
 import mcp.types as types
 from fastmcp import Context, FastMCP
+from fastmcp.tools import ToolResult
 from mcp.server.session import InitializationState, ServerSession
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import McpError
@@ -231,7 +232,7 @@ def build_server() -> FastMCP:
     async def session_probe(
         ctx: Context,
         note: str | None = None,
-    ) -> types.CallToolResult:
+    ) -> ToolResult:
         session_id = _session_id_from_meta(ctx.request_context.meta)
         record = sessions.get(session_id)
         if record is None:
@@ -240,7 +241,7 @@ def build_server() -> FastMCP:
         sessions.touch(record)
         metadata = sessions.metadata(record)
         detail = note.strip() if isinstance(note, str) and note.strip() else "none"
-        return types.CallToolResult(
+        return ToolResult(
             content=[
                 types.TextContent(
                     type="text",
@@ -250,7 +251,7 @@ def build_server() -> FastMCP:
                     ),
                 )
             ],
-            _meta={SESSION_META_KEY: metadata},
+            meta={SESSION_META_KEY: metadata},
         )
 
     return mcp
