@@ -19,7 +19,7 @@ from _session_base import (
     run_server,
     session_meta,
 )
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
 
 
 class SessionCounterStore:
@@ -49,7 +49,7 @@ def _resolve_session_title(label: str | None) -> str:
 
 
 def build_server() -> FastMCP:
-    mcp = FastMCP("selective-session", log_level="WARNING")
+    mcp = FastMCP("selective-session")
     sessions = SessionStore(include_state=False)
     counters = SessionCounterStore()
     register_session_handlers(mcp._mcp_server, sessions)

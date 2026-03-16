@@ -5,7 +5,7 @@ MCP server for testing filtering functionality with multiple tools, resources, a
 
 import logging
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

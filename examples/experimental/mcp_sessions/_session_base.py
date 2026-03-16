@@ -23,7 +23,7 @@ from mcp.shared.session import BaseSession
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
-    from mcp.server.fastmcp import Context, FastMCP
+    from fastmcp import Context, FastMCP
     from mcp.server.models import InitializationOptions
     from mcp.shared.message import SessionMessage
 

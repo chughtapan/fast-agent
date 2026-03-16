@@ -25,7 +25,7 @@ from _session_base import (
     run_server,
     session_metadata_from_meta,
 )
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
 from mcp.shared.exceptions import McpError
 
 
@@ -75,7 +75,7 @@ def _session_meta(record: SessionRecord, state: str) -> dict[str, dict[str, str]
 
 
 def build_server() -> FastMCP:
-    mcp = FastMCP("client-notes", log_level="WARNING")
+    mcp = FastMCP("client-notes")
     sessions = SessionStore(include_state=True)
     lowlevel = mcp._mcp_server
     register_session_handlers(lowlevel, sessions)

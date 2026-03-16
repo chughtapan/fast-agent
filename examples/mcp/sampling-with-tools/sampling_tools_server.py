@@ -10,7 +10,7 @@ until the LLM provides a final answer.
 import logging
 import sys
 
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
 from mcp.types import (
     CallToolResult,
     SamplingMessage,
@@ -28,7 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("sampling_tools_server")
 
-mcp = FastMCP("Sampling With Tools Demo", log_level="DEBUG")
+mcp = FastMCP("Sampling With Tools Demo")
 
 # Calculator tools that we'll pass to the sampling request
 CALCULATOR_TOOLS = [

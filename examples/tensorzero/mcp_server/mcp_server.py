@@ -1,14 +1,13 @@
 import uvicorn
-from mcp.server.fastmcp.server import FastMCP
+from fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
 SERVER_PATH = "t0-example-server"
+MCP_PATH = f"/{SERVER_PATH}/mcp"
 
 
 mcp_instance = FastMCP(name="t0-example-server")
-mcp_instance.settings.message_path = f"/{SERVER_PATH}/messages/"
-mcp_instance.settings.sse_path = f"/{SERVER_PATH}/sse"
 
 
 @mcp_instance.tool()
@@ -20,12 +19,11 @@ def example_tool(input_text: str) -> str:
 
 app = Starlette(
     routes=[
-        Mount("/", app=mcp_instance.sse_app()),
+        Mount("/", app=mcp_instance.http_app(path=MCP_PATH, transport="http")),
     ]
 )
 
 if __name__ == "__main__":
     print(f"Starting minimal MCP server ({mcp_instance.name}) on http://127.0.0.1:8000")
-    print(f" -> SSE endpoint: {mcp_instance.settings.sse_path}")
-    print(f" -> Message endpoint: {mcp_instance.settings.message_path}")
+    print(f" -> HTTP endpoint: {MCP_PATH}")
     uvicorn.run(app, host="127.0.0.1", port=8000)

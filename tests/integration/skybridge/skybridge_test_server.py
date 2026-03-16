@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 from typing import TYPE_CHECKING
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 if TYPE_CHECKING:
-    from mcp.types import Tool as MCPTool
+    from collections.abc import Sequence
+
+    from fastmcp.tools import Tool
 
 SKYBRIDGE_MIME_TYPE = "text/html+skybridge"
 
@@ -21,8 +23,8 @@ class SkybridgeTestServer(FastMCP):
         super().__init__(*args, **kwargs)
         self._tool_templates = tool_templates or {}
 
-    async def list_tools(self) -> list[MCPTool]:
-        tools = await super().list_tools()
+    async def list_tools(self, *, run_middleware: bool = True) -> Sequence[Tool]:
+        tools = await super().list_tools(run_middleware=run_middleware)
         for tool in tools:
             template = self._tool_templates.get(tool.name)
             if template:

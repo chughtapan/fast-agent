@@ -5,7 +5,7 @@ MCP server WITH instructions for testing server instructions feature.
 
 import logging
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

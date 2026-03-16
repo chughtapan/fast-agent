@@ -9,7 +9,8 @@ import sys
 from pathlib import Path
 from typing import cast
 
-from mcp.server.fastmcp import Context, FastMCP, Image
+from fastmcp import Context, FastMCP
+from fastmcp.utilities.types import Image
 from mcp.types import AnyUrl, BlobResourceContents, EmbeddedResource, ImageContent, TextContent
 
 # Configure logging
@@ -17,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Create the FastMCP server
-app = FastMCP(name="ImageToolServer", debug=True)
+app = FastMCP(name="ImageToolServer")
 
 # Global variable to store the image path
 image_path = "image.png"
@@ -26,7 +27,7 @@ image_path = "image.png"
 @app.tool(
     name="get_image",
     description="Returns the sample image with some descriptive text",
-    structured_output=False,
+    output_schema=None,
 )
 async def get_image(
     image_name: str = "default", ctx: Context | None = None
@@ -45,7 +46,7 @@ async def get_image(
 @app.tool(
     name="get_pdf",
     description="Returns 'sample.pdf' - use when the User requests a sample PDF file",
-    structured_output=False,
+    output_schema=None,
 )
 async def get_pdf() -> list[TextContent | EmbeddedResource]:
     try:

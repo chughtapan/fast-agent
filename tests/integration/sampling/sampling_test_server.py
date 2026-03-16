@@ -5,7 +5,7 @@ Enhanced test server for sampling functionality
 import logging
 import sys
 
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
 from mcp.types import CallToolResult, SamplingMessage, TextContent
 
 # Configure detailed logging
@@ -17,7 +17,7 @@ logging.basicConfig(
 logger = logging.getLogger("sampling_server")
 
 # Create MCP server
-mcp = FastMCP("MCP Root Tester", log_level="DEBUG")
+mcp = FastMCP("MCP Root Tester")
 
 
 @mcp.tool()

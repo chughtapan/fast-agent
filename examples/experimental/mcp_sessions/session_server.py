@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import anyio
 import mcp.types as types
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
 from mcp.server.session import InitializationState, ServerSession
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import McpError
@@ -222,7 +222,7 @@ def _register_session_handlers(lowlevel: Any, store: SessionStore) -> None:
 
 
 def build_server() -> FastMCP:
-    mcp = FastMCP("mcp-data-layer-sessions", log_level="WARNING")
+    mcp = FastMCP("mcp-data-layer-sessions")
     sessions = SessionStore()
     lowlevel = mcp._mcp_server
     _register_session_handlers(lowlevel, sessions)

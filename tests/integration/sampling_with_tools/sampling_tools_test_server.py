@@ -7,7 +7,7 @@ This server provides tools that test the sampling with tools functionality.
 import logging
 import sys
 
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
 from mcp.types import (
     AudioContent,
     CallToolResult,
@@ -37,7 +37,7 @@ def _sampling_content(*blocks: SamplingMessageContentBlock) -> list[SamplingMess
     return list(blocks)
 
 
-mcp = FastMCP("Sampling Tools Test Server", log_level="DEBUG")
+mcp = FastMCP("Sampling Tools Test Server")
 
 # Simple test tool definitions
 TEST_TOOLS = [

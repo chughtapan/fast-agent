@@ -14,7 +14,7 @@ from _session_base import (
     run_server,
     session_meta,
 )
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
 
 
 class NotebookStore:
@@ -47,7 +47,7 @@ class NotebookStore:
 
 
 def build_server() -> FastMCP:
-    mcp = FastMCP("notebook", log_level="WARNING")
+    mcp = FastMCP("notebook")
     sessions = SessionStore(include_state=False)
     notebooks = NotebookStore()
     register_session_handlers(mcp._mcp_server, sessions)

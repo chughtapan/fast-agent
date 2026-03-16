@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 import yaml
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
 
@@ -58,7 +58,7 @@ def build_server(spec_text: str, base_url: str | None, server_name: str) -> Fast
         "When issuing requests, do not return more than 50 results in a single query."
     )
 
-    mcp = FastMCP(server_name, instructions=instructions, log_level="INFO")
+    mcp = FastMCP(server_name, instructions=instructions)
 
     @mcp.tool(
         name="call_openapi_endpoint",

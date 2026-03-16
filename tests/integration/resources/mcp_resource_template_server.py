@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import Completion, ResourceTemplateReference
 
 mcp = FastMCP("Smart Resource Template Test Server")
@@ -36,7 +36,7 @@ def smart_static() -> str:
     return "static"
 
 
-@mcp.completion()
+@mcp._mcp_server.completion()
 async def complete_resource_template_argument(ref, argument, context):
     del context
     if not isinstance(ref, ResourceTemplateReference):

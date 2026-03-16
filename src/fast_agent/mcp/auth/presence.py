@@ -1,6 +1,6 @@
 """Presence-only token verifier for MCP server authentication."""
 
-from mcp.server.auth.provider import AccessToken, TokenVerifier
+from fastmcp.server.auth import AccessToken, TokenVerifier
 
 
 class PresenceTokenVerifier(TokenVerifier):
@@ -11,14 +11,22 @@ class PresenceTokenVerifier(TokenVerifier):
     services (e.g., HuggingFace inference API) handle actual validation.
     """
 
-    def __init__(self, provider: str = "generic", scopes: list[str] | None = None):
+    def __init__(
+        self,
+        provider: str = "generic",
+        scopes: list[str] | None = None,
+        *,
+        base_url: str | None = None,
+    ):
         """
         Initialize the presence token verifier.
 
         Args:
             provider: Name of the OAuth provider (for logging/debugging).
             scopes: List of scopes to assign to valid tokens. Defaults to ["access"].
+            base_url: Optional protected resource base URL for auth metadata.
         """
+        super().__init__(base_url=base_url, required_scopes=scopes or ["access"])
         self.provider = provider
         self.scopes = scopes or ["access"]
 

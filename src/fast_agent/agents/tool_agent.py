@@ -4,7 +4,7 @@ from contextvars import ContextVar
 from dataclasses import asdict
 from typing import Any, Callable, Dict, List, Sequence
 
-from mcp.server.fastmcp.tools.base import Tool as FastMCPTool
+from fastmcp.tools import FunctionTool, ToolResult
 from mcp.types import CallToolResult, ListToolsResult, Tool
 
 from fast_agent.agents.agent_types import AgentConfig, AgentType
@@ -23,6 +23,7 @@ from fast_agent.interfaces import ToolRunnerHookCapable
 from fast_agent.mcp.helpers.content_helpers import text_content
 from fast_agent.mcp.tool_execution_handler import ToolExecutionHandler
 from fast_agent.tools.elicitation import get_elicitation_fastmcp_tool
+from fast_agent.tools.function_tool_loader import build_default_function_tool
 from fast_agent.types import LlmStopReason, PromptMessageExtended, RequestParams, ToolTimingInfo
 from fast_agent.ui.message_display_helpers import resolve_highlight_index
 from fast_agent.utils.async_utils import gather_with_cancel
@@ -89,31 +90,31 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
     A Tool Calling agent that uses FastMCP Tools for execution.
 
     Pass either:
-    - FastMCP Tool objects (created via Tool.from_function)
-    - Regular Python functions (will be wrapped as FastMCP Tools)
+    - native FastMCP FunctionTool objects
+    - regular Python functions (wrapped as FunctionTools)
     """
 
     def __init__(
         self,
         config: AgentConfig,
-        tools: Sequence[FastMCPTool | Callable] = [],
+        tools: Sequence[FunctionTool | Callable[..., Any]] = (),
         context: Context | None = None,
     ) -> None:
         super().__init__(config=config, context=context)
 
-        self._execution_tools: dict[str, FastMCPTool] = {}
+        self._execution_tools: dict[str, FunctionTool] = {}
         self._tool_schemas: list[Tool] = []
         self._agent_tools: dict[str, LlmAgent] = {}
         self._card_tool_names: set[str] = set()
         self.tool_runner_hooks: ToolRunnerHooks | None = None
 
         # Build a working list of tools and auto-inject human-input tool if missing
-        working_tools: list[FastMCPTool | Callable] = list(tools) if tools else []
+        working_tools: list[FunctionTool | Callable[..., Any]] = list(tools) if tools else []
         card_tool_source_ids = {id(tool) for tool in working_tools}
         # Only auto-inject if enabled via AgentConfig
         if self.config.human_input:
             existing_names = {
-                t.name if isinstance(t, FastMCPTool) else getattr(t, "__name__", "")
+                t.name if isinstance(t, FunctionTool) else getattr(t, "__name__", "")
                 for t in working_tools
             }
             if HUMAN_INPUT_TOOL_NAME not in existing_names:
@@ -123,10 +124,10 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                     logger.warning(f"Failed to initialize human-input tool: {e}")
 
         for tool in working_tools:
-            if isinstance(tool, FastMCPTool):
+            if isinstance(tool, FunctionTool):
                 fast_tool = tool
             elif callable(tool):
-                fast_tool = FastMCPTool.from_function(tool)
+                fast_tool = build_default_function_tool(tool)
             else:
                 logger.warning(f"Skipping unknown tool type: {type(tool)}")
                 continue
@@ -149,7 +150,7 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
             return {}
         return {"tools": list(self._execution_tools.values())}
 
-    def add_tool(self, tool: FastMCPTool, *, replace: bool = True) -> None:
+    def add_tool(self, tool: FunctionTool, *, replace: bool = True) -> None:
         """Register a new execution tool and expose it to the LLM."""
         name = tool.name
         if not replace and name in self._execution_tools:
@@ -335,7 +336,7 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 except Exception as exc:
                     logger.warning(f"Failed to merge tool clone usage for {child.name}: {exc}")
 
-        fast_tool = FastMCPTool.from_function(
+        fast_tool = build_default_function_tool(
             call_agent,
             name=tool_name,
             description=tool_description,
@@ -751,11 +752,8 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
             token = _tool_progress_context.set((tool_handler, tool_call_id))
 
         try:
-            result = await fast_tool.run(arguments or {}, convert_result=False)
-            tool_result = CallToolResult(
-                content=[text_content(str(result))],
-                isError=False,
-            )
+            native_result = await fast_tool.run(arguments or {})
+            tool_result = self._native_tool_result_to_mcp_result(native_result)
             if tool_handler and tool_call_id:
                 try:
                     await tool_handler.on_tool_complete(
@@ -770,6 +768,12 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 content=[text_content(f"Error: {str(e)}")],
                 isError=True,
             )
+            payload = getattr(e, "_fast_agent_url_elicitation_required", None)
+            if payload is not None:
+                try:
+                    setattr(tool_result, "_fast_agent_url_elicitation_required", payload)
+                except Exception:
+                    pass
             if tool_handler and tool_call_id:
                 try:
                     await tool_handler.on_tool_complete(tool_call_id, False, None, str(e))
@@ -792,3 +796,12 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
             if progress_manager is not None:
                 return progress_manager
         return None
+
+    @staticmethod
+    def _native_tool_result_to_mcp_result(result: ToolResult) -> CallToolResult:
+        return CallToolResult(
+            content=result.content,
+            structuredContent=result.structured_content,
+            meta=result.meta,
+            isError=False,
+        )

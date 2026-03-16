@@ -5,7 +5,7 @@ Simple MCP server that responds to tool calls with text and image content.
 
 import logging
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import ResourceLink
 from pydantic import AnyUrl
 

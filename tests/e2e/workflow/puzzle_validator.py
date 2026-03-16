@@ -1,6 +1,6 @@
 import sys
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 # Create the FastMCP server
 app = FastMCP(name="Puzzle Validator")

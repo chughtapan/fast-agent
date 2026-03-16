@@ -16,11 +16,11 @@ from _session_base import (
     run_server,
     session_meta,
 )
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
 
 
 def build_server() -> FastMCP:
-    mcp = FastMCP("session-required", log_level="WARNING")
+    mcp = FastMCP("session-required")
     sessions = SessionStore(include_state=False)
     register_session_handlers(mcp._mcp_server, sessions)
 

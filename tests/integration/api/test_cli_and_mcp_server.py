@@ -280,7 +280,9 @@ async def test_serve_request_scope_disables_session_header(mcp_test_ports, wait_
         ):
             async with ClientSession(read_stream, write_stream) as session:
                 init_result = await session.initialize()
-                assert init_result.capabilities.prompts is None
+                assert init_result.capabilities.prompts is not None
+                prompt_result = await session.list_prompts()
+                assert prompt_result.prompts == []
     finally:
         if server_proc.poll() is None:
             server_proc.terminate()

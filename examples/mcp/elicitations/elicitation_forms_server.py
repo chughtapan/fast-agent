@@ -7,17 +7,16 @@ different form types and validation patterns.
 
 import logging
 import sys
-from typing import Optional, TypedDict, cast
+from typing import TypedDict, cast
 
-from mcp import ReadResourceResult
-from mcp.server.elicitation import (
+from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_context
+from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
     DeclinedElicitation,
 )
-from mcp.server.fastmcp import FastMCP
-from mcp.types import TextResourceContents
-from pydantic import AnyUrl, BaseModel, Field
+from pydantic import BaseModel, Field
 
 # Configure logging
 logging.basicConfig(
@@ -28,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger("elicitation_forms_server")
 
 # Create MCP server
-mcp = FastMCP("Elicitation Forms Demo Server", log_level="INFO")
+mcp = FastMCP("Elicitation Forms Demo Server")
 
 
 class TitledEnumOption(TypedDict):
@@ -58,7 +57,7 @@ def _create_enum_schema_options(data: dict[str, str]) -> list[TitledEnumOption]:
 
 
 @mcp.resource(uri="elicitation://event-registration")
-async def event_registration() -> ReadResourceResult:
+async def event_registration() -> str:
     """Register for a tech conference event."""
     workshop_names = {
         "ai_basics": "AI Fundamentals",
@@ -72,8 +71,10 @@ async def event_registration() -> ReadResourceResult:
     class EventRegistration(BaseModel):
         name: str = Field(description="Your full name", min_length=2, max_length=100)
         email: str = Field(description="Your email address", json_schema_extra={"format": "email"})
-        company_website: str | None = Field(
-            None, description="Your company website (optional)", json_schema_extra={"format": "uri"}
+        company_website: str = Field(
+            "",
+            description="Your company website (optional)",
+            json_schema_extra={"format": "uri"},
         )
         workshops: list[str] = Field(
             description="Select the workshops you want to attend",
@@ -90,13 +91,15 @@ async def event_registration() -> ReadResourceResult:
         event_date: str = Field(
             description="Which event date works for you?", json_schema_extra={"format": "date"}
         )
-        dietary_requirements: Optional[str] = Field(
-            None, description="Any dietary requirements? (optional)", max_length=200
+        dietary_requirements: str = Field(
+            "",
+            description="Any dietary requirements? (optional)",
+            max_length=200,
         )
 
-    result = await mcp.get_context().elicit(
+    result = await get_context().elicit(
         "Register for the fast-agent conference - fill out your details",
-        schema=EventRegistration,
+        EventRegistration,
     )
 
     match result:
@@ -117,17 +120,11 @@ async def event_registration() -> ReadResourceResult:
         case CancelledElicitation():
             response = "Registration cancelled - please try again later"
 
-    return ReadResourceResult(
-        contents=[
-            TextResourceContents(
-                mimeType="text/plain", uri=AnyUrl("elicitation://event-registration"), text=response
-            )
-        ]
-    )
+    return response
 
 
 @mcp.resource(uri="elicitation://product-review")
-async def product_review() -> ReadResourceResult:
+async def product_review() -> str:
     """Submit a product review with rating and comments."""
     categories = {
         "electronics": "Electronics",
@@ -163,9 +160,9 @@ Overall, highly recommended!""",
             max_length=1000,
         )
 
-    result = await mcp.get_context().elicit(
+    result = await get_context().elicit(
         "Share your product review - Help others make informed decisions!",
-        schema=ProductReview,
+        ProductReview,
     )
 
     match result:
@@ -184,17 +181,11 @@ Overall, highly recommended!""",
         case CancelledElicitation():
             response = "Review cancelled - you can submit it later"
 
-    return ReadResourceResult(
-        contents=[
-            TextResourceContents(
-                mimeType="text/plain", uri=AnyUrl("elicitation://product-review"), text=response
-            )
-        ]
-    )
+    return response
 
 
 @mcp.resource(uri="elicitation://account-settings")
-async def account_settings() -> ReadResourceResult:
+async def account_settings() -> str:
     """Configure your account settings and preferences."""
 
     themes = {"light": "Light Theme", "dark": "Dark Theme", "auto": "Auto (System)"}
@@ -212,7 +203,7 @@ async def account_settings() -> ReadResourceResult:
             25, description="Items to show per page (10-100)", ge=10, le=100
         )
 
-    result = await mcp.get_context().elicit("Update your account settings", schema=AccountSettings)
+    result = await get_context().elicit("Update your account settings", AccountSettings)
 
     match result:
         case AcceptedElicitation(data=data):
@@ -230,17 +221,11 @@ async def account_settings() -> ReadResourceResult:
         case CancelledElicitation():
             response = "Settings update cancelled"
 
-    return ReadResourceResult(
-        contents=[
-            TextResourceContents(
-                mimeType="text/plain", uri=AnyUrl("elicitation://account-settings"), text=response
-            )
-        ]
-    )
+    return response
 
 
 @mcp.resource(uri="elicitation://service-appointment")
-async def service_appointment() -> ReadResourceResult:
+async def service_appointment() -> str:
     """Schedule a car service appointment."""
 
     class ServiceAppointment(BaseModel):
@@ -263,8 +248,8 @@ async def service_appointment() -> ReadResourceResult:
         )
         priority_service: bool = Field(False, description="Is this an urgent repair?")
 
-    result = await mcp.get_context().elicit(
-        "Schedule your vehicle service appointment", schema=ServiceAppointment
+    result = await get_context().elicit(
+        "Schedule your vehicle service appointment", ServiceAppointment
     )
 
     match result:
@@ -284,15 +269,7 @@ async def service_appointment() -> ReadResourceResult:
         case CancelledElicitation():
             response = "Appointment scheduling cancelled"
 
-    return ReadResourceResult(
-        contents=[
-            TextResourceContents(
-                mimeType="text/plain",
-                uri=AnyUrl("elicitation://service-appointment"),
-                text=response,
-            )
-        ]
-    )
+    return response
 
 
 if __name__ == "__main__":

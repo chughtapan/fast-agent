@@ -1,6 +1,7 @@
 import asyncio
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_context
 
 # Create the FastMCP server
 app = FastMCP(
@@ -19,12 +20,12 @@ async def progress_task(steps: int = 5) -> str:
     Args:
         steps: Number of steps to simulate (default: 5)
     """
-    context = app.get_context()
+    context = get_context()
+    request_context = context.request_context
+    assert request_context is not None
 
     # Get the progress token from the request metadata
-    progress_token = (
-        context.request_context.meta.progressToken if context.request_context.meta else None
-    )
+    progress_token = request_context.meta.progressToken if request_context.meta else None
 
     if progress_token is None:
         # Client didn't request progress updates
@@ -34,7 +35,7 @@ async def progress_task(steps: int = 5) -> str:
         return f"Successfully completed {steps} steps (no progress tracking)"
 
     # Use the session directly to properly send progress with related_request_id
-    session = context.request_context.session
+    session = request_context.session
     request_id = context.request_id
 
     # Send progress notifications with proper correlation
@@ -80,12 +81,12 @@ async def progress_task_no_message(steps: int = 3) -> str:
     Args:
         steps: Number of steps to simulate (default: 3)
     """
-    context = app.get_context()
+    context = get_context()
+    request_context = context.request_context
+    assert request_context is not None
 
     # Get the progress token from the request metadata
-    progress_token = (
-        context.request_context.meta.progressToken if context.request_context.meta else None
-    )
+    progress_token = request_context.meta.progressToken if request_context.meta else None
 
     if progress_token is None:
         # Client didn't request progress updates
@@ -94,7 +95,7 @@ async def progress_task_no_message(steps: int = 3) -> str:
         return f"Completed {steps} steps (no progress tracking)"
 
     # Use the session directly for proper correlation
-    session = context.request_context.session
+    session = request_context.session
     request_id = context.request_id
 
     # Send progress without messages
@@ -116,14 +117,14 @@ async def send_progress(
     context, progress: float, total: float | None = None, message: str | None = None
 ) -> None:
     """Helper function that correctly sends progress with related_request_id."""
-    progress_token = (
-        context.request_context.meta.progressToken if context.request_context.meta else None
-    )
+    request_context = context.request_context
+    assert request_context is not None
+    progress_token = request_context.meta.progressToken if request_context.meta else None
 
     if progress_token is None:
         return
 
-    await context.request_context.session.send_progress_notification(
+    await request_context.session.send_progress_notification(
         progress_token=progress_token,
         progress=progress,
         total=total,
@@ -143,7 +144,7 @@ async def progress_task_with_helper(steps: int = 5) -> str:
     Args:
         steps: Number of steps to simulate (default: 5)
     """
-    context = app.get_context()
+    context = get_context()
 
     # Use the helper function for cleaner code
     await send_progress(context, 0, steps, "Starting task...")

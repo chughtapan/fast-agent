@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from fast_agent.mcp.helpers.content_helpers import get_text, is_image_content
+from fast_agent.mcp.helpers.content_helpers import get_image_data, get_text, is_image_content
 from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
 
 if TYPE_CHECKING:
@@ -168,7 +168,7 @@ async def test_handling_multipart_json_format(fast_agent):
             x: GetPromptResult = await agent["test"].get_prompt("multipart")
 
             assert 5 == len(x.messages)
-            assert is_image_content(x.messages[3].content)
+            assert is_image_content(x.messages[3].content) or get_image_data(x.messages[3].content)
 
     await agent_function()
 

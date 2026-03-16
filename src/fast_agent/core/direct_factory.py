@@ -8,6 +8,8 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence, TypeVar, cast
 
+from fastmcp.tools import FunctionTool
+
 from fast_agent.agents import McpAgent
 from fast_agent.agents.agent_types import AgentConfig, AgentType
 from fast_agent.agents.llm_agent import LlmAgent
@@ -38,7 +40,7 @@ from fast_agent.interfaces import (
 )
 from fast_agent.llm.model_factory import ModelFactory
 from fast_agent.mcp.ui_agent import McpAgentWithUI
-from fast_agent.tools.function_tool_loader import FastMCPTool, load_function_tools
+from fast_agent.tools.function_tool_loader import load_function_tools
 from fast_agent.tools.hook_loader import load_tool_runner_hooks
 from fast_agent.types import RequestParams
 
@@ -60,7 +62,7 @@ class AgentBuildContext:
 @dataclass(frozen=True)
 class AgentsAsToolsBuildInputs:
     config: AgentConfig
-    function_tools: list[FastMCPTool]
+    function_tools: list[FunctionTool]
     child_agents: list[AgentProtocol]
     options: Any
     child_message_files: dict[str, list[Path]]
@@ -87,7 +89,7 @@ def _ensure_basic_only_agents(agents_dict: AgentConfigDict) -> None:
 def _load_configured_function_tools(
     config: AgentConfig,
     agent_data: Mapping[str, Any],
-) -> list[FastMCPTool]:
+) -> list[FunctionTool]:
     """Load function tools from config or agent_data, resolving paths.
 
     Args:

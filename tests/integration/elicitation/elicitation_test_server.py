@@ -5,17 +5,14 @@ Enhanced test server for sampling functionality
 import logging
 import sys
 
-from mcp import (
-    ReadResourceResult,
-)
-from mcp.server.elicitation import (
+from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_context
+from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
     DeclinedElicitation,
 )
-from mcp.server.fastmcp import FastMCP
-from mcp.types import TextResourceContents
-from pydantic import AnyUrl, BaseModel, Field
+from pydantic import BaseModel, Field
 
 # Configure detailed logging
 logging.basicConfig(
@@ -26,18 +23,18 @@ logging.basicConfig(
 logger = logging.getLogger("elicitation_server")
 
 # Create MCP server
-mcp = FastMCP("MCP Elicitation Server", log_level="DEBUG")
+mcp = FastMCP("MCP Elicitation Server")
 
 
 @mcp.resource(uri="elicitation://generate")
-async def get() -> ReadResourceResult:
+async def get() -> str:
     """Tool that echoes back the input parameter"""
 
     class ServerRating(BaseModel):
         rating: bool = Field(description="Server Rating")
 
-    mcp.get_context()
-    result = await mcp.get_context().elicit("Rate this server 5 stars?", schema=ServerRating)
+    get_context()
+    result = await get_context().elicit("Rate this server 5 stars?", ServerRating)
     ret = "nothing"
     match result:
         case AcceptedElicitation(data=data):
@@ -48,14 +45,7 @@ async def get() -> ReadResourceResult:
         case CancelledElicitation():
             ret = "cancelled"
 
-    # Return the result directly, without nesting
-    return ReadResourceResult(
-        contents=[
-            TextResourceContents(
-                mimeType="text/plain", uri=AnyUrl("elicitation://generate"), text=f"Result: {ret}"
-            )
-        ]
-    )
+    return f"Result: {ret}"
 
 
 if __name__ == "__main__":

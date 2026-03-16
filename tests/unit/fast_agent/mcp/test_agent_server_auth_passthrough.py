@@ -12,6 +12,8 @@ from fast_agent.mcp.auth.context import request_bearer_token
 from fast_agent.mcp.server.agent_server import AgentMCPServer
 
 if TYPE_CHECKING:
+    from fastmcp.tools import FunctionTool
+
     from fast_agent.interfaces import AgentProtocol
 
 
@@ -67,7 +69,7 @@ async def _build_server(agent: _AuthCapturingAgent) -> AgentMCPServer:
 async def test_send_tool_passes_authenticated_bearer_token_via_contextvar() -> None:
     agent = _AuthCapturingAgent()
     server = await _build_server(agent)
-    tool = server.mcp_server._tool_manager._tools["worker"]
+    tool = cast("FunctionTool", await server.mcp_server.get_tool("worker"))
     ctx = _build_test_context()
     authenticated_user = AuthenticatedUser(
         AccessToken(token="request-token", client_id="client-id", scopes=["access"])
@@ -90,7 +92,7 @@ async def test_send_tool_passes_authenticated_bearer_token_via_contextvar() -> N
 async def test_send_tool_restores_prior_request_token_when_no_authenticated_user_exists() -> None:
     agent = _AuthCapturingAgent()
     server = await _build_server(agent)
-    tool = server.mcp_server._tool_manager._tools["worker"]
+    tool = cast("FunctionTool", await server.mcp_server.get_tool("worker"))
     ctx = _build_test_context()
 
     saved_request_token = request_bearer_token.set("stale-token")

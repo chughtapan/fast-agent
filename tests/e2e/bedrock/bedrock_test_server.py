@@ -5,7 +5,7 @@ Bedrock-specific MCP server that matches the main smoke test server functionalit
 
 import logging
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

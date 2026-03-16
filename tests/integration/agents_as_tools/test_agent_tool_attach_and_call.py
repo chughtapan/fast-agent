@@ -2,6 +2,8 @@
 
 import pytest
 
+from fast_agent.mcp.helpers.content_helpers import get_text
+
 
 @pytest.mark.integration
 @pytest.mark.asyncio
@@ -44,7 +46,8 @@ async def test_agent_tool_attach_and_call(fast_agent):
             # Call the tool
             tool = parent._execution_tools[tool_name]
             result = await tool.run({"message": "hello"})
-            assert result == "hello"  # passthrough echoes input
+            assert get_text(result.content[0]) == "hello"  # passthrough echoes input
+            assert result.structured_content is None
 
     await test_attach_and_call()
 
@@ -104,7 +107,9 @@ async def test_multiple_agent_tools(fast_agent):
             result1 = await coordinator._execution_tools[tool1].run({"message": "msg1"})
             result2 = await coordinator._execution_tools[tool2].run({"message": "msg2"})
 
-            assert result1 == "msg1"
-            assert result2 == "msg2"
+            assert get_text(result1.content[0]) == "msg1"
+            assert get_text(result2.content[0]) == "msg2"
+            assert result1.structured_content is None
+            assert result2.structured_content is None
 
     await test_multiple_tools()

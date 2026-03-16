@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_context
+from fastmcp.tools import FunctionTool
 
 # Create the FastMCP server
 app = FastMCP(name="An MCP Server", instructions="Here is how to use this server")
@@ -19,22 +21,19 @@ async def check_weather(location: str) -> str:
     global dynamic_tool_registered
 
     # Get the current context which gives us access to the session
-    context = app.get_context()
+    context = get_context()
 
     # Toggle the dynamic tool
     if dynamic_tool_registered:
-        # Remove the tool by recreating the tool manager's tool list
-        # This is a simple approach for testing purposes
-        app._tool_manager._tools = {
-            name: tool for name, tool in app._tool_manager._tools.items() if name != "dynamic_tool"
-        }
+        app.remove_tool("dynamic_tool")
         dynamic_tool_registered = False
     else:
-        # Add a new tool dynamically
         app.add_tool(
-            lambda: "This is a dynamic tool",
-            name="dynamic_tool",
-            description="A tool that was added dynamically",
+            FunctionTool.from_function(
+                lambda: "This is a dynamic tool",
+                name="dynamic_tool",
+                description="A tool that was added dynamically",
+            )
         )
         dynamic_tool_registered = True
 

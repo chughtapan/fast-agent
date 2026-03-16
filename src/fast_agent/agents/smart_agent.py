@@ -72,7 +72,7 @@ from fast_agent.mcp.helpers.content_helpers import get_text
 from fast_agent.mcp.prompts.prompt_load import load_prompt
 from fast_agent.mcp.ui_mixin import McpUIMixin
 from fast_agent.paths import resolve_environment_paths
-from fast_agent.tools.function_tool_loader import FastMCPTool
+from fast_agent.tools.function_tool_loader import build_default_function_tool
 
 if TYPE_CHECKING:
     from fast_agent.agents.llm_agent import LlmAgent
@@ -1428,7 +1428,7 @@ def _enable_smart_tooling(agent: Any) -> None:
     }
     setattr(agent, "_smart_tool_names", set(smart_tool_names))
 
-    smart_tool = FastMCPTool.from_function(
+    smart_tool = build_default_function_tool(
         agent.smart,
         name="smart",
         description=(
@@ -1439,12 +1439,12 @@ def _enable_smart_tooling(agent: Any) -> None:
             "for runtime MCP attachment during run calls."
         ),
     )
-    slash_command_tool = FastMCPTool.from_function(
+    slash_command_tool = build_default_function_tool(
         agent.slash_command,
         name="slash_command",
         description=_slash_command_tool_description(),
     )
-    resource_read_tool = FastMCPTool.from_function(
+    resource_read_tool = build_default_function_tool(
         agent.read_resource,
         name="get_resource",
         description=(

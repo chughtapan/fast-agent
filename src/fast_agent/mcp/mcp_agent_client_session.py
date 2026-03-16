@@ -3,6 +3,7 @@ A derived client session for the MCP Agent framework.
 It adds logging and supports sampling requests.
 """
 
+import json
 import os
 import sys
 from datetime import timedelta
@@ -76,6 +77,7 @@ _SESSIONS_CAPABILITY_KEY = "sessions"
 _EXPERIMENTAL_SESSION_TEST_CAPABILITY_KEY = "experimental/sessions"
 
 _EXPERIMENTAL_SESSION_META_KEY = "io.modelcontextprotocol/session"
+_URL_ELICITATION_RESULT_PREFIX = "fast-agent-url-elicitation-required:"
 
 
 class _SessionMetadata(BaseModel):
@@ -685,6 +687,10 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
                 )
 
             self._attach_transport_channel(request_id, result)
+            self._attach_url_elicitation_payload_from_result(
+                result,
+                request_method=request_method,
+            )
             self._attach_pending_url_elicitation_payload_for_request(
                 result,
                 request_method=request_method,
@@ -855,6 +861,38 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
     def _discard_pending_url_elicitation_payload(self) -> None:
         self._ensure_pending_url_elicitation_state()
         self._pending_url_elicitations = []
+
+    def _attach_url_elicitation_payload_from_result(
+        self,
+        result: object,
+        *,
+        request_method: str,
+    ) -> None:
+        if not isinstance(result, CallToolResult) or not result.isError or not result.content:
+            return
+
+        first_block = result.content[0]
+        text = getattr(first_block, "text", None)
+        if not isinstance(text, str) or _URL_ELICITATION_RESULT_PREFIX not in text:
+            return
+
+        _, _, raw_payload = text.partition(_URL_ELICITATION_RESULT_PREFIX)
+        try:
+            payload_data = json.loads(raw_payload.strip())
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload_data, dict):
+            return
+
+        payload = build_url_elicitation_required_display_payload(
+            payload_data,
+            server_name=self.session_server_name or "unknown",
+            request_method=request_method,
+        )
+        try:
+            setattr(result, "_fast_agent_url_elicitation_required", payload)
+        except Exception:
+            pass
 
     @staticmethod
     def get_url_elicitation_required_payload(

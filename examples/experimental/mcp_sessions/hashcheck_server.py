@@ -17,7 +17,7 @@ from _session_base import (
     run_server,
     session_meta,
 )
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
 
 HASH_ALGORITHM = "sha256"
 
@@ -61,7 +61,7 @@ class HashStore:
 
 
 def build_server() -> FastMCP:
-    mcp = FastMCP("hashcheck", log_level="WARNING")
+    mcp = FastMCP("hashcheck")
     sessions = SessionStore(include_state=False)
     hashes = HashStore()
     register_session_handlers(mcp._mcp_server, sessions)

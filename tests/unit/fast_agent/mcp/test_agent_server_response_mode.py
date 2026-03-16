@@ -11,6 +11,8 @@ from fast_agent.mcp.server.agent_server import AgentMCPServer
 from fast_agent.types import RequestParams
 
 if TYPE_CHECKING:
+    from fastmcp.tools import FunctionTool
+
     from fast_agent.interfaces import AgentProtocol
 
 
@@ -44,7 +46,11 @@ def _build_test_context() -> object:
     return SimpleNamespace(session=object(), request_context=request_context)
 
 
-async def _build_server(agent: CapturingAgent) -> AgentMCPServer:
+async def _build_server(
+    agent: CapturingAgent,
+    *,
+    with_reload_callback: bool = False,
+) -> AgentMCPServer:
     async def create_instance() -> AgentInstance:
         wrapped = cast("AgentProtocol", agent)
         app = AgentApp({"worker": wrapped})
@@ -53,12 +59,16 @@ async def _build_server(agent: CapturingAgent) -> AgentMCPServer:
     async def dispose_instance(instance: AgentInstance) -> None:
         await instance.shutdown()
 
+    async def reload_callback() -> bool:
+        return True
+
     primary = await create_instance()
     return AgentMCPServer(
         primary_instance=primary,
         create_instance=create_instance,
         dispose_instance=dispose_instance,
         instance_scope="shared",
+        reload_callback=reload_callback if with_reload_callback else None,
     )
 
 
@@ -67,9 +77,10 @@ async def _build_server(agent: CapturingAgent) -> AgentMCPServer:
 async def test_send_tool_schema_omits_response_mode_by_default() -> None:
     server = await _build_server(CapturingAgent())
 
-    tool = server.mcp_server._tool_manager._tools["worker"]
+    tool = cast("FunctionTool", await server.mcp_server.get_tool("worker"))
     properties = tool.parameters.get("properties", {})
     assert properties.get("response_mode") is None
+    assert tool.output_schema is None
 
 
 @pytest.mark.unit
@@ -77,13 +88,24 @@ async def test_send_tool_schema_omits_response_mode_by_default() -> None:
 async def test_send_tool_schema_includes_response_mode_enum_when_selectable() -> None:
     server = await _build_server(CapturingAgent(tool_result_mode="selectable"))
 
-    tool = server.mcp_server._tool_manager._tools["worker"]
+    tool = cast("FunctionTool", await server.mcp_server.get_tool("worker"))
     properties = tool.parameters.get("properties", {})
     response_mode_schema = properties.get("response_mode")
 
     assert response_mode_schema is not None
     assert response_mode_schema.get("enum") == ["inherit", "postprocess", "passthrough"]
     assert response_mode_schema.get("default") == "inherit"
+    assert tool.output_schema is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reload_tool_schema_is_text_only() -> None:
+    server = await _build_server(CapturingAgent(), with_reload_callback=True)
+
+    tool = cast("FunctionTool", await server.mcp_server.get_tool("reload_agent_cards"))
+
+    assert tool.output_schema is None
 
 
 @pytest.mark.unit
@@ -93,7 +115,7 @@ async def test_response_mode_inherit_does_not_override_tool_result_mode() -> Non
     server = await _build_server(agent)
 
     ctx = _build_test_context()
-    tool = server.mcp_server._tool_manager._tools["worker"]
+    tool = cast("FunctionTool", await server.mcp_server.get_tool("worker"))
 
     await tool.fn(message="hello", ctx=ctx, response_mode="inherit")
 
@@ -109,7 +131,7 @@ async def test_response_mode_explicit_values_override_tool_result_mode() -> None
     server = await _build_server(agent)
 
     ctx = _build_test_context()
-    tool = server.mcp_server._tool_manager._tools["worker"]
+    tool = cast("FunctionTool", await server.mcp_server.get_tool("worker"))
 
     await tool.fn(message="hello", ctx=ctx, response_mode="postprocess")
     await tool.fn(message="hello", ctx=ctx, response_mode="passthrough")

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, Awaitable, Callable, Literal, Union
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, Union
 
-from mcp.server.fastmcp.tools import Tool as FastMCPTool
 from mcp.types import Tool as McpTool
 from pydantic import BaseModel, Field
 
 from fast_agent.constants import HUMAN_INPUT_TOOL_NAME
+from fast_agent.tools.function_tool_loader import build_default_function_tool
+
+if TYPE_CHECKING:
+    from fastmcp.tools import FunctionTool
 
 """
 Human-input (elicitation) tool models, schemas, and builders.
@@ -389,7 +392,7 @@ async def run_elicitation_form(arguments: dict | str, agent_name: str | None = N
 # -----------------------
 
 
-def get_elicitation_fastmcp_tool() -> FastMCPTool:
+def get_elicitation_fastmcp_tool() -> FunctionTool:
     async def elicit(
         title: str | None = None,
         description: str | None = None,
@@ -404,7 +407,7 @@ def get_elicitation_fastmcp_tool() -> FastMCPTool:
         }
         return await run_elicitation_form(args)
 
-    tool = FastMCPTool.from_function(elicit)
+    tool = build_default_function_tool(elicit)
     tool.name = HUMAN_INPUT_TOOL_NAME
     tool.description = (
         "Collect structured input from a human via a simple form. Provide up to 7 fields "

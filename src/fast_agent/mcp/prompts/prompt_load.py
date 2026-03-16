@@ -2,11 +2,6 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from mcp.server.fastmcp.prompts.base import (
-    AssistantMessage,
-    Message,
-    UserMessage,
-)
 from mcp.types import PromptMessage, TextContent
 
 from fast_agent.constants import FAST_AGENT_USAGE
@@ -91,20 +86,18 @@ def create_content_message(text: str, role: MessageRole) -> PromptMessage:
 
 def create_resource_message(
     resource_path: str, content: str, mime_type: str, is_binary: bool, role: MessageRole
-) -> Message:
+) -> PromptMessage:
     """Create a resource message with the specified content and role"""
-    message_class = UserMessage if role == "user" else AssistantMessage
-
     if mime_utils.is_image_mime_type(mime_type):
         # For images, create an ImageContent
         image_content = resource_utils.create_image_content(data=content, mime_type=mime_type)
-        return message_class(content=image_content)
+        return PromptMessage(role=role, content=image_content)
     else:
         # For other resources, create an EmbeddedResource
         embedded_resource = resource_utils.create_embedded_resource(
             resource_path, content, mime_type, is_binary
         )
-        return message_class(content=embedded_resource)
+        return PromptMessage(role=role, content=embedded_resource)
 
 
 def load_prompt(file: Path | str) -> list[PromptMessageExtended]:
