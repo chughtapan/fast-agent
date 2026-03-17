@@ -261,9 +261,7 @@ def _parse_query_overrides(
         raw_value = _collect_query_values(query_params, ("instant",))[-1]
         instant_setting = parse_reasoning_setting(raw_value)
         if instant_setting is None or instant_setting.kind != "toggle":
-            raise ModelConfigError(
-                f"Invalid instant query value: '{raw_value}' in '{model_spec}'"
-            )
+            raise ModelConfigError(f"Invalid instant query value: '{raw_value}' in '{model_spec}'")
         instant = bool(instant_setting.value)
 
     if "context" in query_params:
@@ -444,8 +442,7 @@ def _resolve_provider_and_model_name(
 
         if provider is None:
             raise ModelConfigError(
-                f"Unknown model or provider for: {model_spec}. "
-                f"Model name parsed as '{model_name}'"
+                f"Unknown model or provider for: {model_spec}. Model name parsed as '{model_name}'"
             )
 
     if provider == Provider.TENSORZERO and not model_name:
@@ -518,6 +515,8 @@ class ModelFactory:
         "gpt51": "responses.gpt-5.1",
         "gpt52": "responses.gpt-5.2",
         "gpt54": "responses.gpt-5.4",
+        "gpt54-mini": "responses.gpt-5.4-mini",
+        "gpt54-nano": "responses.gpt-5.4-nano",
         "chatgpt": "responses.gpt-5.3-chat-latest",
         "codex": "responses.gpt-5.3-codex",
         "codexplan": "codexresponses.gpt-5.4",

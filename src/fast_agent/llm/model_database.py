@@ -362,6 +362,19 @@ class ModelDatabase:
         default_provider=Provider.RESPONSES,
     )
 
+    OPENAI_GPT_54_SMALL = ModelParameters(
+        context_window=400000,
+        max_output_tokens=128000,
+        tokenizes=OPENAI_VISION,
+        reasoning="openai",
+        reasoning_effort_spec=OPENAI_GPT_51_CLASS_REASONING,
+        text_verbosity_spec=OPENAI_TEXT_VERBOSITY_SPEC,
+        response_transports=("sse", "websocket"),
+        response_websocket_providers=(Provider.RESPONSES, Provider.CODEX_RESPONSES),
+        response_service_tiers=("fast", "flex"),
+        default_provider=Provider.RESPONSES,
+    )
+
     OPENAI_GPT_CODEX_SPARK = ModelParameters(
         context_window=128000,
         max_output_tokens=128000,
@@ -690,6 +703,10 @@ class ModelDatabase:
         "gpt-5.3-codex": OPENAI_GPT_CODEX.model_copy(update={"response_service_tiers": ("fast",)}),
         "gpt-5.4": OPENAI_GPT_CODEX.model_copy(
             update={"reasoning_effort_spec": OPENAI_GPT_51_CLASS_REASONING}
+        ),
+        "gpt-5.4-mini": OPENAI_GPT_54_SMALL,
+        "gpt-5.4-nano": OPENAI_GPT_54_SMALL.model_copy(
+            update={"response_websocket_providers": (Provider.RESPONSES,)}
         ),
         "gpt-5.3-codex-spark": _with_fast(OPENAI_GPT_CODEX_SPARK),
         "gpt-5.2": OPENAI_GPT_5_2.model_copy(

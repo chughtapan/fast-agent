@@ -48,6 +48,7 @@ class CaptureDisplay(ConsoleDisplay):
         name: str | None = None,
         model: str | None = None,
         additional_message: Text | None = None,
+        pre_content=None,
         render_markdown: bool | None = None,
         show_hook_indicator: bool = False,
     ) -> None:

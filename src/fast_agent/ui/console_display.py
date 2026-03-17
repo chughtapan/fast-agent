@@ -537,6 +537,8 @@ class ConsoleDisplay:
             else:
                 # No markdown markers, print as regular Rich Text
                 console.console.print(content, markup=self._markup)
+        elif isinstance(content, Group):
+            console.console.print(content, markup=self._markup)
         elif isinstance(content, list):
             # Handle content blocks (for tool results)
             if len(content) == 1 and is_text_content(content[0]):
@@ -729,8 +731,10 @@ class ConsoleDisplay:
 
         return Text(joined, style="dim italic")
 
-    @staticmethod
-    def _extract_openai_phase_content(message: "PromptMessageExtended") -> str | None:
+    @classmethod
+    def _extract_openai_phase_content(
+        cls, message: "PromptMessageExtended"
+    ) -> str | Group | None:
         channels = message.channels or {}
         raw_blocks = (
             channels.get(OPENAI_ASSISTANT_MESSAGE_ITEMS) if isinstance(channels, Mapping) else None
@@ -738,7 +742,7 @@ class ConsoleDisplay:
         if not raw_blocks:
             return None
 
-        sections: list[str] = []
+        sections: list[str | Group | Text] = []
         saw_phase = False
 
         for block in raw_blocks:
@@ -779,13 +783,36 @@ class ConsoleDisplay:
             if phase is not None:
                 saw_phase = True
                 phase_label = PHASE_LABELS.get(phase, phase)
-                sections.append(f"▎{phase_label} {section_text}")
+                label = Text()
+                label.append("▎", style="dim")
+                label.append(phase_label, style="dim")
+                if cls._looks_like_markdown(section_text):
+                    prepared_content = prepare_markdown_content(section_text, True)
+                    sections.append(
+                        Group(
+                            label,
+                            Markdown(prepared_content, code_theme=CODE_STYLE),
+                        )
+                    )
+                else:
+                    label.append(" ")
+                    label.append(section_text)
+                    sections.append(label)
             else:
                 sections.append(section_text)
 
         if not sections or not saw_phase:
             return None
-        return "\n\n".join(sections)
+
+        if all(isinstance(section, str) for section in sections):
+            return "\n\n".join(section for section in sections if isinstance(section, str))
+
+        renderables: list[str | Group | Text] = []
+        for index, section in enumerate(sections):
+            if index:
+                renderables.append(Text("\n"))
+            renderables.append(section)
+        return Group(*renderables)
 
     async def show_assistant_message(
         self,
@@ -796,6 +823,7 @@ class ConsoleDisplay:
         name: str | None = None,
         model: str | None = None,
         additional_message: Text | None = None,
+        pre_content: Text | Group | None = None,
         render_markdown: bool | None = None,
         show_hook_indicator: bool = False,
     ) -> None:
@@ -810,6 +838,7 @@ class ConsoleDisplay:
             name: Optional agent name
             model: Optional model name for right info
             additional_message: Optional additional styled message to append
+            pre_content: Optional additional styled message to prepend before body text
             render_markdown: Force markdown rendering (True) or plain rendering (False)
             show_hook_indicator: Whether to show the hook indicator glyph (◆)
         """
@@ -821,7 +850,7 @@ class ConsoleDisplay:
         # Extract text from PromptMessageExtended if needed
         from fast_agent.types import PromptMessageExtended
 
-        pre_content: Text | Group | None = None
+        resolved_pre_content = pre_content
 
         if isinstance(message_text, PromptMessageExtended):
             # Prefer full assistant text so streamed/finalized multi-block responses
@@ -832,7 +861,10 @@ class ConsoleDisplay:
                 or message_text.last_text()
                 or ""
             )
-            pre_content = self._extract_reasoning_content(message_text)
+            resolved_pre_content = self._merge_pre_content(
+                self._extract_reasoning_content(message_text),
+                pre_content,
+            )
         else:
             display_text = message_text
 
@@ -851,13 +883,24 @@ class ConsoleDisplay:
             max_item_length=max_item_length,
             truncate_content=False,  # Assistant messages shouldn't be truncated
             additional_message=additional_message,
-            pre_content=pre_content,
+            pre_content=resolved_pre_content,
             render_markdown=render_markdown,
             show_hook_indicator=show_hook_indicator,
         )
 
         # Handle mermaid diagrams separately (after the main message)
         self.show_mermaid_diagrams_from_message_text(message_text)
+
+    @staticmethod
+    def _merge_pre_content(
+        primary: Text | Group | None,
+        secondary: Text | Group | None,
+    ) -> Text | Group | None:
+        if primary is None:
+            return secondary
+        if secondary is None:
+            return primary
+        return Group(primary, Text("\n\n"), secondary)
 
     def show_mermaid_diagrams_from_message_text(
         self,

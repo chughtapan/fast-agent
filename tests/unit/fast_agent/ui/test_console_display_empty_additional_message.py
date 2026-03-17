@@ -2,6 +2,7 @@ import asyncio
 import json
 
 from mcp.types import CallToolResult, TextContent
+from rich.console import Group
 from rich.text import Text
 
 from fast_agent.constants import OPENAI_ASSISTANT_MESSAGE_ITEMS
@@ -126,6 +127,35 @@ def test_reasoning_then_text_has_single_blank_separator() -> None:
     assert "Thinking\n\n\nFinal answer" not in rendered
 
 
+def test_assistant_pre_content_renders_between_reasoning_and_final_answer() -> None:
+    display = ConsoleDisplay(config=None)
+
+    message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="Final answer")],
+        channels={
+            "reasoning": [
+                TextContent(type="text", text="Thinking"),
+            ]
+        },
+        stop_reason=LlmStopReason.END_TURN,
+    )
+    sources = Text("Sources\n [1] Example — https://example.com\n")
+
+    async def _render() -> str:
+        with console.console.capture() as capture:
+            await display.show_assistant_message(
+                message_text=message,
+                name="dev",
+                model="gpt-test",
+                pre_content=sources,
+            )
+        return capture.get()
+
+    rendered = asyncio.run(_render())
+    assert rendered.index("Thinking") < rendered.index("Sources") < rendered.index("Final answer")
+
+
 def test_openai_phase_blocks_render_with_friendly_labels_in_assistant_output() -> None:
     display = ConsoleDisplay(config=None)
 
@@ -173,3 +203,29 @@ def test_openai_phase_blocks_render_with_friendly_labels_in_assistant_output() -
     assert "Let me inspect that first." in rendered
     assert "Final Answer:" in rendered
     assert "Final answer" in rendered
+
+
+def test_openai_phase_blocks_use_renderable_group_for_dim_labels() -> None:
+    message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="Final answer")],
+        channels={
+            OPENAI_ASSISTANT_MESSAGE_ITEMS: [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "type": "message",
+                            "phase": "final_answer",
+                            "content": [{"type": "output_text", "text": "Final answer"}],
+                        }
+                    ),
+                ),
+            ]
+        },
+        stop_reason=LlmStopReason.END_TURN,
+    )
+
+    extracted = ConsoleDisplay._extract_openai_phase_content(message)
+
+    assert isinstance(extracted, Group)

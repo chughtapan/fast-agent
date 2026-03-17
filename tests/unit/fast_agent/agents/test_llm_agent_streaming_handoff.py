@@ -8,7 +8,7 @@ from mcp.types import TextContent
 
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.llm_agent import LlmAgent
-from fast_agent.constants import REASONING
+from fast_agent.constants import ANTHROPIC_CITATIONS_CHANNEL, REASONING
 from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
 from fast_agent.types.llm_stop_reason import LlmStopReason
 
@@ -203,6 +203,35 @@ async def test_generate_impl_preserves_streamed_frame_with_reasoning_channel() -
     assert handle.finalize_calls == [response]
     assert len(agent.shown_messages) == 1
     assert agent.shown_messages[0]["render_message"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_generate_impl_reprints_when_sources_need_pre_content() -> None:
+    handle = _FakeStreamHandle(has_scrolled=False, preserve_result=True)
+    response = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="answer")],
+        stop_reason=LlmStopReason.END_TURN,
+        channels={
+            ANTHROPIC_CITATIONS_CHANNEL: [
+                TextContent(
+                    type="text",
+                    text='{"title":"Example","url":"https://example.com"}',
+                )
+            ]
+        },
+    )
+    agent = _StreamingHarnessAgent(handle=handle, response=response)
+
+    result = await agent.generate_impl([_seed_message()])
+
+    assert result is response
+    assert handle.wait_for_drain_calls == 1
+    assert handle.preserve_called is False
+    assert handle.finalize_calls == [response]
+    assert len(agent.shown_messages) == 1
+    assert agent.shown_messages[0]["render_message"] is True
 
 
 @pytest.mark.unit

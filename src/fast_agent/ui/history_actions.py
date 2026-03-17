@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 from rich.text import Text
 
 from fast_agent.ui.citation_display import (
-    render_sources_additional_text,
+    render_sources_pre_content,
     web_tool_badges,
 )
 
@@ -102,6 +102,7 @@ async def display_history_turn(
                 shell_access=shell_access,
                 file_read=read_file_access,
             )
+            pre_content = render_sources_pre_content(message)
             display_message = message
 
             badges = web_tool_badges(message)
@@ -111,14 +112,6 @@ async def display_history_turn(
                     badge_text
                     if additional_message is None
                     else Text.assemble(additional_message, badge_text)
-                )
-
-            sources_text = render_sources_additional_text(message)
-            if sources_text is not None:
-                additional_message = (
-                    sources_text
-                    if additional_message is None
-                    else Text.assemble(additional_message, sources_text)
                 )
 
             bottom_items = badges or None
@@ -136,6 +129,7 @@ async def display_history_turn(
                 bottom_items=bottom_items,
                 highlight_index=highlight_index,
                 additional_message=additional_message,
+                pre_content=pre_content,
             )
 
             if tool_calls:

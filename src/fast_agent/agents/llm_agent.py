@@ -34,7 +34,7 @@ from fast_agent.types import PromptMessageExtended, RequestParams
 from fast_agent.types.llm_stop_reason import LlmStopReason
 from fast_agent.ui.citation_display import (
     collect_citation_sources,
-    render_sources_additional_text,
+    render_sources_pre_content,
     web_tool_badges,
 )
 from fast_agent.ui.console_display import ConsoleDisplay
@@ -150,14 +150,20 @@ class LlmAgent(LlmDecorator):
         if caller_additional_segment is not None:
             additional_segments.append(caller_additional_segment)
 
-        metadata_segments, bottom_items, highlight_items = self._collect_post_turn_metadata(
-            message,
-            bottom_items=bottom_items,
-            highlight_items=highlight_items,
+        pre_segments, metadata_segments, bottom_items, highlight_items = (
+            self._collect_post_turn_metadata(
+                message,
+                bottom_items=bottom_items,
+                highlight_items=highlight_items,
+            )
         )
         additional_segments.extend(metadata_segments)
 
         additional_message_text = self._combine_additional_segments(additional_segments)
+        pre_content = self._combine_additional_segments(pre_segments)
+        status_message_text = self._combine_additional_segments(
+            [*pre_segments, *additional_segments]
+        )
         display_name = self._resolve_assistant_display_name(name)
         display_model = self._resolve_assistant_display_model(message=message, model=model)
         bottom_items, highlight_items = self._filter_bottom_metadata_for_tool_use(
@@ -178,12 +184,13 @@ class LlmAgent(LlmDecorator):
                 name=display_name,
                 model=display_model,
                 additional_message=additional_message_text,
+                pre_content=pre_content,
                 render_markdown=render_markdown,
                 show_hook_indicator=hook_indicator,
             )
         else:
-            if additional_message_text is not None:
-                self.display.show_status_message(additional_message_text)
+            if status_message_text is not None:
+                self.display.show_status_message(status_message_text)
             self.display.show_mermaid_diagrams_from_message_text(message_text)
         self._display_url_elicitations_from_history(display_name)
 
@@ -274,10 +281,11 @@ class LlmAgent(LlmDecorator):
         *,
         bottom_items: list[str] | None,
         highlight_items: str | list[str] | None,
-    ) -> tuple[list[Text], list[str] | None, str | list[str] | None]:
+    ) -> tuple[list[Text], list[Text], list[str] | None, str | list[str] | None]:
+        pre_segments: list[Text] = []
         additional_segments: list[Text] = []
         show_post_turn_metadata = self._should_show_post_turn_metadata(message)
-        sources_text = render_sources_additional_text(message) if show_post_turn_metadata else None
+        sources_text = render_sources_pre_content(message) if show_post_turn_metadata else None
         badge_items = web_tool_badges(message) if show_post_turn_metadata else []
         self._log_web_metadata_debug(
             message,
@@ -287,7 +295,7 @@ class LlmAgent(LlmDecorator):
         )
 
         if sources_text is not None:
-            additional_segments.append(sources_text)
+            pre_segments.append(sources_text)
 
         if badge_items:
             additional_segments.append(
@@ -301,7 +309,7 @@ class LlmAgent(LlmDecorator):
             if highlight_items is None:
                 highlight_items = badge_items[0]
 
-        return additional_segments, bottom_items, highlight_items
+        return pre_segments, additional_segments, bottom_items, highlight_items
 
     def _log_web_metadata_debug(
         self,
@@ -413,6 +421,8 @@ class LlmAgent(LlmDecorator):
         if message.stop_reason != LlmStopReason.END_TURN:
             return False
         if stream_handle.has_scrolled():
+            return False
+        if collect_citation_sources(message):
             return False
 
         display_text = message.all_text() or message.last_text() or ""
