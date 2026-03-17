@@ -12,6 +12,32 @@ from fast_agent.cli.commands.check_config import (
 from fast_agent.llm.model_selection import ModelSelectionCatalog
 from fast_agent.llm.provider_types import Provider
 
+OPENAI_FAMILY_PROVIDERS = (
+    Provider.OPENAI,
+    Provider.RESPONSES,
+    Provider.CODEX_RESPONSES,
+)
+
+
+def _collapse(text: str) -> str:
+    return "".join(text.split())
+
+
+def _current_catalog_models(providers: tuple[Provider, ...]) -> set[str]:
+    models: set[str] = set()
+    for provider in providers:
+        models.update(ModelSelectionCatalog.list_current_models(provider))
+    return models
+
+
+def _first_additional_model(providers: tuple[Provider, ...]) -> str:
+    current_models = _current_catalog_models(providers)
+    for provider in providers:
+        for model in ModelSelectionCatalog.list_all_models(provider):
+            if model not in current_models:
+                return model
+    raise AssertionError("expected at least one non-curated model in provider catalog")
+
 
 def test_show_check_summary_points_to_check_models_command(tmp_path: Path, capsys) -> None:
     env_dir = tmp_path / ".fast-agent"
@@ -39,20 +65,24 @@ def test_show_provider_model_catalog_openai_defaults_to_curated_aliases(capsys) 
     show_provider_model_catalog("openai")
 
     output = capsys.readouterr().out
-    collapsed_output = "".join(output.split())
+    collapsed_output = _collapse(output)
     assert "OpenAI model catalog (curated)" in output
     assert "Tags" in output
     assert "fast" in output
     assert "OpenAI" in output
     assert "Responses" in output
     assert "Codex Responses" in output
+    assert "All known models" not in output
 
-    for provider in (Provider.OPENAI, Provider.RESPONSES, Provider.CODEX_RESPONSES):
+    for provider in OPENAI_FAMILY_PROVIDERS:
+        current_entry = ModelSelectionCatalog.list_current_entries(provider)[0]
         fast_entry = next(
             entry for entry in ModelSelectionCatalog.list_current_entries(provider) if entry.fast
         )
+        assert current_entry.alias in output
+        assert _collapse(current_entry.model) in collapsed_output
         assert fast_entry.alias in output
-        assert "".join(fast_entry.model.split()) in collapsed_output
+        assert _collapse(fast_entry.model) in collapsed_output
 
     assert "More models are available" in output
 
@@ -61,12 +91,13 @@ def test_show_provider_model_catalog_openai_all_includes_openai_family(capsys) -
     show_provider_model_catalog("openai", show_all=True)
 
     output = capsys.readouterr().out
+    collapsed_output = _collapse(output)
+    additional_model = _first_additional_model(OPENAI_FAMILY_PROVIDERS)
+
     assert "OpenAI model catalog (curated + all models)" in output
     assert "All known models" in output
     assert "catalog" in output
-    assert "gpt-4.1" in output
-    assert "o1" in output
-    assert "gpt-5.3-codex-spark" in output
+    assert _collapse(additional_model) in collapsed_output
 
 
 def test_show_models_overview_includes_provider_args_and_named_aliases(
