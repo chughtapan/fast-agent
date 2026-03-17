@@ -21,6 +21,15 @@ Updated after implementation progress:
   `AgentMCPServer`, and `prompt-server`
 - server-side SSE tests/examples/docs were pruned or converted to HTTP
 - client-side SSE handling remains intentionally unchanged
+- `fastmcp==3.1.1` was added as an explicit dependency alongside retained direct `mcp` usage
+- `AgentMCPServer` now runs on FastMCP 3 public HTTP/stdio APIs, uses typed prompt messages,
+  and wires Hugging Face auth through FastMCP auth providers plus `http_app()`
+- prompt-server now registers prompts via FastMCP 3 `Prompt.from_function(...)`/`add_prompt()`
+  with explicit dynamic signatures and HTTP/stdio startup via `run_http_async()`/`run_stdio_async()`
+- local function tools now use native `fastmcp.tools.FunctionTool`/`ToolResult` end-to-end,
+  with fast-agent translating results at its own MCP boundaries
+- bundled examples, packaged example resources, and relevant MCP fixtures/tests were swept off
+  `mcp.server.fastmcp` imports and updated for FastMCP 3 constructor/runtime rules
 
 ## Decision summary
 
@@ -319,6 +328,8 @@ Primary tests to update/run:
 
 ### Phase 2 — prompt server migration
 
+Status: **completed**
+
 Files:
 - `src/fast_agent/mcp/prompts/prompt_server.py`
 - `src/fast_agent/mcp/prompts/prompt_load.py`
@@ -358,6 +369,8 @@ Primary tests:
 
 ### Phase 3 — native tool migration
 
+Status: **completed**
+
 Files:
 - `src/fast_agent/tools/function_tool_loader.py`
 - `src/fast_agent/agents/tool_agent.py`
@@ -391,6 +404,8 @@ Primary tests:
 - any integration tests that call local FastMCP-backed tools through `ToolAgent`
 
 ### Phase 4 — example/resource/test sweep
+
+Status: **completed**
 
 Files:
 - `examples/...`
@@ -452,6 +467,8 @@ Acceptance:
 
 ### PR 2 — FastMCP 3 foundation + `serve` runtime
 
+Status: **completed**
+
 Scope:
 - `pyproject.toml`
 - migrate `AgentMCPServer` to FastMCP 3 public APIs
@@ -466,6 +483,8 @@ Acceptance:
 
 ### PR 3 — prompt server migration
 
+Status: **completed**
+
 Scope:
 - prompt-server runtime and prompt registration
 - confirm prompt-server remains HTTP/stdio-only after PR 1
@@ -476,6 +495,8 @@ Acceptance:
 - dynamic prompt vars still render correctly
 
 ### PR 4 — native tool migration + example sweep
+
+Status: **completed**
 
 Scope:
 - native tool migration
@@ -515,7 +536,6 @@ Likely targeted test groups during migration:
 
 ## Recommended next step
 
-Start with **PR 2**:
-- add `fastmcp==3.1.1`
-- migrate `AgentMCPServer` imports/runtime/auth wiring to FastMCP 3 public APIs
-- keep the diff focused on server runtime now that the transport matrix is smaller
+Migration implementation is complete. Remaining follow-up, if desired, is normal cleanup:
+- trim the unrelated pre-existing `ty` warning comments noted by `scripts/typecheck.py`
+- decide whether any additional docs/changelog notes should be written around the FastMCP 3 break
