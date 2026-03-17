@@ -170,11 +170,6 @@ class ModelSelectionCatalog:
                 fast=True,
             ),
             CatalogModelEntry(
-                alias="gpt-5.4-nano",
-                model="codexresponses.gpt-5.4-nano?reasoning=medium",
-                fast=True,
-            ),
-            CatalogModelEntry(
                 alias="codexplan52",
                 model="codexresponses.gpt-5.2-codex?reasoning=high",
             ),
