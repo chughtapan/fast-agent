@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
+import pytest
+
 from fast_agent.llm.model_database import ModelDatabase
 from fast_agent.llm.model_overlays import load_model_overlay_registry
 from fast_agent.llm.model_selection import ModelSelectionCatalog
@@ -25,6 +27,14 @@ def _write_overlay(env_dir: "Path", name: str, *, provider: str, model: str) -> 
         ),
         encoding="utf-8",
     )
+
+
+def _static_current_entries(provider: Provider) -> list:
+    return [
+        entry
+        for entry in ModelSelectionCatalog.CATALOG_ENTRIES_BY_PROVIDER[provider]
+        if entry.current
+    ]
 
 
 def test_list_curated_models_for_provider() -> None:
@@ -51,22 +61,51 @@ def test_legacy_aliases_are_listed_but_not_curated() -> None:
 
 
 def test_list_fast_models_uses_explicit_curated_designation() -> None:
-    def _expected_fast_models(provider: Provider) -> list[str]:
-        return [
-            entry.model
-            for entry in ModelSelectionCatalog.CATALOG_ENTRIES_BY_PROVIDER[provider]
-            if entry.current and entry.fast
+    for provider in (Provider.ANTHROPIC, Provider.CODEX_RESPONSES, Provider.HUGGINGFACE):
+        assert ModelSelectionCatalog.list_fast_models(provider) == [
+            entry.model for entry in _static_current_entries(provider) if entry.fast
         ]
 
-    assert ModelSelectionCatalog.list_fast_models(Provider.ANTHROPIC) == _expected_fast_models(
-        Provider.ANTHROPIC
-    )
-    assert ModelSelectionCatalog.list_fast_models(
-        Provider.CODEX_RESPONSES
-    ) == _expected_fast_models(Provider.CODEX_RESPONSES)
-    assert ModelSelectionCatalog.list_fast_models(
-        Provider.HUGGINGFACE
-    ) == _expected_fast_models(Provider.HUGGINGFACE)
+
+@pytest.mark.parametrize(
+    "provider",
+    (
+        Provider.ANTHROPIC,
+        Provider.GOOGLE,
+        Provider.HUGGINGFACE,
+        Provider.CODEX_RESPONSES,
+    ),
+)
+def test_current_catalog_helpers_project_current_entries(provider: Provider) -> None:
+    current_entries = _static_current_entries(provider)
+
+    assert ModelSelectionCatalog.list_current_aliases(provider) == [
+        entry.alias for entry in current_entries
+    ]
+    assert ModelSelectionCatalog.list_current_models(provider) == [
+        entry.model for entry in current_entries
+    ]
+    assert ModelSelectionCatalog.list_fast_models(provider) == [
+        entry.model for entry in current_entries if entry.fast
+    ]
+
+
+@pytest.mark.parametrize(
+    "provider",
+    (
+        Provider.ANTHROPIC,
+        Provider.GOOGLE,
+        Provider.HUGGINGFACE,
+        Provider.CODEX_RESPONSES,
+    ),
+)
+def test_curated_helpers_alias_current_helpers(provider: Provider) -> None:
+    assert ModelSelectionCatalog.list_curated_aliases(
+        provider
+    ) == ModelSelectionCatalog.list_current_aliases(provider)
+    assert ModelSelectionCatalog.list_curated_models(
+        provider
+    ) == ModelSelectionCatalog.list_current_models(provider)
 
 
 def test_is_fast_model_normalizes_provider_prefix() -> None:
