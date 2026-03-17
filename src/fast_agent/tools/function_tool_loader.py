@@ -1,20 +1,18 @@
 """
 Dynamic function tool loader.
 
-Loads Python functions from files for use as agent tools.
+Loads Python functions from files for use as native FastMCP tools.
 Supports both direct callables and string specs like "module.py:function_name".
 """
 
-import asyncio
 import importlib.util
+import inspect
 from collections.abc import Callable
+from functools import wraps
 from pathlib import Path
-from typing import Any, Self, cast
+from typing import Any
 
-from mcp.server.fastmcp.exceptions import ToolError
-from mcp.server.fastmcp.tools.base import Tool as BaseFastMCPTool
-from mcp.shared.exceptions import UrlElicitationRequiredError
-from mcp.types import Icon, ToolAnnotations
+from fastmcp.tools import FunctionTool, ToolResult
 
 from fast_agent.core.exceptions import AgentConfigError
 from fast_agent.core.logging.logger import get_logger
@@ -22,81 +20,60 @@ from fast_agent.core.logging.logger import get_logger
 logger = get_logger(__name__)
 
 
-class FastMCPTool(BaseFastMCPTool):
-    """fast-agent wrapper around FastMCP tools.
+def _as_default_tool_result(raw: Any) -> ToolResult:
+    if isinstance(raw, ToolResult):
+        return raw
+    if raw is None:
+        return ToolResult(content=[])
+    return ToolResult(content=raw)
 
-    FastMCP executes synchronous tool functions inline. For local Python function
-    tools that can block on I/O or long-running computation, that would block the
-    MCP server event loop and serialize otherwise independent requests.
 
-    This override preserves FastMCP's schema/validation behavior while offloading
-    synchronous tool bodies to a worker thread.
+def _wrap_default_tool_result(fn: Callable[..., Any]) -> Callable[..., Any]:
+    if inspect.iscoroutinefunction(fn):
+
+        @wraps(fn)
+        async def async_wrapped(*args: Any, **kwargs: Any) -> ToolResult:
+            raw = await fn(*args, **kwargs)
+            return _as_default_tool_result(raw)
+
+        async_wrapped.__signature__ = inspect.signature(fn)  # type: ignore[attr-defined]
+        return async_wrapped
+
+    @wraps(fn)
+    def sync_wrapped(*args: Any, **kwargs: Any) -> ToolResult | Any:
+        raw = fn(*args, **kwargs)
+        if inspect.isawaitable(raw):
+
+            async def await_and_wrap() -> ToolResult:
+                awaited = await raw
+                return _as_default_tool_result(awaited)
+
+            return await_and_wrap()
+        return _as_default_tool_result(raw)
+
+    sync_wrapped.__signature__ = inspect.signature(fn)  # type: ignore[attr-defined]
+    return sync_wrapped
+
+
+def build_default_function_tool(
+    fn: Callable[..., Any],
+    *,
+    name: str | None = None,
+    description: str | None = None,
+) -> FunctionTool:
     """
+    Build a FastMCP FunctionTool with fast-agent's text-only-by-default policy.
 
-    @classmethod
-    def from_function(
-        cls,
-        fn: Callable[..., Any],
-        name: str | None = None,
-        title: str | None = None,
-        description: str | None = None,
-        context_kwarg: str | None = None,
-        annotations: ToolAnnotations | None = None,
-        icons: list[Icon] | None = None,
-        meta: dict[str, Any] | None = None,
-        structured_output: bool | None = None,
-    ) -> Self:
-        return cast(
-            "Self",
-            super().from_function(
-                fn,
-                name=name,
-                title=title,
-                description=description,
-                context_kwarg=context_kwarg,
-                annotations=annotations,
-                icons=icons,
-                meta=meta,
-                structured_output=structured_output,
-            ),
-        )
-
-    async def run(
-        self,
-        arguments: dict[str, Any],
-        context: Any | None = None,
-        convert_result: bool = False,
-    ) -> Any:
-        """Run the tool with validated arguments.
-
-        Async functions are awaited directly.
-        Sync functions are executed via ``asyncio.to_thread`` to keep the event
-        loop responsive while preserving validated argument and context injection.
-        """
-
-        try:
-            arguments_pre_parsed = self.fn_metadata.pre_parse_json(arguments)
-            arguments_parsed_model = self.fn_metadata.arg_model.model_validate(
-                arguments_pre_parsed
-            )
-            arguments_parsed_dict = arguments_parsed_model.model_dump_one_level()
-
-            if self.context_kwarg is not None:
-                arguments_parsed_dict[self.context_kwarg] = context
-
-            if self.is_async:
-                result = await self.fn(**arguments_parsed_dict)
-            else:
-                result = await asyncio.to_thread(self.fn, **arguments_parsed_dict)
-
-            if convert_result:
-                result = self.fn_metadata.convert_result(result)
-
-            return result
-        except UrlElicitationRequiredError:
-            raise
-        except Exception as exc:
-            raise ToolError(f"Error executing tool {self.name}: {exc}") from exc
+    Plain callable return values are wrapped as ``ToolResult(content=...)`` so FastMCP
+    preserves normal content rendering while suppressing implicit structured output.
+    Explicit ``ToolResult`` returns pass through unchanged.
+    """
+    return FunctionTool.from_function(
+        _wrap_default_tool_result(fn),
+        name=name,
+        description=description,
+        output_schema=None,
+    )
 
 
 def load_function_from_spec(spec: str, base_path: Path | None = None) -> Callable[..., Any]:
@@ -122,7 +99,6 @@ def load_function_from_spec(spec: str, base_path: Path | None = None) -> Callabl
     module_path_str, func_name = spec.rsplit(":", 1)
     module_path = Path(module_path_str)
 
-    # Resolve relative paths
     if not module_path.is_absolute():
         if base_path is not None:
             module_path = (base_path / module_path).resolve()
@@ -135,10 +111,7 @@ def load_function_from_spec(spec: str, base_path: Path | None = None) -> Callabl
             f"Resolved path: {module_path}",
         )
 
-    # Generate a unique module name to avoid conflicts
     module_name = f"_function_tool_{module_path.stem}_{id(spec)}"
-
-    # Load the module dynamically
     spec_obj = importlib.util.spec_from_file_location(module_name, module_path)
     if spec_obj is None or spec_obj.loader is None:
         raise AgentConfigError(
@@ -155,7 +128,6 @@ def load_function_from_spec(spec: str, base_path: Path | None = None) -> Callabl
             str(exc),
         ) from exc
 
-    # Get the function from the module
     if not hasattr(module, func_name):
         raise AgentConfigError(
             f"Function '{func_name}' not found for '{spec}'",
@@ -175,7 +147,7 @@ def load_function_from_spec(spec: str, base_path: Path | None = None) -> Callabl
 def load_function_tools(
     tools_config: list[Callable[..., Any] | str] | None,
     base_path: Path | None = None,
-) -> list[FastMCPTool]:
+) -> list[FunctionTool]:
     """
     Load function tools from a config list.
 
@@ -186,26 +158,24 @@ def load_function_tools(
         base_path: Base path for resolving relative module paths in string specs.
 
     Returns:
-        List of FastMCPTool objects ready for use with an agent.
+        List of native FunctionTool objects ready for use with an agent.
     """
     if not tools_config:
         return []
 
-    result: list[FastMCPTool] = []
-
+    result: list[FunctionTool] = []
     for tool_spec in tools_config:
         try:
             if callable(tool_spec):
-                # Direct callable - wrap it
-                result.append(FastMCPTool.from_function(tool_spec))
+                result.append(build_default_function_tool(tool_spec))
             elif isinstance(tool_spec, str):
-                # String spec - load and wrap
-                func = load_function_from_spec(tool_spec, base_path)
-                result.append(FastMCPTool.from_function(func))
+                result.append(
+                    build_default_function_tool(load_function_from_spec(tool_spec, base_path))
+                )
             else:
                 logger.warning(f"Skipping invalid function tool config: {tool_spec}")
-        except Exception as e:
-            logger.error(f"Failed to load function tool '{tool_spec}': {e}")
+        except Exception as exc:
+            logger.error(f"Failed to load function tool '{tool_spec}': {exc}")
             raise
 
     return result

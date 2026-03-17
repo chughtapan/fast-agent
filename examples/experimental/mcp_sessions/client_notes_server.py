@@ -25,7 +25,8 @@ from _session_base import (
     run_server,
     session_metadata_from_meta,
 )
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
+from fastmcp.tools import ToolResult
 from mcp.shared.exceptions import McpError
 
 
@@ -75,7 +76,7 @@ def _session_meta(record: SessionRecord, state: str) -> dict[str, dict[str, str]
 
 
 def build_server() -> FastMCP:
-    mcp = FastMCP("client-notes", log_level="WARNING")
+    mcp = FastMCP("client-notes")
     sessions = SessionStore(include_state=True)
     lowlevel = mcp._mcp_server
     register_session_handlers(lowlevel, sessions)
@@ -99,20 +100,20 @@ def build_server() -> FastMCP:
     lowlevel.request_handlers[CreateSessionRequest] = _handle_session_create
 
     @mcp.tool(name="client_notes_add")
-    async def client_notes_add(ctx: Context, text: str) -> types.CallToolResult:
+    async def client_notes_add(ctx: Context, text: str) -> ToolResult:
         """Append a note in client-managed session state."""
         record = require_session(ctx, sessions)
         notes = _decode_notes_state(_incoming_state(ctx, record))
         notes.append(text)
         record.tool_calls += 1
         state = _encode_notes_state(notes)
-        return types.CallToolResult(
+        return ToolResult(
             content=[types.TextContent(type="text", text=f"Added note #{len(notes)}: {text}")],
-            _meta=_session_meta(record, state),
+            meta=_session_meta(record, state),
         )
 
     @mcp.tool(name="client_notes_list")
-    async def client_notes_list(ctx: Context) -> types.CallToolResult:
+    async def client_notes_list(ctx: Context) -> ToolResult:
         """List notes from client-managed session state."""
         record = require_session(ctx, sessions)
         notes = _decode_notes_state(_incoming_state(ctx, record))
@@ -123,32 +124,32 @@ def build_server() -> FastMCP:
         else:
             text = "(client notes are empty)"
         state = _encode_notes_state(notes)
-        return types.CallToolResult(
+        return ToolResult(
             content=[types.TextContent(type="text", text=text)],
-            _meta=_session_meta(record, state),
+            meta=_session_meta(record, state),
         )
 
     @mcp.tool(name="client_notes_clear")
-    async def client_notes_clear(ctx: Context) -> types.CallToolResult:
+    async def client_notes_clear(ctx: Context) -> ToolResult:
         """Clear notes stored in client-managed session state."""
         record = require_session(ctx, sessions)
         notes = _decode_notes_state(_incoming_state(ctx, record))
         removed = len(notes)
         record.tool_calls += 1
         state = _encode_notes_state([])
-        return types.CallToolResult(
+        return ToolResult(
             content=[types.TextContent(type="text", text=f"Cleared {removed} client notes.")],
-            _meta=_session_meta(record, state),
+            meta=_session_meta(record, state),
         )
 
     @mcp.tool(name="client_notes_status")
-    async def client_notes_status(ctx: Context) -> types.CallToolResult:
+    async def client_notes_status(ctx: Context) -> ToolResult:
         """Show session status and decoded client note count."""
         record = require_session(ctx, sessions)
         notes = _decode_notes_state(_incoming_state(ctx, record))
         record.tool_calls += 1
         state = _encode_notes_state(notes)
-        return types.CallToolResult(
+        return ToolResult(
             content=[
                 types.TextContent(
                     type="text",
@@ -158,7 +159,7 @@ def build_server() -> FastMCP:
                     ),
                 )
             ],
-            _meta=_session_meta(record, state),
+            meta=_session_meta(record, state),
         )
 
     return mcp

@@ -49,6 +49,16 @@ class ModelSelectionCatalog:
         Provider.RESPONSES: (
             CatalogModelEntry(alias="gpt-5.4", model="responses.gpt-5.4?reasoning=medium"),
             CatalogModelEntry(
+                alias="gpt-5.4-mini",
+                model="responses.gpt-5.4-mini?reasoning=medium",
+                fast=True,
+            ),
+            CatalogModelEntry(
+                alias="gpt-5.4-nano",
+                model="responses.gpt-5.4-nano?reasoning=medium",
+                fast=True,
+            ),
+            CatalogModelEntry(
                 alias="gpt-5.3-chat-latest",
                 model="responses.gpt-5.3-chat-latest?transport=auto",
             ),
@@ -56,12 +66,6 @@ class ModelSelectionCatalog:
                 alias="gpt-5.3-codex", model="responses.gpt-5.3-codex?reasoning=high"
             ),
             CatalogModelEntry(alias="gpt-5.2", model="responses.gpt-5.2?reasoning=medium"),
-            CatalogModelEntry(
-                alias="gpt-5-mini",
-                model="responses.gpt-5-mini?reasoning=low",
-                fast=True,
-            ),
-            CatalogModelEntry(alias="gpt-5-nano", model="responses.gpt-5-nano?reasoning=medium"),
         ),
         Provider.OPENAI: (
             CatalogModelEntry(alias="gpt-4.1", model="openai.gpt-4.1"),
@@ -161,6 +165,16 @@ class ModelSelectionCatalog:
                 fast=True,
             ),
             CatalogModelEntry(
+                alias="gpt-5.4-mini",
+                model="codexresponses.gpt-5.4-mini?reasoning=medium",
+                fast=True,
+            ),
+            CatalogModelEntry(
+                alias="gpt-5.4-nano",
+                model="codexresponses.gpt-5.4-nano?reasoning=medium",
+                fast=True,
+            ),
+            CatalogModelEntry(
                 alias="codexplan52",
                 model="codexresponses.gpt-5.2-codex?reasoning=high",
             ),
@@ -214,8 +228,7 @@ class ModelSelectionCatalog:
         env_dir: str | Path | None = None,
     ) -> dict[Provider, tuple[CatalogModelEntry, ...]]:
         provider_map = {
-            provider: list(entries)
-            for provider, entries in cls.CATALOG_ENTRIES_BY_PROVIDER.items()
+            provider: list(entries) for provider, entries in cls.CATALOG_ENTRIES_BY_PROVIDER.items()
         }
         overlay_registry = cls._resolve_overlay_registry(
             overlay_registry,
@@ -518,7 +531,9 @@ class ModelSelectionCatalog:
             current_models = tuple(
                 cls._dedupe_preserve_order(
                     [
-                        *cls.list_current_models(provider, overlay_registry=resolved_overlay_registry),
+                        *cls.list_current_models(
+                            provider, overlay_registry=resolved_overlay_registry
+                        ),
                         *discovered.current_models,
                     ]
                 )

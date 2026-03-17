@@ -28,7 +28,7 @@ def test_run_async_agent_passes_serve_mode() -> None:
         environment_dir=None,
         shell_enabled=False,
         mode="serve",
-        transport="sse",
+        transport="http",
         host="127.0.0.1",
         port=9123,
         tool_description="Send requests to {agent}",
@@ -40,7 +40,7 @@ def test_run_async_agent_passes_serve_mode() -> None:
     )
 
     assert run_kwargs["mode"] == "serve"
-    assert run_kwargs["transport"] == "sse"
+    assert run_kwargs["transport"] == "http"
     assert run_kwargs["host"] == "127.0.0.1"
     assert run_kwargs["port"] == 9123
     assert run_kwargs["tool_description"] == "Send requests to {agent}"

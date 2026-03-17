@@ -34,6 +34,7 @@ class _CaptureDisplay(ConsoleDisplay):
         name: str | None = None,
         model: str | None = None,
         additional_message: Text | None = None,
+        pre_content=None,
         render_markdown: bool | None = None,
         show_hook_indicator: bool = False,
     ) -> None:
@@ -45,6 +46,7 @@ class _CaptureDisplay(ConsoleDisplay):
             "name": name,
             "model": model,
             "additional_message": additional_message,
+            "pre_content": pre_content,
             "render_markdown": render_markdown,
             "show_hook_indicator": show_hook_indicator,
         }
@@ -166,11 +168,15 @@ async def test_show_assistant_message_renders_web_metadata_for_final_turn() -> N
     assert len(capture_display.calls) == 1
     call = capture_display.calls[0]
     assert call.get("bottom_items") == ["web_search x1"]
+    pre_content = call.get("pre_content")
+    assert isinstance(pre_content, Text)
+    assert "Sources" in pre_content.plain
+    assert "done" not in pre_content.plain
 
     additional = call.get("additional_message")
     assert isinstance(additional, Text)
     plain = additional.plain
-    assert "Sources" in plain
+    assert "Sources" not in plain
     assert "Web activity: web_search x1" in plain
     assert call.get("highlight_index") == 0
 

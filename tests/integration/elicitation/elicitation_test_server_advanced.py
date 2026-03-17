@@ -5,17 +5,14 @@ Advanced test server for comprehensive elicitation functionality
 import logging
 import sys
 
-from mcp import (
-    ReadResourceResult,
-)
-from mcp.server.elicitation import (
+from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_context
+from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
     DeclinedElicitation,
 )
-from mcp.server.fastmcp import FastMCP
-from mcp.types import TextResourceContents
-from pydantic import AnyUrl, BaseModel, Field
+from pydantic import BaseModel, Field
 
 # Configure detailed logging
 logging.basicConfig(
@@ -26,14 +23,14 @@ logging.basicConfig(
 logger = logging.getLogger("elicitation_server_advanced")
 
 # Create MCP server
-mcp = FastMCP("MCP Advanced Elicitation Server", log_level="DEBUG")
+mcp = FastMCP("MCP Advanced Elicitation Server")
 
 
 @mcp.resource(uri="elicitation://client-capabilities")
-async def client_capabilities_resource() -> ReadResourceResult:
+async def client_capabilities_resource() -> str:
     """Expose the client capabilities received during initialization."""
 
-    ctx = mcp.get_context()
+    ctx = get_context()
 
     if not ctx.session.client_params:
         text = "No client initialization params available"
@@ -73,23 +70,17 @@ async def client_capabilities_resource() -> ReadResourceResult:
         text += f"\n\nClient Info: {client_info.name} v{client_info.version}"
         text += f"\nProtocol Version: {ctx.session.client_params.protocolVersion}"
 
-    return ReadResourceResult(
-        contents=[
-            TextResourceContents(
-                mimeType="text/plain", uri=AnyUrl("elicitation://client-capabilities"), text=text
-            )
-        ]
-    )
+    return text
 
 
 @mcp.resource(uri="elicitation://simple-rating")
-async def simple_rating() -> ReadResourceResult:
+async def simple_rating() -> str:
     """Simple boolean rating elicitation"""
 
     class ServerRating(BaseModel):
         rating: bool = Field(description="Do you like this server?")
 
-    result = await mcp.get_context().elicit("Please rate this server", schema=ServerRating)
+    result = await get_context().elicit("Please rate this server", ServerRating)
 
     match result:
         case AcceptedElicitation(data=data):
@@ -99,17 +90,11 @@ async def simple_rating() -> ReadResourceResult:
         case CancelledElicitation():
             response = "Rating cancelled"
 
-    return ReadResourceResult(
-        contents=[
-            TextResourceContents(
-                mimeType="text/plain", uri=AnyUrl("elicitation://simple-rating"), text=response
-            )
-        ]
-    )
+    return response
 
 
 @mcp.resource(uri="elicitation://user-profile")
-async def user_profile() -> ReadResourceResult:
+async def user_profile() -> str:
     """Complex form with multiple field types"""
 
     class UserProfile(BaseModel):
@@ -128,13 +113,13 @@ async def user_profile() -> ReadResourceResult:
                 ],
             },
         )
-        email: str | None = Field(
-            None, description="Your email address (optional)", json_schema_extra={"format": "email"}
+        email: str = Field(
+            "", description="Your email address (optional)", json_schema_extra={"format": "email"}
         )
         subscribe_newsletter: bool = Field(False, description="Subscribe to our newsletter?")
 
-    result = await mcp.get_context().elicit(
-        "Please provide your user profile information", schema=UserProfile
+    result = await get_context().elicit(
+        "Please provide your user profile information", UserProfile
     )
 
     match result:
@@ -152,17 +137,11 @@ async def user_profile() -> ReadResourceResult:
         case CancelledElicitation():
             response = "Profile cancelled"
 
-    return ReadResourceResult(
-        contents=[
-            TextResourceContents(
-                mimeType="text/plain", uri=AnyUrl("elicitation://user-profile"), text=response
-            )
-        ]
-    )
+    return response
 
 
 @mcp.resource(uri="elicitation://preferences")
-async def preferences() -> ReadResourceResult:
+async def preferences() -> str:
     """Enum-based preference selection"""
 
     class Preferences(BaseModel):
@@ -182,7 +161,7 @@ async def preferences() -> ReadResourceResult:
         )
         notifications: bool = Field(True, description="Enable notifications?")
 
-    result = await mcp.get_context().elicit("Configure your preferences", schema=Preferences)
+    result = await get_context().elicit("Configure your preferences", Preferences)
 
     match result:
         case AcceptedElicitation(data=data):
@@ -192,26 +171,20 @@ async def preferences() -> ReadResourceResult:
         case CancelledElicitation():
             response = "Preferences cancelled"
 
-    return ReadResourceResult(
-        contents=[
-            TextResourceContents(
-                mimeType="text/plain", uri=AnyUrl("elicitation://preferences"), text=response
-            )
-        ]
-    )
+    return response
 
 
 @mcp.resource(uri="elicitation://feedback")
-async def feedback() -> ReadResourceResult:
+async def feedback() -> str:
     """Feedback form with number ratings"""
 
     class Feedback(BaseModel):
         overall_rating: int = Field(description="Overall rating (1-5)", ge=1, le=5)
         ease_of_use: float = Field(description="Ease of use (0.0-10.0)", ge=0.0, le=10.0)
         would_recommend: bool = Field(description="Would you recommend to others?")
-        comments: str | None = Field(None, description="Additional comments", max_length=500)
+        comments: str = Field("", description="Additional comments", max_length=500)
 
-    result = await mcp.get_context().elicit("We'd love your feedback!", schema=Feedback)
+    result = await get_context().elicit("We'd love your feedback!", Feedback)
 
     match result:
         case AcceptedElicitation(data=data):
@@ -228,13 +201,7 @@ async def feedback() -> ReadResourceResult:
         case CancelledElicitation():
             response = "Feedback cancelled"
 
-    return ReadResourceResult(
-        contents=[
-            TextResourceContents(
-                mimeType="text/plain", uri=AnyUrl("elicitation://feedback"), text=response
-            )
-        ]
-    )
+    return response
 
 
 if __name__ == "__main__":

@@ -23,12 +23,13 @@ import logging
 import sys
 from typing import TYPE_CHECKING, Any
 
-from mcp.server.elicitation import (
+from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_context
+from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
     DeclinedElicitation,
 )
-from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
@@ -42,13 +43,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("blocking_elicitation_server")
 
-# Create MCP server (host/port are configured here, not in run())
-mcp = FastMCP(
-    "Blocking Elicitation Test Server",
-    log_level="DEBUG",
-    host="127.0.0.1",
-    port=8000,
-)
+# Create MCP server definition; bind settings are applied at run time.
+mcp = FastMCP("Blocking Elicitation Test Server")
 
 
 class DeploymentConfig(BaseModel):
@@ -73,12 +69,12 @@ async def deploy_associated() -> str:
     - Without fix: Client blocks, elicitation may timeout
     - With fix: Elicitation completes immediately
     """
-    ctx = mcp.get_context()
+    ctx = get_context()
     logger.info("deploy_associated: Sending elicitation via POST response SSE")
 
     result = await ctx.elicit(
         "Confirm deployment configuration (associated - via POST SSE)",
-        schema=DeploymentConfig,
+        DeploymentConfig,
     )
 
     match result:
@@ -110,7 +106,7 @@ async def deploy_dissociated() -> str:
     - Without fix: Client blocks, elicitation times out after ~20s
     - With fix: Elicitation completes immediately
     """
-    ctx = mcp.get_context()
+    ctx = get_context()
     session = ctx.request_context.session
 
     logger.info("deploy_dissociated: Sending elicitation via GET stream (no related_request_id)")
@@ -169,5 +165,4 @@ if __name__ == "__main__":
     logger.info("  - deploy_associated: Elicitation via POST response SSE")
     logger.info("  - deploy_dissociated: Elicitation via GET stream")
     logger.info("  - ping: Basic connectivity test")
-    mcp.run(transport="streamable-http")
-
+    mcp.run(transport="http", host="127.0.0.1", port=8000)

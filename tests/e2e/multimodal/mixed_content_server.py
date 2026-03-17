@@ -13,7 +13,7 @@ used to cause OpenAI API validation errors before the fix.
 import base64
 import logging
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
 # Configure logging
@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Create the FastMCP server
-app = FastMCP(name="MixedContentServer", debug=True)
+app = FastMCP(name="MixedContentServer")
 
 
 @app.tool(

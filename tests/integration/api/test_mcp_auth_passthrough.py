@@ -79,7 +79,7 @@ async def _call_worker_tool(
         FAST_AGENT_OAUTH_RESOURCE_URL="http://testserver",
     ):
         server = await _build_server()
-        starlette_app = server.mcp_server.streamable_http_app()
+        starlette_app = server.http_app()
         transport_app = (
             HFAuthHeaderMiddleware(starlette_app) if wrap_hf_auth_headers else starlette_app
         )

@@ -9,6 +9,8 @@ from fast_agent.cli.commands.check_config import (
     show_models_overview,
     show_provider_model_catalog,
 )
+from fast_agent.llm.model_selection import ModelSelectionCatalog
+from fast_agent.llm.provider_types import Provider
 
 
 def test_show_check_summary_points_to_check_models_command(tmp_path: Path, capsys) -> None:
@@ -37,17 +39,21 @@ def test_show_provider_model_catalog_openai_defaults_to_curated_aliases(capsys) 
     show_provider_model_catalog("openai")
 
     output = capsys.readouterr().out
+    collapsed_output = "".join(output.split())
     assert "OpenAI model catalog (curated)" in output
     assert "Tags" in output
     assert "fast" in output
     assert "OpenAI" in output
     assert "Responses" in output
     assert "Codex Responses" in output
-    assert "gpt-4.1-mini" in output
-    assert "openai.gpt-4.1-mini" in output
-    assert "gpt-5-mini" in output
-    assert "responses.gpt-5-mini" in output
-    assert "codexspark" in output
+
+    for provider in (Provider.OPENAI, Provider.RESPONSES, Provider.CODEX_RESPONSES):
+        fast_entry = next(
+            entry for entry in ModelSelectionCatalog.list_current_entries(provider) if entry.fast
+        )
+        assert fast_entry.alias in output
+        assert "".join(fast_entry.model.split()) in collapsed_output
+
     assert "More models are available" in output
 
 

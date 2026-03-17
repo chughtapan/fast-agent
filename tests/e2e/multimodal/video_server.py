@@ -6,7 +6,7 @@ Simple MCP server that returns ResourceLinks to video content for testing.
 import logging
 import sys
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import ResourceLink, TextContent
 
 from fast_agent.mcp.helpers.content_helpers import text_content, video_link
@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Create the FastMCP server
-app = FastMCP(name="VideoLinkServer", debug=True)
+app = FastMCP(name="VideoLinkServer")
 
 # Global variable to store the video URL
 video_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # Mystery Video
@@ -25,7 +25,7 @@ video_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # Mystery Video
 @app.tool(
     name="get_video_link",
     description="Returns a ResourceLink to a sample video for analysis",
-    structured_output=False,
+    output_schema=None,
 )
 async def get_video_link() -> list[TextContent | ResourceLink]:
     """Return a ResourceLink to a video."""

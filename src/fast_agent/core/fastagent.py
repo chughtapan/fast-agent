@@ -230,20 +230,20 @@ class FastAgent(DecoratorMixin):
             )
             parser.add_argument(
                 "--transport",
-                choices=["sse", "http", "stdio", "acp"],
+                choices=["http", "stdio", "acp"],
                 default=None,
-                help="Transport protocol to use when running as a server (sse, http, stdio, or acp)",
+                help="Transport protocol to use when running as a server (http, stdio, or acp)",
             )
             parser.add_argument(
                 "--port",
                 type=int,
                 default=8000,
-                help="Port to use when running as a server with SSE transport",
+                help="Port to use when running as a server with HTTP transport",
             )
             parser.add_argument(
                 "--host",
                 default="0.0.0.0",
-                help="Host address to bind to when running as a server with SSE transport",
+                help="Host address to bind to when running as a server with HTTP transport",
             )
             parser.add_argument(
                 "--instance-scope",
@@ -2043,7 +2043,7 @@ class FastAgent(DecoratorMixin):
     def _print_server_startup(self, output_stream: Any) -> None:
         print(f"Starting fast-agent  '{self.name}' in server mode", file=output_stream)
         print(f"Transport: {self.args.transport}", file=output_stream)
-        if self.args.transport == "sse":
+        if self.args.transport == "http":
             print(f"Listening on {self.args.host}:{self.args.port}", file=output_stream)
         print("Press Ctrl+C to stop", file=output_stream)
 
@@ -2604,9 +2604,9 @@ class FastAgent(DecoratorMixin):
         It is a blocking method that runs until the server is stopped.
 
         Args:
-            transport: Transport protocol to use ("stdio" or "sse")
-            host: Host address for the server when using SSE
-            port: Port for the server when using SSE
+            transport: Transport protocol to use ("http" or "stdio")
+            host: Host address for the server when using HTTP
+            port: Port for the server when using HTTP
             server_name: Optional custom name for the MCP server
             server_description: Optional description/instructions for the MCP server
             tool_description: Optional description template for the exposed send tool.
@@ -2663,10 +2663,9 @@ class FastAgent(DecoratorMixin):
         if original_args:
             self.args = original_args
 
-    # Keep run_with_mcp_server for backward compatibility
     async def run_with_mcp_server(
         self,
-        transport: str = "sse",
+        transport: str = "http",
         host: str = "0.0.0.0",
         port: int = 8000,
         server_name: str | None = None,
@@ -2677,13 +2676,11 @@ class FastAgent(DecoratorMixin):
     ) -> None:
         """
         Run the application and expose agents through an MCP server.
-        This method is kept for backward compatibility.
-        For new code, use start_server() instead.
 
         Args:
-            transport: Transport protocol to use ("stdio" or "sse")
-            host: Host address for the server when using SSE
-            port: Port for the server when using SSE
+            transport: Transport protocol to use ("http" or "stdio")
+            host: Host address for the server when using HTTP
+            port: Port for the server when using HTTP
             server_name: Optional custom name for the MCP server
             server_description: Optional description/instructions for the MCP server
             tool_description: Optional description template for the exposed send tool.

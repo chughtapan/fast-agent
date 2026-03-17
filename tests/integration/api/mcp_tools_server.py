@@ -5,7 +5,7 @@ Simple MCP server that responds to tool calls with text and image content.
 
 import logging
 
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

@@ -10,12 +10,13 @@ Note: Following MCP spec, we don't collect sensitive information like passwords.
 import logging
 import sys
 
-from mcp.server.elicitation import (
+from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_context
+from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
     DeclinedElicitation,
 )
-from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
 # Configure logging
@@ -27,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger("elicitation_account_server")
 
 # Create MCP server
-mcp = FastMCP("Account Creation Server", log_level="INFO")
+mcp = FastMCP("Account Creation Server")
 
 
 @mcp.tool()
@@ -67,8 +68,8 @@ async def create_user_account(service_name: str = "MyApp") -> str:
         agree_terms: bool = Field(description="I agree to the terms of service")
         marketing_emails: bool = Field(False, description="Send me product updates")
 
-    result = await mcp.get_context().elicit(
-        f"Create Your {service_name} Account", schema=AccountSignup
+    result = await get_context().elicit(
+        f"Create Your {service_name} Account", AccountSignup
     )
 
     match result:

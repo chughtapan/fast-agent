@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any, TypedDict, cast
 
 import pytest
+from fastmcp.tools import FunctionTool, ToolResult
 from mcp.types import (
     CallToolRequest,
     CallToolRequestParams,
@@ -47,6 +48,7 @@ class CaptureDisplay(ConsoleDisplay):
         name: str | None = None,
         model: str | None = None,
         additional_message: Text | None = None,
+        pre_content=None,
         render_markdown: bool | None = None,
         show_hook_indicator: bool = False,
     ) -> None:
@@ -126,6 +128,76 @@ async def test_local_tools_listed_and_callable() -> None:
     assert result.content[0].type == "text"
     assert isinstance(result.content[0], TextContent)
     assert result.content[0].text == "transcript for 1234"
+    assert result.structuredContent is None
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+async def test_local_plain_dict_tool_suppresses_structured_content() -> None:
+    def summarize() -> dict[str, str]:
+        return {"status": "ok"}
+
+    agent = McpAgent(
+        config=_make_agent_config(),
+        connection_persistence=False,
+        context=Context(),
+        tools=[summarize],
+    )
+
+    result = await agent.call_tool("summarize", {})
+
+    assert result.isError is False
+    assert result.structuredContent is None
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert result.content[0].text == '{"status":"ok"}'
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+async def test_local_explicit_function_tool_preserves_native_structured_content() -> None:
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    agent = McpAgent(
+        config=_make_agent_config(),
+        connection_persistence=False,
+        context=Context(),
+        tools=[FunctionTool.from_function(add)],
+    )
+
+    result = await agent.call_tool("add", {"a": 2, "b": 3})
+
+    assert result.isError is False
+    assert result.structuredContent == {"result": 5}
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+async def test_local_tool_result_preserves_explicit_structured_content() -> None:
+    def summarize() -> ToolResult:
+        return ToolResult(
+            content={"status": "ok"},
+            structured_content={"status": "ok"},
+        )
+
+    agent = McpAgent(
+        config=_make_agent_config(),
+        connection_persistence=False,
+        context=Context(),
+        tools=[summarize],
+    )
+
+    result = await agent.call_tool("summarize", {})
+
+    assert result.isError is False
+    assert result.structuredContent == {"status": "ok"}
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert result.content[0].text == '{"status":"ok"}'
 
     await agent._aggregator.close()
 

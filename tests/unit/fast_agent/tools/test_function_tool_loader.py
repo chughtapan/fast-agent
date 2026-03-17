@@ -2,8 +2,10 @@ import asyncio
 import time
 
 import pytest
+from fastmcp.tools import FunctionTool, ToolResult
 
-from fast_agent.tools.function_tool_loader import FastMCPTool
+from fast_agent.mcp.helpers.content_helpers import get_text
+from fast_agent.tools.function_tool_loader import build_default_function_tool, load_function_tools
 
 
 @pytest.mark.asyncio
@@ -12,7 +14,7 @@ async def test_sync_function_tool_runs_off_event_loop() -> None:
         time.sleep(0.05)
         return a + b
 
-    tool = FastMCPTool.from_function(blocking_add)
+    tool = build_default_function_tool(blocking_add)
 
     async def probe() -> float:
         started = time.perf_counter()
@@ -24,23 +26,23 @@ async def test_sync_function_tool_runs_off_event_loop() -> None:
         probe(),
     )
 
-    assert result == 5
+    assert get_text(result.content[0]) == "5"
+    assert result.structured_content is None
     assert probe_elapsed < 0.03
 
 
 @pytest.mark.asyncio
-async def test_sync_function_tool_injects_context_kwarg() -> None:
-    sentinel = object()
+async def test_loader_returns_text_only_function_tool_for_dict_result() -> None:
+    def shout(value: str) -> dict[str, str]:
+        return {"value": value.upper()}
 
-    def read_context(value: str, ctx: object) -> str:
-        assert ctx is sentinel
-        return value.upper()
+    tool = load_function_tools([shout])[0]
 
-    tool = FastMCPTool.from_function(read_context, context_kwarg="ctx")
+    result = await tool.run({"value": "hello"})
 
-    result = await tool.run({"value": "hello"}, context=sentinel)
-
-    assert result == "HELLO"
+    assert isinstance(tool, FunctionTool)
+    assert get_text(result.content[0]) == '{"value":"HELLO"}'
+    assert result.structured_content is None
 
 
 @pytest.mark.asyncio
@@ -49,8 +51,25 @@ async def test_async_function_tool_still_runs_inline() -> None:
         await asyncio.sleep(0)
         return a + b
 
-    tool = FastMCPTool.from_function(async_add)
+    tool = build_default_function_tool(async_add)
 
     result = await tool.run({"a": 4, "b": 5})
 
-    assert result == 9
+    assert get_text(result.content[0]) == "9"
+    assert result.structured_content is None
+
+
+@pytest.mark.asyncio
+async def test_default_function_tool_preserves_explicit_structured_tool_result() -> None:
+    def summarize() -> ToolResult:
+        return ToolResult(
+            content={"status": "ok"},
+            structured_content={"status": "ok"},
+        )
+
+    tool = build_default_function_tool(summarize)
+
+    result = await tool.run({})
+
+    assert get_text(result.content[0]) == '{"status":"ok"}'
+    assert result.structured_content == {"status": "ok"}

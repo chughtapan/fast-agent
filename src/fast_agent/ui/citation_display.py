@@ -128,13 +128,16 @@ def render_sources_footer(message: "PromptMessageExtended") -> str | None:
     return "\n".join(lines)
 
 
-def render_sources_additional_text(message: "PromptMessageExtended") -> Text | None:
-    """Render citations as styled multi-line text for console output."""
+def _render_sources_text(
+    message: "PromptMessageExtended",
+    *,
+    leading_breaks: int,
+) -> Text | None:
     sources = collect_citation_sources(message)
     if not sources:
         return None
 
-    rendered = Text("\n\nSources\n")
+    rendered = Text("\n" * leading_breaks + "Sources\n")
     for source in sources:
         title = source.title or source.source or f"Source {source.index}"
         rendered.append(" ")
@@ -146,6 +149,16 @@ def render_sources_additional_text(message: "PromptMessageExtended") -> Text | N
         rendered.append("\n")
 
     return rendered
+
+
+def render_sources_additional_text(message: "PromptMessageExtended") -> Text | None:
+    """Render citations as styled multi-line text for post-answer console output."""
+    return _render_sources_text(message, leading_breaks=2)
+
+
+def render_sources_pre_content(message: "PromptMessageExtended") -> Text | None:
+    """Render citations as styled multi-line text for pre-answer console output."""
+    return _render_sources_text(message, leading_breaks=0)
 
 
 def web_tool_badges(message: "PromptMessageExtended") -> list[str]:

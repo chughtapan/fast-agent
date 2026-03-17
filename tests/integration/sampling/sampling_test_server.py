@@ -5,8 +5,9 @@ Enhanced test server for sampling functionality
 import logging
 import sys
 
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.types import CallToolResult, SamplingMessage, TextContent
+from fastmcp import Context, FastMCP
+from fastmcp.tools import ToolResult
+from mcp.types import SamplingMessage, TextContent
 
 # Configure detailed logging
 logging.basicConfig(
@@ -17,11 +18,11 @@ logging.basicConfig(
 logger = logging.getLogger("sampling_server")
 
 # Create MCP server
-mcp = FastMCP("MCP Root Tester", log_level="DEBUG")
+mcp = FastMCP("MCP Root Tester")
 
 
 @mcp.tool()
-async def sample(ctx: Context, to_sample: str | None = "hello, world") -> CallToolResult:
+async def sample(ctx: Context, to_sample: str | None = "hello, world") -> ToolResult:
     """Tool that echoes back the input parameter"""
     try:
         logger.info(f"Sample tool called with to_sample={to_sample!r}")
@@ -38,15 +39,14 @@ async def sample(ctx: Context, to_sample: str | None = "hello, world") -> CallTo
 
         # Return the result directly, without nesting
         logger.info(f"Returning value: {value}")
-        return CallToolResult(content=[TextContent(type="text", text=value)])
+        return ToolResult(content=[TextContent(type="text", text=value)])
     except Exception as e:
         logger.error(f"Error in sample tool: {e}", exc_info=True)
-        # Ensure we always include the content field in the error response
-        return CallToolResult(isError=True, content=[TextContent(type="text", text=f"Error: {str(e)}")])
+        return ToolResult(content=[TextContent(type="text", text=f"Error: {str(e)}")])
 
 
 @mcp.tool()
-async def sample_many(ctx: Context) -> CallToolResult:
+async def sample_many(ctx: Context) -> ToolResult:
     """Tool that echoes back the input parameter"""
 
     result = await ctx.session.create_message(
@@ -58,11 +58,11 @@ async def sample_many(ctx: Context) -> CallToolResult:
     )
 
     # Return the result directly, without nesting
-    return CallToolResult(content=[TextContent(type="text", text=str(result))])
+    return ToolResult(content=[TextContent(type="text", text=str(result))])
 
 
 @mcp.tool()
-async def sample_parallel(ctx: Context, count: int = 5) -> CallToolResult:
+async def sample_parallel(ctx: Context, count: int = 5) -> ToolResult:
     """Tool that makes multiple concurrent sampling requests to test parallel processing"""
     try:
         logger.info(f"Making {count} concurrent sampling requests")
@@ -95,11 +95,11 @@ async def sample_parallel(ctx: Context, count: int = 5) -> CallToolResult:
             combined_response += f"... and {len(response_texts) - 3} more"
 
         logger.info(f"Parallel sampling completed: {combined_response}")
-        return CallToolResult(content=[TextContent(type="text", text=combined_response)])
+        return ToolResult(content=[TextContent(type="text", text=combined_response)])
 
     except Exception as e:
         logger.error(f"Error in sample_parallel tool: {e}", exc_info=True)
-        return CallToolResult(isError=True, content=[TextContent(type="text", text=f"Error: {str(e)}")])
+        return ToolResult(content=[TextContent(type="text", text=f"Error: {str(e)}")])
 
 
 if __name__ == "__main__":

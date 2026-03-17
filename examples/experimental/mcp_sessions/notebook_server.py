@@ -14,7 +14,8 @@ from _session_base import (
     run_server,
     session_meta,
 )
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
+from fastmcp.tools import ToolResult
 
 
 class NotebookStore:
@@ -47,28 +48,28 @@ class NotebookStore:
 
 
 def build_server() -> FastMCP:
-    mcp = FastMCP("notebook", log_level="WARNING")
+    mcp = FastMCP("notebook")
     sessions = SessionStore(include_state=False)
     notebooks = NotebookStore()
     register_session_handlers(mcp._mcp_server, sessions)
 
     @mcp.tool(name="notebook_append")
-    async def notebook_append(ctx: Context, text: str) -> types.CallToolResult:
+    async def notebook_append(ctx: Context, text: str) -> ToolResult:
         record = require_session(ctx, sessions)
         sessions.touch(record)
         count = notebooks.append(record.session_id, text)
-        return types.CallToolResult(
+        return ToolResult(
             content=[
                 types.TextContent(
                     type="text",
                     text=f"Note added (#{count}): {text}",
                 )
             ],
-            _meta=session_meta(record, sessions),
+            meta=session_meta(record, sessions),
         )
 
     @mcp.tool(name="notebook_read")
-    async def notebook_read(ctx: Context) -> types.CallToolResult:
+    async def notebook_read(ctx: Context) -> ToolResult:
         record = require_session(ctx, sessions)
         sessions.touch(record)
         notes = notebooks.read(record.session_id)
@@ -77,32 +78,32 @@ def build_server() -> FastMCP:
         else:
             lines = [f"  {idx}. [{note['timestamp']}] {note['text']}" for idx, note in enumerate(notes, 1)]
             text = f"Notebook ({len(notes)} notes):\n" + "\n".join(lines)
-        return types.CallToolResult(
+        return ToolResult(
             content=[types.TextContent(type="text", text=text)],
-            _meta=session_meta(record, sessions),
+            meta=session_meta(record, sessions),
         )
 
     @mcp.tool(name="notebook_clear")
-    async def notebook_clear(ctx: Context) -> types.CallToolResult:
+    async def notebook_clear(ctx: Context) -> ToolResult:
         record = require_session(ctx, sessions)
         sessions.touch(record)
         removed = notebooks.clear(record.session_id)
-        return types.CallToolResult(
+        return ToolResult(
             content=[
                 types.TextContent(
                     type="text",
                     text=f"Notebook cleared ({removed} notes removed).",
                 )
             ],
-            _meta=session_meta(record, sessions),
+            meta=session_meta(record, sessions),
         )
 
     @mcp.tool(name="notebook_status")
-    async def notebook_status(ctx: Context) -> types.CallToolResult:
+    async def notebook_status(ctx: Context) -> ToolResult:
         record = require_session(ctx, sessions)
         sessions.touch(record)
         count = notebooks.count(record.session_id)
-        return types.CallToolResult(
+        return ToolResult(
             content=[
                 types.TextContent(
                     type="text",
@@ -112,7 +113,7 @@ def build_server() -> FastMCP:
                     ),
                 )
             ],
-            _meta=session_meta(record, sessions),
+            meta=session_meta(record, sessions),
         )
 
     return mcp

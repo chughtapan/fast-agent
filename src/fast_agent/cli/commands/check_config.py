@@ -726,7 +726,9 @@ def show_models_overview(env_dir: Path | None = None) -> None:
     console.print(
         "Use [cyan]fast-agent check models <provider>[/cyan] to inspect provider models and aliases."
     )
-    console.print("Use [cyan]fast-agent check models <provider> --all[/cyan] to list every known model.")
+    console.print(
+        "Use [cyan]fast-agent check models <provider> --all[/cyan] to list every known model."
+    )
 
 
 def _load_all_models_by_provider(
@@ -1023,7 +1025,9 @@ def _render_model_secret_requirements_table(
 
     if unique_secret_envs:
         console.print()
-        console.print("[bold]Candidate secret env var names:[/bold] " + ", ".join(unique_secret_envs))
+        console.print(
+            "[bold]Candidate secret env var names:[/bold] " + ", ".join(unique_secret_envs)
+        )
 
     console.print()
     console.print(
@@ -1198,7 +1202,9 @@ def _build_check_summary_context(env_dir: Path | None) -> _CheckSummaryContext:
     )
     skills_registry = SkillRegistry(
         base_dir=search_root,
-        directories=override_directories if override_directories is not None else default_directories,
+        directories=override_directories
+        if override_directories is not None
+        else default_directories,
     )
     skills_dirs = list(skills_registry.directories)
     skills_manifests, skill_errors = skills_registry.load_manifests_with_errors()
@@ -1232,10 +1238,7 @@ def _build_check_summary_context(env_dir: Path | None) -> _CheckSummaryContext:
 
 
 def _built_in_preset_sources() -> dict[str, str]:
-    sources = {
-        preset_name: "built-in model preset"
-        for preset_name in ModelFactory.MODEL_PRESETS
-    }
+    sources = {preset_name: "built-in model preset" for preset_name in ModelFactory.MODEL_PRESETS}
     for provider_entries in ModelSelectionCatalog.CATALOG_ENTRIES_BY_PROVIDER.values():
         for entry in provider_entries:
             sources.setdefault(entry.alias, "curated model alias")
@@ -1256,8 +1259,7 @@ def _collect_overlay_preset_collision_messages(
         if source is None:
             continue
         message = (
-            f'Local model overlay "{overlay.name}" overrides existing '
-            f'{source} "{overlay.name}".'
+            f'Local model overlay "{overlay.name}" overrides existing {source} "{overlay.name}".'
         )
         messages.append(message)
         logger.info(
@@ -1271,9 +1273,7 @@ def _collect_overlay_preset_collision_messages(
 
 
 def _render_environment_summary(context: _CheckSummaryContext) -> None:
-    header_title = (
-        f"fast-agent v{context.fastagent_version} ({context.system_info['platform']})"
-    )
+    header_title = f"fast-agent v{context.fastagent_version} ({context.system_info['platform']})"
     _print_section_header(header_title, color="blue")
 
     config_path = context.config_files["config"]
@@ -1311,7 +1311,7 @@ def _render_environment_summary(context: _CheckSummaryContext) -> None:
         env_table.add_row("Config File", f"[green]Found[/green] ({config_path})")
         default_model_value = context.config_summary.get(
             "default_model",
-            "gpt-5-mini?reasoning=low (system default)",
+            "gpt-5.4-mini?reasoning=low (system default)",
         )
         env_table.add_row("Default Model", f"[green]{default_model_value}[/green]")
 
@@ -1362,7 +1362,9 @@ def _build_application_settings_rows(
 ) -> list[tuple[str, str]]:
     logger = config_summary.get("logger", {})
     mcp_ui_mode = config_summary.get("mcp_ui_mode", "auto")
-    mcp_ui_display = "[dim]disabled[/dim]" if mcp_ui_mode == "disabled" else f"[green]{mcp_ui_mode}[/green]"
+    mcp_ui_display = (
+        "[dim]disabled[/dim]" if mcp_ui_mode == "disabled" else f"[green]{mcp_ui_mode}[/green]"
+    )
 
     timeline_settings = config_summary.get("timeline", {})
     timeline_steps = timeline_settings.get("steps", 20)
@@ -1430,9 +1432,7 @@ def _format_provider_row(provider: str, status: dict[str, str]) -> tuple[str, st
     else:
         env_status = "[dim]✗[/dim]"
 
-    config_status = (
-        "[bold green]✓[/bold green]" if status["config"] else "[dim]✗[/dim]"
-    )
+    config_status = "[bold green]✓[/bold green]" if status["config"] else "[dim]✗[/dim]"
 
     if status["config"]:
         active = f"[bold green]{status['config']}[/bold green]"
@@ -1608,11 +1608,7 @@ def _resolve_mcp_token_status(
 ) -> str:
     if not oauth_enabled:
         return "[dim]n/a[/dim]"
-    if (
-        context.keyring is not None
-        and context.keyring_status.writable
-        and persist == "keyring"
-    ):
+    if context.keyring is not None and context.keyring_status.writable and persist == "keyring":
         identity = compute_server_identity(cfg)
         token_key = f"oauth:tokens:{identity}"
         try:

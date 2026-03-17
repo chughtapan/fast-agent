@@ -1,6 +1,6 @@
 import asyncio
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.tool_agent import ToolAgent
@@ -9,7 +9,7 @@ from fast_agent.llm.model_factory import ModelFactory
 
 # Initialize FastMCP instance for decorator-based tools
 # Set log_level to WARNING or ERROR to avoid httpx INFO logs
-mcp = FastMCP("Weather Bot", log_level="WARNING")
+mcp = FastMCP("Weather Bot")
 
 
 # Option 1: Using @mcp.tool decorator

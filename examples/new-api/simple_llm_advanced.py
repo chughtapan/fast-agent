@@ -1,7 +1,7 @@
 import asyncio
 from typing import Any
 
-from mcp.server.fastmcp.tools.base import Tool as FastMCPTool
+from fastmcp.tools import FunctionTool
 
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.tool_agent import ToolAgent
@@ -25,7 +25,7 @@ async def search_web(query: str, max_results: int = 5) -> str:
 
 
 # Example 2: Create a FastMCP Tool directly for more control
-def create_calculator_tool() -> FastMCPTool:
+def create_calculator_tool() -> FunctionTool:
     """Create a calculator tool with explicit schema."""
 
     def calculate(operation: str, a: float, b: float) -> float:
@@ -43,7 +43,7 @@ def create_calculator_tool() -> FastMCPTool:
         return operations[operation](a, b)
 
     # Create the tool with explicit configuration
-    return FastMCPTool.from_function(
+    return FunctionTool.from_function(
         fn=calculate,
         name="calculator",
         description="Perform basic arithmetic operations",

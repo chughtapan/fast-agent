@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -16,16 +17,22 @@ class _SmartToolHarness:
     def add_tool(self, tool: object) -> None:
         self.tools.append(tool)
 
-    async def smart(self, *args, **kwargs):
-        del args, kwargs
+    async def smart(
+        self,
+        agent_card_path: str,
+        message: str | None = None,
+        mcp_connect: list[str] | None = None,
+        action: str = "run",
+    ) -> str:
+        del agent_card_path, message, mcp_connect, action
         return ""
 
-    async def slash_command(self, *args, **kwargs):
-        del args, kwargs
+    async def slash_command(self, command: str) -> str:
+        del command
         return ""
 
-    async def read_resource(self, *args, **kwargs):
-        del args, kwargs
+    async def read_resource(self, uri: str, server_name: str | None = None) -> str:
+        del uri, server_name
         return ""
 
     async def smart_list_resources(self, *args, **kwargs):
@@ -69,6 +76,25 @@ def test_enable_smart_tooling_registers_minimal_visible_tools() -> None:
     assert "/skills" in description
     assert "/cards" in description
     assert "/model" in description
+
+
+@pytest.mark.asyncio
+async def test_enable_smart_tooling_tools_default_to_content_only() -> None:
+    harness = _SmartToolHarness()
+
+    _enable_smart_tooling(harness)
+
+    tools: dict[str, Any] = {getattr(tool, "name", ""): tool for tool in harness.tools}
+
+    smart_result = await tools["smart"].run({"agent_card_path": "worker.md", "message": "hi"})
+    slash_result = await tools["slash_command"].run({"command": "/commands"})
+    resource_result = await tools["get_resource"].run(
+        {"uri": "internal://fast-agent/smart-agent-cards", "server_name": None}
+    )
+
+    assert smart_result.structured_content is None
+    assert slash_result.structured_content is None
+    assert resource_result.structured_content is None
 
 
 @pytest.mark.asyncio

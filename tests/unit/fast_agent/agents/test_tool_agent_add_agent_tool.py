@@ -5,6 +5,7 @@ from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.llm_agent import LlmAgent
 from fast_agent.agents.tool_agent import ToolAgent
 from fast_agent.core.prompt import Prompt
+from fast_agent.mcp.helpers.content_helpers import get_text
 from fast_agent.types import PromptMessageExtended, RequestParams
 
 
@@ -49,13 +50,17 @@ async def test_add_agent_tool_uses_stateless_clone_history() -> None:
     tool_name = parent.add_agent_tool(child)
     tool = parent._execution_tools[tool_name]
 
-    assert await tool.run({"message": "hello"}) == "ok"
+    first = await tool.run({"message": "hello"})
+    assert get_text(first.content[0]) == "ok"
+    assert first.structured_content is None
     assert len(child.spawned) == 1
     clone_one = child.spawned[0]
     assert clone_one.history_loads == [[]]
     assert clone_one.message_history == []
 
-    assert await tool.run({"message": "again"}) == "ok"
+    second = await tool.run({"message": "again"})
+    assert get_text(second.content[0]) == "ok"
+    assert second.structured_content is None
     assert len(child.spawned) == 2
     clone_two = child.spawned[1]
     assert clone_two.history_loads == [[]]

@@ -213,64 +213,6 @@ async def test_agent_server_option_stdio_and_prompt_history(fast_agent):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_agent_transport_option_sse(fast_agent, mcp_test_ports, wait_for_port):
-    """Test that FastAgent enables server mode when --transport is provided (SSE)."""
-
-    # Start the SSE server in a subprocess
-    import os
-    import subprocess
-
-    # Get the path to the test agent
-    test_dir = os.path.dirname(os.path.abspath(__file__))
-    test_agent_path = os.path.join(test_dir, "integration_agent.py")
-
-    # Port must match what's in the fastagent.config.yaml
-    port = mcp_test_ports["sse"]
-
-    # Start the server process
-    server_proc = subprocess.Popen(
-        [
-            "uv",
-            "run",
-            test_agent_path,
-            "--transport",
-            "sse",
-            "--port",
-            str(port),
-            "--quiet",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        cwd=test_dir,
-    )
-
-    try:
-        await wait_for_port("127.0.0.1", port, process=server_proc)
-
-        # Now connect to it via the configured MCP server
-        @fast_agent.agent(name="client", servers=["sse"])
-        async def agent_function():
-            async with fast_agent.run() as agent:
-                # Try connecting and sending a message
-                assert "connected" == await agent.send("connected")
-                result = await agent.send('***CALL_TOOL test {"message": "sse server test"}')
-                assert "sse server test" == result
-
-        await agent_function()
-
-    finally:
-        # Terminate the server process
-        if server_proc.poll() is None:  # If still running
-            server_proc.terminate()
-            try:
-                server_proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                server_proc.kill()
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
 async def test_serve_request_scope_disables_session_header(mcp_test_ports, wait_for_port):
     """Request-scoped instances should not advertise an MCP session id."""
 
@@ -338,7 +280,9 @@ async def test_serve_request_scope_disables_session_header(mcp_test_ports, wait_
         ):
             async with ClientSession(read_stream, write_stream) as session:
                 init_result = await session.initialize()
-                assert init_result.capabilities.prompts is None
+                assert init_result.capabilities.prompts is not None
+                prompt_result = await session.list_prompts()
+                assert prompt_result.prompts == []
     finally:
         if server_proc.poll() is None:
             server_proc.terminate()
@@ -353,7 +297,7 @@ async def test_serve_request_scope_disables_session_header(mcp_test_ports, wait_
 async def test_agent_server_option_http(fast_agent, mcp_test_ports, wait_for_port):
     """Test that FastAgent still accepts the legacy --server flag with HTTP transport."""
 
-    # Start the SSE server in a subprocess
+    # Start the HTTP server in a subprocess
     import os
     import subprocess
 
