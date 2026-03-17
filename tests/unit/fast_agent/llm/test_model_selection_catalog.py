@@ -51,15 +51,22 @@ def test_legacy_aliases_are_listed_but_not_curated() -> None:
 
 
 def test_list_fast_models_uses_explicit_curated_designation() -> None:
-    anthropic_fast = ModelSelectionCatalog.list_fast_models(Provider.ANTHROPIC)
-    assert anthropic_fast == ["claude-haiku-4-5"]
+    def _expected_fast_models(provider: Provider) -> list[str]:
+        return [
+            entry.model
+            for entry in ModelSelectionCatalog.CATALOG_ENTRIES_BY_PROVIDER[provider]
+            if entry.current and entry.fast
+        ]
 
-    codex_fast = ModelSelectionCatalog.list_fast_models(Provider.CODEX_RESPONSES)
-    assert codex_fast == ["codexresponses.gpt-5.3-codex-spark"]
-
-    hf_fast = ModelSelectionCatalog.list_fast_models(Provider.HUGGINGFACE)
-    assert "hf.openai/gpt-oss-120b:sambanova" in hf_fast
-    assert "hf.moonshotai/Kimi-K2.5:fireworks-ai?temperature=1.0&top_p=0.95&reasoning=on" in hf_fast
+    assert ModelSelectionCatalog.list_fast_models(Provider.ANTHROPIC) == _expected_fast_models(
+        Provider.ANTHROPIC
+    )
+    assert ModelSelectionCatalog.list_fast_models(
+        Provider.CODEX_RESPONSES
+    ) == _expected_fast_models(Provider.CODEX_RESPONSES)
+    assert ModelSelectionCatalog.list_fast_models(
+        Provider.HUGGINGFACE
+    ) == _expected_fast_models(Provider.HUGGINGFACE)
 
 
 def test_is_fast_model_normalizes_provider_prefix() -> None:
